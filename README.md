@@ -213,6 +213,24 @@ npm run tauri build -- --target x86_64-unknown-linux-gnu
 
 > 详细交叉编译配置参见 [Tauri Cross-Compilation Guide](https://v2.tauri.app/guides/building/cross-compile/)
 
+### macOS 无签名安装说明
+
+由于当前采用**免签分发**，macOS 首次安装后如果提示“已损坏”或无法打开，请执行：
+
+```zsh
+xattr -c /Applications/PDF_Seeker.app
+```
+
+然后重新打开即可。
+
+如果仍然被阻止，可执行：
+
+```bash
+sudo xattr -rd com.apple.quarantine /Applications/PDF_Seeker.app
+```
+
+
+
 ### CI/CD 集成
 
 可使用 [GitHub Actions](https://github.com/features/actions) 自动构建多平台安装包：
