@@ -1,4 +1,3 @@
-```yaml
 name: Release
 
 on:
@@ -18,16 +17,15 @@ jobs:
         include:
           - platform: macos-latest
             args: "--target aarch64-apple-darwin"
-            artifact_suffix: "aarch64"
+
           - platform: macos-latest
             args: "--target x86_64-apple-darwin"
-            artifact_suffix: "x86_64"
+
           - platform: windows-latest
-            args: ""
-            artifact_suffix: "x86_64"
+            args: "--target x86_64-pc-windows-msvc"
+
           - platform: ubuntu-22.04
-            args: ""
-            artifact_suffix: "x86_64"
+            args: "--target x86_64-unknown-linux-gnu"
 
     runs-on: ${{ matrix.platform }}
 
@@ -90,4 +88,3 @@ jobs:
     steps:
       - name: Skip
         run: echo "macOS universal binary merging can be added later if needed"
-```
