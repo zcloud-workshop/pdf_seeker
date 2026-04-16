@@ -4,22 +4,19 @@ on:
   push:
     tags:
       - "v*"
-
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (optional)"
+        description: "Release tag (e.g. v0.1.0). Leave empty to auto-generate by run number"
         required: false
         default: ""
 
 permissions:
   contents: write
 
-env:
-  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-
 jobs:
   release:
+    name: Build ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
@@ -35,51 +32,67 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
-    steps:
-      - uses: actions/checkout@v4
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || format('v0.1.{0}', github.run_number) }}
 
-      # Linux deps
-      - name: Install Linux deps
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwebkit2gtk-4.0-dev \
+            libwebkit2gtk-4.1-dev \
             libappindicator3-dev \
             librsvg2-dev \
             libgtk-3-dev \
             patchelf \
             libssl-dev
 
-      # Node
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
 
-      # Rust
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Add Rust target
-        run: rustup target add ${{ matrix.target }}
-
-      - uses: swatinem/rust-cache@v2
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          workspaces: "./src-tauri -> target"
+          targets: ${{ matrix.target }}
 
-      - run: npm ci
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
 
-      # Build
-      - uses: tauri-apps/tauri-action@v0
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and create GitHub Release
+        uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ env.RELEASE_TAG }}
-          releaseName: "App ${{ env.RELEASE_TAG }}"
-          args: ${{ matrix.target }}
+          releaseName: PDF_Seeker ${{ env.RELEASE_TAG }}
+          releaseBody: |
+            ## PDF_Seeker Release
 
-      # macOS 免签修复
-      - name: Fix macOS quarantine
-        if: matrix.os == 'macos-latest'
-        run: |
-          find ./src-tauri/target -name "*.app" -exec xattr -cr {} \;
+            ### Platforms
+            - macOS Apple Silicon (`aarch64`)
+            - macOS Intel (`x86_64`)
+            - Windows x64
+            - Linux x64
+
+            ### macOS first-run fix (unsigned app)
+            If macOS shows **damaged** or blocks opening, run:
+
+            ```bash
+            xattr -c /Applications/PDF_Seeker.app
+            ```
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: --target ${{ matrix.target }}
