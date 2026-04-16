@@ -229,30 +229,6 @@ xattr -c /Applications/PDF_Seeker.app
 sudo xattr -rd com.apple.quarantine /Applications/PDF_Seeker.app
 ```
 
-
-
-### CI/CD 集成
-
-可使用 [GitHub Actions](https://github.com/features/actions) 自动构建多平台安装包：
-
-```yaml
-# .github/workflows/build.yml 示例
-on: [push, pull_request]
-jobs:
-  build:
-    strategy:
-      matrix:
-        os: [macos-latest, ubuntu-22.04, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - run: npm install
-      - run: npm run tauri build
-```
-
 ## 开发指南
 
 ### 代码检查
