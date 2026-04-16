@@ -1,0 +1,103 @@
+{
+  "app": {
+    "name": "PDF Seeker",
+    "loading": "加载中..."
+  },
+  "nav": {
+    "home": "首页",
+    "viewer": "查看器",
+    "tools": "工具",
+    "storage": "存储",
+    "settings": "设置"
+  },
+  "toolbar": {
+    "openFile": "打开文件",
+    "saveFile": "保存",
+    "export": "导出",
+    "settings": "设置"
+  },
+  "viewer": {
+    "noFile": "未打开文件",
+    "openFileHint": "点击「打开文件」或将 PDF 拖拽到此处",
+    "page": "第",
+    "of": "页，共",
+    "zoomIn": "放大",
+    "zoomOut": "缩小",
+    "fitWidth": "适应宽度",
+    "fitPage": "适应页面",
+    "rotateLeft": "向左旋转",
+    "rotateRight": "向右旋转"
+  },
+  "recent": {
+    "title": "最近文件",
+    "empty": "没有最近文件",
+    "clear": "清空全部"
+  },
+  "settings": {
+    "title": "设置",
+    "general": "通用",
+    "language": "语言",
+    "theme": "主题",
+    "themeSystem": "跟随系统",
+    "themeLight": "浅色",
+    "themeDark": "深色",
+    "storage": "存储",
+    "s3": "S3 兼容存储",
+    "s3Endpoint": "终端节点",
+    "s3Region": "区域",
+    "s3Bucket": "存储桶",
+    "s3AccessKey": "访问密钥",
+    "s3SecretKey": "秘密密钥",
+    "s3SessionToken": "会话令牌（可选）",
+    "s3AuthMode": "认证方式",
+    "s3AuthNone": "无需认证（公开桶）",
+    "s3AuthStatic": "Access Key + Secret Key",
+    "s3AuthEnv": "环境变量 / 实例配置",
+    "s3AuthEnvHint": "将从环境变量（AWS_ACCESS_KEY_ID、AWS_SECRET_ACCESS_KEY）或实例元数据（EC2、ECS 等）自动加载凭证",
+    "s3PathStyle": "强制路径风格",
+    "s3RootPrefix": "根前缀",
+    "s3TestConnection": "测试连接",
+    "s3Connected": "连接成功",
+    "s3Failed": "连接失败",
+    "s3MaxVersions": "最大保留版本数",
+    "s3VersionTtl": "版本保留天数",
+    "save": "保存",
+    "saved": "设置已保存"
+  },
+  "storage": {
+    "title": "S3 兼容存储",
+    "upload": "上传",
+    "download": "下载",
+    "browse": "浏览",
+    "versions": "版本历史",
+    "newFolder": "新建文件夹",
+    "empty": "空文件夹",
+    "uploading": "上传中",
+    "downloading": "下载中",
+    "noConfig": "请在设置中配置 S3 存储以启用云功能"
+  },
+  "tools": {
+    "merge": "合并",
+    "split": "拆分",
+    "rotate": "旋转",
+    "deletePages": "删除页面",
+    "extractPages": "提取页面",
+    "compress": "压缩",
+    "watermark": "水印",
+    "convertImage": "图片转 PDF",
+    "pdf2img": "PDF 转图片",
+    "convertText": "PDF 转文本",
+    "sign": "签署",
+    "ocr": "OCR 识别",
+    "editText": "添加文字",
+    "editRect": "矩形",
+    "editHighlight": "高亮",
+    "extractTable": "提取表格",
+    "preview": "预览",
+    "openPdf": "打开 PDF",
+    "goToViewer": "前往查看器",
+    "selectAll": "全选",
+    "clear": "清空",
+    "keep": "保留"
+  }
+}

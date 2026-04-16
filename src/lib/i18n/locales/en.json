@@ -1,0 +1,103 @@
+{
+  "app": {
+    "name": "PDF Seeker",
+    "loading": "Loading..."
+  },
+  "nav": {
+    "home": "Home",
+    "viewer": "Viewer",
+    "tools": "Tools",
+    "storage": "Storage",
+    "settings": "Settings"
+  },
+  "toolbar": {
+    "openFile": "Open File",
+    "saveFile": "Save",
+    "export": "Export",
+    "settings": "Settings"
+  },
+  "viewer": {
+    "noFile": "No file opened",
+    "openFileHint": "Click \"Open File\" or drag a PDF here",
+    "page": "Page",
+    "of": "of",
+    "zoomIn": "Zoom In",
+    "zoomOut": "Zoom Out",
+    "fitWidth": "Fit Width",
+    "fitPage": "Fit Page",
+    "rotateLeft": "Rotate Left",
+    "rotateRight": "Rotate Right"
+  },
+  "recent": {
+    "title": "Recent Files",
+    "empty": "No recent files",
+    "clear": "Clear All"
+  },
+  "settings": {
+    "title": "Settings",
+    "general": "General",
+    "language": "Language",
+    "theme": "Theme",
+    "themeSystem": "System",
+    "themeLight": "Light",
+    "themeDark": "Dark",
+    "storage": "Storage",
+    "s3": "S3 Compatible Storage",
+    "s3Endpoint": "Endpoint",
+    "s3Region": "Region",
+    "s3Bucket": "Bucket",
+    "s3AccessKey": "Access Key",
+    "s3SecretKey": "Secret Key",
+    "s3SessionToken": "Session Token (Optional)",
+    "s3AuthMode": "Authentication Mode",
+    "s3AuthNone": "No Authentication (Public Bucket)",
+    "s3AuthStatic": "Access Key + Secret Key",
+    "s3AuthEnv": "Environment / Instance Profile",
+    "s3AuthEnvHint": "Credentials will be loaded from environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) or instance metadata (EC2, ECS, etc.)",
+    "s3PathStyle": "Force Path Style",
+    "s3RootPrefix": "Root Prefix",
+    "s3TestConnection": "Test Connection",
+    "s3Connected": "Connection successful",
+    "s3Failed": "Connection failed",
+    "s3MaxVersions": "Max Versions to Keep",
+    "s3VersionTtl": "Version Retention Days",
+    "save": "Save",
+    "saved": "Settings saved"
+  },
+  "storage": {
+    "title": "S3 Compatible Storage",
+    "upload": "Upload",
+    "download": "Download",
+    "browse": "Browse",
+    "versions": "Versions",
+    "newFolder": "New Folder",
+    "empty": "Empty folder",
+    "uploading": "Uploading",
+    "downloading": "Downloading",
+    "noConfig": "Configure S3 storage in Settings to enable cloud features"
+  },
+  "tools": {
+    "merge": "Merge",
+    "split": "Split",
+    "rotate": "Rotate",
+    "deletePages": "Delete Pages",
+    "extractPages": "Extract Pages",
+    "compress": "Compress",
+    "watermark": "Watermark",
+    "convertImage": "Image to PDF",
+    "pdf2img": "PDF to Image",
+    "convertText": "PDF to Text",
+    "sign": "Sign",
+    "ocr": "OCR",
+    "editText": "Add Text",
+    "editRect": "Rectangle",
+    "editHighlight": "Highlight",
+    "extractTable": "Extract Table",
+    "preview": "Preview",
+    "openPdf": "Open PDF",
+    "goToViewer": "Go to Viewer",
+    "selectAll": "Select All",
+    "clear": "Clear",
+    "keep": "keep"
+  }
+}

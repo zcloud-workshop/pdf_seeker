@@ -1,0 +1,38 @@
+[package]
+name = "pdf-seeker"
+version = "0.1.0"
+description = "A cross-platform offline PDF toolbox"
+authors = [""]
+edition = "2021"
+
+[lib]
+name = "pdf_seeker_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+lopdf = "0.34"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+toml = "0.8"
+directories = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tracing-appender = "0.2"
