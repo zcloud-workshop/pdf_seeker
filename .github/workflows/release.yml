@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,81 +14,62 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS Apple Silicon
-          - platform: macos-latest
+          - os: macos-latest
             target: aarch64-apple-darwin
-            is_macos: true
-
-          # macOS Intel
-          - platform: macos-latest
+          - os: macos-latest
             target: x86_64-apple-darwin
-            is_macos: true
-
-          # Windows（保持你原本正常逻辑）
-          - platform: windows-latest
+          - os: windows-latest
             target: x86_64-pc-windows-msvc
-            is_macos: false
-
-          # Linux
-          - platform: ubuntu-22.04
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            is_macos: false
 
-    runs-on: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
+      # Linux deps
+      - name: Install Linux deps
+        if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
+            libwebkit2gtk-4.0-dev \
             libappindicator3-dev \
-            libayatana-appindicator3-dev \
             librsvg2-dev \
             libgtk-3-dev \
-            patchelf
+            patchelf \
+            libssl-dev
 
+      # Node
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
 
+      # Rust
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
 
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
 
-      # 🔐 仅 macOS 创建临时 Apple Key
-      - name: Create Apple API Key File
-        if: matrix.is_macos
-        shell: bash
-        run: |
-          echo "${{ secrets.APPLE_API_KEY }}" > ${{ runner.temp }}/AuthKey.p8
-
-      # 🚀 构建（Windows / Linux 不受影响）
-      - name: Build and Release
-        uses: tauri-apps/tauri-action@v1
+      # Build
+      - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-          # 仅 macOS 会实际使用
-          APPLE_SIGNING_IDENTITY: ${{ matrix.is_macos && secrets.APPLE_SIGNING_IDENTITY || '' }}
-          APPLE_API_ISSUER: ${{ matrix.is_macos && secrets.APPLE_API_ISSUER || '' }}
-          APPLE_API_KEY_PATH: ${{ matrix.is_macos && format('{0}/AuthKey.p8', runner.temp) || '' }}
-
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "PDF Seeker ${{ github.ref_name }}"
-          releaseBody: "Download the installer from assets."
-          releaseDraft: false
-          prerelease: false
-          args: --target ${{ matrix.target }}
+          releaseName: "App ${{ github.ref_name }}"
+          args: ${{ matrix.target }}
+
+      # ⭐ macOS 免签关键修复
+      - name: Fix macOS quarantine
+        if: matrix.os == 'macos-latest'
+        run: |
+          find ./src-tauri/target -name "*.app" -exec xattr -cr {} \;
