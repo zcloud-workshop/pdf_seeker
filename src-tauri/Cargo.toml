@@ -1,5 +1,5 @@
 [package]
-name = "pdf-seeker"
+name = "pdf_seeker"
 version = "0.1.0"
 description = "A cross-platform offline PDF toolbox"
 authors = [""]
