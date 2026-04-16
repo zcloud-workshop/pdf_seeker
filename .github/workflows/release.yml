@@ -5,8 +5,18 @@ on:
     tags:
       - "v*"
 
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (optional)"
+        required: false
+        default: ""
+
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -64,11 +74,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "App ${{ github.ref_name }}"
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: "App ${{ env.RELEASE_TAG }}"
           args: ${{ matrix.target }}
 
-      # ⭐ macOS 免签关键修复
+      # macOS 免签修复
       - name: Fix macOS quarantine
         if: matrix.os == 'macos-latest'
         run: |
