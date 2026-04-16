@@ -15,24 +15,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macOS Apple Silicon
           - platform: macos-latest
-            args: "--target aarch64-apple-darwin"
+            target: aarch64-apple-darwin
+            is_macos: true
+
+          # macOS Intel
           - platform: macos-latest
-            args: "--target x86_64-apple-darwin"
+            target: x86_64-apple-darwin
+            is_macos: true
+
+          # Windows（保持你原本正常逻辑）
           - platform: windows-latest
-            args: "--target x86_64-pc-windows-msvc"
+            target: x86_64-pc-windows-msvc
+            is_macos: false
+
+          # Linux
           - platform: ubuntu-22.04
-            args: "--target x86_64-unknown-linux-gnu"
+            target: x86_64-unknown-linux-gnu
+            is_macos: false
 
     runs-on: ${{ matrix.platform }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - if: matrix.platform == 'ubuntu-22.04'
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
+          sudo apt-get update
+          sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
             libappindicator3-dev \
             libayatana-appindicator3-dev \
@@ -46,23 +58,38 @@ jobs:
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
-
-      - shell: bash
-        run: rustup target add $(echo "${{ matrix.args }}" | awk '{print $2}')
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
 
-      - run: npm ci --silent
+      - name: Install dependencies
+        run: npm ci
 
-      - uses: tauri-apps/tauri-action@v0.6.0
+      # 🔐 仅 macOS 创建临时 Apple Key
+      - name: Create Apple API Key File
+        if: matrix.is_macos
+        shell: bash
+        run: |
+          echo "${{ secrets.APPLE_API_KEY }}" > ${{ runner.temp }}/AuthKey.p8
+
+      # 🚀 构建（Windows / Linux 不受影响）
+      - name: Build and Release
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # 仅 macOS 会实际使用
+          APPLE_SIGNING_IDENTITY: ${{ matrix.is_macos && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_API_ISSUER: ${{ matrix.is_macos && secrets.APPLE_API_ISSUER || '' }}
+          APPLE_API_KEY_PATH: ${{ matrix.is_macos && format('{0}/AuthKey.p8', runner.temp) || '' }}
+
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "PDF Seeker ${{ github.ref_name }}"
           releaseBody: "Download the installer from assets."
           releaseDraft: false
           prerelease: false
-          args: ${{ matrix.args }}
+          args: --target ${{ matrix.target }}
