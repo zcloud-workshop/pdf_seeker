@@ -757,47 +757,45 @@ pub fn sign_pdf(req: SignPdfRequest) -> AppResult<()> {
 
     // Get or create resources reference first
     // Handle: no Resources, Resources as reference, Resources as inline dict
-    let res_ref = {
+    let (res_needs_page_update, res_id) = {
         let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
         let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
         match page_dict.get(b"Resources") {
             Err(_) => {
-                let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                    (b"XObject".to_vec(), Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                        (b"SigImg".to_vec(), Object::Reference(image_id)),
-                    ]))),
-                ])));
-                (res_id, true)
+                let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
+                (true, res_id)
             }
             Ok(res_obj) => {
                 if let Ok(r) = res_obj.as_reference() {
-                    (r, false)
+                    (false, r)
                 } else {
                     // Inline dictionary — promote to standalone object
                     let res_id = doc.add_object(res_obj.clone());
-                    (res_id, true)
+                    (true, res_id)
                 }
             }
         }
     };
 
-    if !res_ref.1 {
-        // Add XObject to existing resources
-        if let Some(res_obj) = doc.objects.get_mut(&res_ref.0) {
-            if let Ok(res_dict) = res_obj.as_dict_mut() {
-                let xobject = lopdf::Dictionary::from_iter(vec![
-                    (b"SigImg".to_vec(), Object::Reference(image_id)),
-                ]);
-                res_dict.set("XObject", Object::Dictionary(xobject));
+    // Merge XObject into resources (preserves existing entries)
+    if let Some(res_obj) = doc.objects.get_mut(&res_id) {
+        if let Ok(res_dict) = res_obj.as_dict_mut() {
+            if res_dict.get(b"XObject").is_err() {
+                res_dict.set("XObject", Object::Dictionary(lopdf::Dictionary::new()));
+            }
+            if let Ok(xo_d) = res_dict.get_mut(b"XObject") {
+                if let Ok(xd) = xo_d.as_dict_mut() {
+                    xd.set("SigImg", Object::Reference(image_id));
+                }
             }
         }
     }
 
-    // Set resources reference on page if newly created
-    if res_ref.1 {
+    // Set resources reference on page if newly created or promoted
+    if res_needs_page_update {
         if let Some(page_obj) = doc.objects.get_mut(page_id) {
             if let Ok(dict) = page_obj.as_dict_mut() {
-                dict.set("Resources", Object::Reference(res_ref.0));
+                dict.set("Resources", Object::Reference(res_id));
             }
         }
     }
