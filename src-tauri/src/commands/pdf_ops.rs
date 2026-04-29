@@ -1,12 +1,11 @@
 use lopdf::{Document, Object, ObjectId};
 use serde::{Deserialize, Serialize};
 use image as img_crate;
-use std::path::Path;
 
 use crate::commands::validation::validate_path;
+use crate::error::{AppError, AppResult};
 
 pub type ObjId = ObjectId;
-pub type AppResult<T> = Result<T, String>;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,13 +110,13 @@ pub struct OcrRequest {
 }
 
 fn load_doc(path: &str) -> AppResult<Document> {
-    Document::load(path).map_err(|e| format!("Load '{}': {}", path, e))
+    Document::load(path).map_err(|e| AppError::Pdf(format!("Load '{}': {}", path, e)))
 }
 
 fn save_doc(doc: &mut Document, path: &str) -> AppResult<()> {
     doc.save(path)
         .map(|_| ())
-        .map_err(|e| format!("Save '{}': {}", path, e))
+        .map_err(|e| AppError::Pdf(format!("Save '{}': {}", path, e)))
 }
 
 fn escape_pdf_string(s: &str) -> String {
@@ -128,7 +127,7 @@ fn escape_pdf_string(s: &str) -> String {
 
 fn parse_page_ranges(ranges: &str, max: u32) -> AppResult<Vec<Vec<u32>>> {
     if ranges.trim().is_empty() {
-        return Err("Empty ranges".into());
+        return Err(AppError::Pdf("Empty ranges".into()));
     }
     let mut result = Vec::new();
     for part in ranges.split(',') {
@@ -136,18 +135,18 @@ fn parse_page_ranges(ranges: &str, max: u32) -> AppResult<Vec<Vec<u32>>> {
         if trimmed.is_empty() { continue; }
         if trimmed.contains('-') {
             let nums: Vec<&str> = trimmed.split('-').collect();
-            if nums.len() != 2 { return Err(format!("Invalid range: {}", trimmed)); }
-            let s: u32 = nums[0].parse().map_err(|_| format!("Invalid number: {}", nums[0]))?;
-            let e: u32 = nums[1].parse().map_err(|_| format!("Invalid number: {}", nums[1]))?;
-            if s < 1 || e > max || s > e { return Err(format!("Range {} out of bounds (1-{})", trimmed, max)); }
+            if nums.len() != 2 { return Err(AppError::Pdf(format!("Invalid range: {}", trimmed))); }
+            let s: u32 = nums[0].parse().map_err(|_| AppError::Pdf(format!("Invalid number: {}", nums[0])))?;
+            let e: u32 = nums[1].parse().map_err(|_| AppError::Pdf(format!("Invalid number: {}", nums[1])))?;
+            if s < 1 || e > max || s > e { return Err(AppError::Pdf(format!("Range {} out of bounds (1-{})", trimmed, max))); }
             result.push((s..=e).collect());
         } else {
-            let n: u32 = trimmed.parse().map_err(|_| format!("Invalid number: {}", trimmed))?;
-            if n < 1 || n > max { return Err(format!("Page {} out of bounds (1-{})", n, max)); }
+            let n: u32 = trimmed.parse().map_err(|_| AppError::Pdf(format!("Invalid number: {}", trimmed)))?;
+            if n < 1 || n > max { return Err(AppError::Pdf(format!("Page {} out of bounds (1-{})", n, max))); }
             result.push(vec![n]);
         }
     }
-    if result.is_empty() { return Err("No valid ranges".into()); }
+    if result.is_empty() { return Err(AppError::Pdf("No valid ranges".into())); }
     Ok(result)
 }
 
@@ -160,7 +159,7 @@ fn embed_image(doc: &mut Document, data: &[u8], path: &str) -> AppResult<(Object
 
     if ext == "jpg" || ext == "jpeg" {
         let img = img_crate::load_from_memory(data)
-            .map_err(|e| format!("Image decode: {}", e))?;
+            .map_err(|e| AppError::Pdf(format!("Image decode: {}", e)))?;
         let (w, h) = (img.width(), img.height());
         let dict = lopdf::Dictionary::from_iter(vec![
             (b"Type".to_vec(), Object::Name(b"XObject".to_vec())),
@@ -175,7 +174,7 @@ fn embed_image(doc: &mut Document, data: &[u8], path: &str) -> AppResult<(Object
         Ok((id, w, h))
     } else {
         let img = img_crate::load_from_memory(data)
-            .map_err(|e| format!("Image decode: {}", e))?;
+            .map_err(|e| AppError::Pdf(format!("Image decode: {}", e)))?;
         let rgba = img.to_rgba8();
         let (w, h) = (rgba.width(), rgba.height());
         let mut rgb_data = Vec::with_capacity((w * h * 3) as usize);
@@ -216,12 +215,12 @@ fn embed_image(doc: &mut Document, data: &[u8], path: &str) -> AppResult<(Object
 fn get_pages_ref(doc: &Document) -> AppResult<ObjectId> {
     let root_ref = doc.trailer.get(b"Root")
         .and_then(|o| o.as_reference())
-        .map_err(|e| format!("Root error: {}", e))?;
+        .map_err(|e| AppError::Pdf(format!("Root error: {}", e)))?;
     doc.get_object(root_ref)
         .and_then(|o| o.as_dict())
         .and_then(|d| d.get(b"Pages"))
         .and_then(|o| o.as_reference())
-        .map_err(|e| format!("Pages error: {}", e))
+        .map_err(|e| AppError::Pdf(format!("Pages error: {}", e)))
 }
 
 fn get_page_size(page_dict: &lopdf::Dictionary) -> (f64, f64) {
@@ -238,12 +237,12 @@ fn get_page_size(page_dict: &lopdf::Dictionary) -> (f64, f64) {
 #[tauri::command]
 pub fn merge_pdfs(paths: Vec<String>, output_path: String) -> AppResult<()> {
     if paths.is_empty() {
-        return Err("No input PDFs".into());
+        return Err(AppError::Pdf("No input PDFs".into()));
     }
     for p in &paths {
-        validate_path(p).map_err(|e| e.to_string())?;
+        validate_path(p)?;
     }
-    validate_path(&output_path).map_err(|e| e.to_string())?;
+    validate_path(&output_path)?;
 
     let mut merged = load_doc(&paths[0])?;
 
@@ -284,25 +283,25 @@ pub fn merge_pdfs(paths: Vec<String>, output_path: String) -> AppResult<()> {
             .trailer
             .get(b"Root")
             .and_then(|o| o.as_reference())
-            .map_err(|e| format!("Root error: {}", e))?;
+            .map_err(|e| AppError::Pdf(format!("Root error: {}", e)))?;
 
         let pages_ref = merged
             .get_object(root_ref)
             .and_then(|o| o.as_dict())
             .and_then(|d| d.get(b"Pages"))
             .and_then(|o| o.as_reference())
-            .map_err(|e| format!("Pages error: {}", e))?;
+            .map_err(|e| AppError::Pdf(format!("Pages error: {}", e)))?;
 
         let merged_count = merged.get_pages().len();
 
         let pages_obj = merged
             .objects
             .get_mut(&pages_ref)
-            .ok_or("Pages object missing")?;
+            .ok_or_else(|| AppError::Pdf("Pages object missing".into()))?;
 
         let pages_dict = pages_obj
             .as_dict_mut()
-            .map_err(|e| format!("Pages dict error: {}", e))?;
+            .map_err(|e| AppError::Pdf(format!("Pages dict error: {}", e)))?;
 
         if let Ok(kids) = pages_dict.get_mut(b"Kids") {
             if let Ok(arr) = kids.as_array_mut() {
@@ -321,8 +320,8 @@ pub fn merge_pdfs(paths: Vec<String>, output_path: String) -> AppResult<()> {
 
 #[tauri::command]
 pub fn rotate_pdf(req: RotatePdfRequest) -> AppResult<()> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.output_path)?;
     let mut doc = load_doc(&req.input_path)?;
     let page_ids: Vec<ObjId> = doc.get_pages().values().copied().collect();
 
@@ -348,8 +347,8 @@ pub fn rotate_pdf(req: RotatePdfRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn delete_pages(req: DeletePagesRequest) -> AppResult<()> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.output_path)?;
     let mut doc = load_doc(&req.input_path)?;
     doc.delete_pages(&req.pages_to_delete);
     save_doc(&mut doc, &req.output_path)
@@ -357,7 +356,7 @@ pub fn delete_pages(req: DeletePagesRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn extract_text(path: String) -> AppResult<TextExtractResult> {
-    validate_path(&path).map_err(|e| e.to_string())?;
+    validate_path(&path)?;
     let doc = load_doc(&path)?;
     let pages = doc.get_pages();
 
@@ -381,8 +380,8 @@ pub fn extract_text(path: String) -> AppResult<TextExtractResult> {
 
 #[tauri::command]
 pub fn split_pdf(req: SplitPdfRequest) -> AppResult<Vec<String>> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_dir).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.output_dir)?;
     let doc = load_doc(&req.input_path)?;
     let total = doc.get_pages().len() as u32;
     let mut output_paths = Vec::new();
@@ -418,8 +417,8 @@ pub fn split_pdf(req: SplitPdfRequest) -> AppResult<Vec<String>> {
 
 #[tauri::command]
 pub fn extract_pages_pdf(req: ExtractPagesRequest) -> AppResult<()> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.output_path)?;
     let mut doc = load_doc(&req.input_path)?;
     let total = doc.get_pages().len() as u32;
     let pages_to_delete: Vec<u32> = (1..=total)
@@ -435,11 +434,11 @@ pub fn extract_pages_pdf(req: ExtractPagesRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn compress_pdf(input_path: String, output_path: String) -> AppResult<CompressResult> {
-    validate_path(&input_path).map_err(|e| e.to_string())?;
-    validate_path(&output_path).map_err(|e| e.to_string())?;
+    validate_path(&input_path)?;
+    validate_path(&output_path)?;
     let original_size = std::fs::metadata(&input_path)
         .map(|m| m.len())
-        .map_err(|e| format!("Metadata error: {}", e))?;
+        .map_err(AppError::from)?;
 
     let mut doc = load_doc(&input_path)?;
     doc.compress();
@@ -447,7 +446,7 @@ pub fn compress_pdf(input_path: String, output_path: String) -> AppResult<Compre
 
     let compressed_size = std::fs::metadata(&output_path)
         .map(|m| m.len())
-        .map_err(|e| format!("Metadata error: {}", e))?;
+        .map_err(AppError::from)?;
 
     let ratio = if original_size > 0 {
         (1.0 - compressed_size as f64 / original_size as f64) * 100.0
@@ -462,8 +461,8 @@ pub fn compress_pdf(input_path: String, output_path: String) -> AppResult<Compre
 
 #[tauri::command]
 pub fn add_text_watermark(req: WatermarkRequest) -> AppResult<()> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.output_path)?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
 
@@ -482,8 +481,8 @@ pub fn add_text_watermark(req: WatermarkRequest) -> AppResult<()> {
     ])));
 
     for (_, page_id) in pages.iter() {
-        let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
-        let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+        let page = doc.get_object(*page_id).map_err(|e| AppError::Pdf(format!("Page error: {}", e)))?;
+        let page_dict = page.as_dict().map_err(|e| AppError::Pdf(format!("Page dict error: {}", e)))?;
         let (pw, ph) = get_page_size(page_dict);
 
         let opacity = req.opacity.min(1.0).max(0.0);
@@ -512,8 +511,8 @@ pub fn add_text_watermark(req: WatermarkRequest) -> AppResult<()> {
         // Phase 1: get or create resources (immutable read first)
         // Handle: no Resources, Resources as reference, Resources as inline dict
         let res_ref = {
-            let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
-            let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+            let page = doc.get_object(*page_id).map_err(|e| AppError::Pdf(format!("Page error: {}", e)))?;
+            let page_dict = page.as_dict().map_err(|e| AppError::Pdf(format!("Page dict error: {}", e)))?;
             match page_dict.get(b"Resources") {
                 Err(_) => {
                     let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
@@ -610,12 +609,12 @@ pub fn add_text_watermark(req: WatermarkRequest) -> AppResult<()> {
 #[tauri::command]
 pub fn images_to_pdf(req: ImagesToPdfRequest) -> AppResult<()> {
     if req.image_paths.is_empty() {
-        return Err("No images provided".into());
+        return Err(AppError::Pdf("No images provided".into()));
     }
     for p in &req.image_paths {
-        validate_path(p).map_err(|e| e.to_string())?;
+        validate_path(p)?;
     }
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path)?;
 
     let mut doc = Document::with_version("1.4");
     let catalog_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
@@ -635,7 +634,7 @@ pub fn images_to_pdf(req: ImagesToPdfRequest) -> AppResult<()> {
     let mut kids = Vec::new();
     for image_path in &req.image_paths {
         let data = std::fs::read(image_path)
-            .map_err(|e| format!("Read '{}': {}", image_path, e))?;
+            .map_err(|e| AppError::Pdf(format!("Read '{}': {}", image_path, e)))?;
         let (image_id, w, h) = embed_image(&mut doc, &data, image_path)?;
 
         let content = format!("q {} 0 0 {} 0 0 cm /Im1 Do Q", w, h);
@@ -673,14 +672,14 @@ pub fn images_to_pdf(req: ImagesToPdfRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn reorder_pages(req: ReorderPagesRequest) -> AppResult<()> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.output_path)?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
     let total = pages.len() as u32;
 
     if req.new_order.len() != total as usize {
-        return Err(format!("Expected {} page numbers, got {}", total, req.new_order.len()));
+        return Err(AppError::Pdf(format!("Expected {} page numbers, got {}", total, req.new_order.len())));
     }
 
     let mut current_order: Vec<(u32, ObjectId)> = pages.iter().map(|(n, id)| (*n, *id)).collect();
@@ -689,10 +688,10 @@ pub fn reorder_pages(req: ReorderPagesRequest) -> AppResult<()> {
     let mut new_kids = Vec::new();
     for page_num in &req.new_order {
         if *page_num < 1 || *page_num > total {
-            return Err(format!("Invalid page number: {}", page_num));
+            return Err(AppError::Pdf(format!("Invalid page number: {}", page_num)));
         }
         let (_, page_id) = current_order.iter().find(|(n, _)| *n == *page_num)
-            .ok_or(format!("Page {} not found", page_num))?;
+            .ok_or_else(|| AppError::Pdf(format!("Page {} not found", page_num)))?;
         new_kids.push(Object::Reference(*page_id));
     }
 
@@ -710,9 +709,9 @@ pub fn reorder_pages(req: ReorderPagesRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn insert_pages(req: InsertPagesRequest) -> AppResult<()> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.source_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.source_path)?;
+    validate_path(&req.output_path)?;
     let mut target = load_doc(&req.input_path)?;
     let mut source = load_doc(&req.source_path)?;
 
@@ -741,7 +740,7 @@ pub fn insert_pages(req: InsertPagesRequest) -> AppResult<()> {
     let target_count = target.get_pages().len();
     let pos = req.insert_position as usize;
     if pos > target_count {
-        return Err(format!("Insert position {} exceeds page count {}", pos, target_count));
+        return Err(AppError::Pdf(format!("Insert position {} exceeds page count {}", pos, target_count)));
     }
 
     let pages_ref = get_pages_ref(&target)?;
@@ -765,18 +764,18 @@ pub fn insert_pages(req: InsertPagesRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn sign_pdf(req: SignPdfRequest) -> AppResult<()> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.signature_image_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.signature_image_path)?;
+    validate_path(&req.output_path)?;
     let mut doc = load_doc(&req.input_path)?;
 
     let sig_data = std::fs::read(&req.signature_image_path)
-        .map_err(|e| format!("Read signature: {}", e))?;
+        .map_err(|e| AppError::Pdf(format!("Read signature: {}", e)))?;
     let (image_id, _w, _h) = embed_image(&mut doc, &sig_data, &req.signature_image_path)?;
 
     let pages = doc.get_pages();
     let page_id = pages.get(&req.page)
-        .ok_or(format!("Page {} not found", req.page))?;
+        .ok_or_else(|| AppError::Pdf(format!("Page {} not found", req.page)))?;
 
     let content = format!(
         "q {} 0 0 {} {} {} cm /SigImg Do Q",
@@ -789,8 +788,8 @@ pub fn sign_pdf(req: SignPdfRequest) -> AppResult<()> {
     // Get or create resources reference first
     // Handle: no Resources, Resources as reference, Resources as inline dict
     let (res_needs_page_update, res_id) = {
-        let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
-        let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+        let page = doc.get_object(*page_id).map_err(|e| AppError::Pdf(format!("Page error: {}", e)))?;
+        let page_dict = page.as_dict().map_err(|e| AppError::Pdf(format!("Page dict error: {}", e)))?;
         match page_dict.get(b"Resources") {
             Err(_) => {
                 let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
@@ -879,7 +878,7 @@ pub fn sign_pdf(req: SignPdfRequest) -> AppResult<()> {
 pub fn get_temp_dir() -> AppResult<String> {
     let dir = std::env::temp_dir().join("pdf_seeker_ocr");
     std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Create temp dir: {}", e))?;
+        .map_err(AppError::from)?;
     Ok(dir.to_string_lossy().to_string())
 }
 
@@ -889,12 +888,12 @@ pub fn get_temp_dir() -> AppResult<String> {
 pub fn save_image_file(path: String, data: Vec<u8>) -> AppResult<()> {
     let path_obj = std::path::Path::new(&path);
     if let Some(parent) = path_obj.parent() {
-        validate_path(&parent.to_string_lossy()).map_err(|e| e.to_string())?;
+        validate_path(&parent.to_string_lossy())?;
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Create dir: {}", e))?;
+            .map_err(AppError::from)?;
     }
     std::fs::write(&path, &data)
-        .map_err(|e| format!("Write '{}': {}", path, e))
+        .map_err(|e| AppError::Pdf(format!("Write '{}': {}", path, e)))
 }
 
 // ==================== PDF Editing ====================
@@ -943,12 +942,12 @@ pub struct AddHighlightRequest {
 
 #[tauri::command]
 pub fn add_text_to_page(req: AddTextRequest) -> AppResult<()> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.output_path)?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
     let page_id = pages.get(&req.page)
-        .ok_or(format!("Page {} not found", req.page))?;
+        .ok_or_else(|| AppError::Pdf(format!("Page {} not found", req.page)))?;
 
     let hex = req.color.trim_start_matches('#');
     let r = u8::from_str_radix(&hex.get(0..2).unwrap_or("00"), 16).unwrap_or(0);
@@ -974,8 +973,8 @@ pub fn add_text_to_page(req: AddTextRequest) -> AppResult<()> {
 
     // Handle resources
     let res_ref = {
-        let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
-        let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+        let page = doc.get_object(*page_id).map_err(|e| AppError::Pdf(format!("Page error: {}", e)))?;
+        let page_dict = page.as_dict().map_err(|e| AppError::Pdf(format!("Page dict error: {}", e)))?;
         match page_dict.get(b"Resources") {
             Err(_) => {
                 let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
@@ -1051,12 +1050,12 @@ pub fn add_text_to_page(req: AddTextRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn add_rectangle(req: AddRectangleRequest) -> AppResult<()> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.output_path)?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
     let page_id = pages.get(&req.page)
-        .ok_or(format!("Page {} not found", req.page))?;
+        .ok_or_else(|| AppError::Pdf(format!("Page {} not found", req.page)))?;
 
     let hex = req.border_color.trim_start_matches('#');
     let br = u8::from_str_radix(&hex.get(0..2).unwrap_or("00"), 16).unwrap_or(0);
@@ -1126,12 +1125,12 @@ pub fn add_rectangle(req: AddRectangleRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn add_highlight(req: AddHighlightRequest) -> AppResult<()> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.output_path)?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
     let page_id = pages.get(&req.page)
-        .ok_or(format!("Page {} not found", req.page))?;
+        .ok_or_else(|| AppError::Pdf(format!("Page {} not found", req.page)))?;
 
     let hex = req.color.trim_start_matches('#');
     let r = u8::from_str_radix(&hex.get(0..2).unwrap_or("ff"), 16).unwrap_or(255);
@@ -1158,8 +1157,8 @@ pub fn add_highlight(req: AddHighlightRequest) -> AppResult<()> {
 
     // Handle resources (for ExtGState)
     let res_ref = {
-        let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
-        let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+        let page = doc.get_object(*page_id).map_err(|e| AppError::Pdf(format!("Page error: {}", e)))?;
+        let page_dict = page.as_dict().map_err(|e| AppError::Pdf(format!("Page dict error: {}", e)))?;
         match page_dict.get(b"Resources") {
             Err(_) => {
                 let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
@@ -1243,12 +1242,12 @@ pub struct WhiteoutRequest {
 
 #[tauri::command]
 pub fn add_whiteout(req: WhiteoutRequest) -> AppResult<()> {
-    validate_path(&req.input_path).map_err(|e| e.to_string())?;
-    validate_path(&req.output_path).map_err(|e| e.to_string())?;
+    validate_path(&req.input_path)?;
+    validate_path(&req.output_path)?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
     let page_id = pages.get(&req.page)
-        .ok_or(format!("Page {} not found", req.page))?;
+        .ok_or_else(|| AppError::Pdf(format!("Page {} not found", req.page)))?;
 
     // Draw a filled white rectangle to cover the original text
     let content = format!(
@@ -1473,12 +1472,12 @@ pub fn apply_edit_operations(
     operations: Vec<EditOp>,
 ) -> AppResult<()> {
     use std::path::Path;
-    validate_path(&input_path).map_err(|e| e.to_string())?;
-    validate_path(&output_path).map_err(|e| e.to_string())?;
+    validate_path(&input_path)?;
+    validate_path(&output_path)?;
 
     // Start with a copy of the input file
     std::fs::copy(&input_path, &output_path)
-        .map_err(|e| format!("Failed to copy file: {}", e))?;
+        .map_err(|e| AppError::Pdf(format!("Failed to copy file: {}", e)))?;
 
     let mut current_path = output_path.clone();
 
@@ -1545,7 +1544,7 @@ pub fn apply_edit_operations(
                     height: op.params["h"].as_f64().unwrap_or(20.0),
                 })?;
             }
-            other => return Err(format!("Unknown edit operation: {}", other)),
+            other => return Err(AppError::Pdf(format!("Unknown edit operation: {}", other))),
         }
 
         // Clean up intermediate file
@@ -1572,9 +1571,9 @@ pub struct PdfInfoResult {
 
 #[tauri::command]
 pub fn get_pdf_info(path: String) -> AppResult<PdfInfoResult> {
-    validate_path(&path).map_err(|e| e.to_string())?;
+    validate_path(&path)?;
     let metadata = std::fs::metadata(&path)
-        .map_err(|e| format!("Cannot read file: {}", e))?;
+        .map_err(AppError::from)?;
     let file_size = metadata.len();
 
     let doc = Document::load(&path);
