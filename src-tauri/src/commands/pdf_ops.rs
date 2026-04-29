@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use image as img_crate;
 use std::path::Path;
 
+use crate::commands::validation::validate_path;
+
 pub type ObjId = ObjectId;
 pub type AppResult<T> = Result<T, String>;
 
@@ -238,6 +240,10 @@ pub fn merge_pdfs(paths: Vec<String>, output_path: String) -> AppResult<()> {
     if paths.is_empty() {
         return Err("No input PDFs".into());
     }
+    for p in &paths {
+        validate_path(p).map_err(|e| e.to_string())?;
+    }
+    validate_path(&output_path).map_err(|e| e.to_string())?;
 
     let mut merged = load_doc(&paths[0])?;
 
@@ -315,6 +321,8 @@ pub fn merge_pdfs(paths: Vec<String>, output_path: String) -> AppResult<()> {
 
 #[tauri::command]
 pub fn rotate_pdf(req: RotatePdfRequest) -> AppResult<()> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
     let mut doc = load_doc(&req.input_path)?;
     let page_ids: Vec<ObjId> = doc.get_pages().values().copied().collect();
 
@@ -340,6 +348,8 @@ pub fn rotate_pdf(req: RotatePdfRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn delete_pages(req: DeletePagesRequest) -> AppResult<()> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
     let mut doc = load_doc(&req.input_path)?;
     doc.delete_pages(&req.pages_to_delete);
     save_doc(&mut doc, &req.output_path)
@@ -347,6 +357,7 @@ pub fn delete_pages(req: DeletePagesRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn extract_text(path: String) -> AppResult<TextExtractResult> {
+    validate_path(&path).map_err(|e| e.to_string())?;
     let doc = load_doc(&path)?;
     let pages = doc.get_pages();
 
@@ -370,6 +381,8 @@ pub fn extract_text(path: String) -> AppResult<TextExtractResult> {
 
 #[tauri::command]
 pub fn split_pdf(req: SplitPdfRequest) -> AppResult<Vec<String>> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_dir).map_err(|e| e.to_string())?;
     let doc = load_doc(&req.input_path)?;
     let total = doc.get_pages().len() as u32;
     let mut output_paths = Vec::new();
@@ -405,6 +418,8 @@ pub fn split_pdf(req: SplitPdfRequest) -> AppResult<Vec<String>> {
 
 #[tauri::command]
 pub fn extract_pages_pdf(req: ExtractPagesRequest) -> AppResult<()> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
     let mut doc = load_doc(&req.input_path)?;
     let total = doc.get_pages().len() as u32;
     let pages_to_delete: Vec<u32> = (1..=total)
@@ -420,6 +435,8 @@ pub fn extract_pages_pdf(req: ExtractPagesRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn compress_pdf(input_path: String, output_path: String) -> AppResult<CompressResult> {
+    validate_path(&input_path).map_err(|e| e.to_string())?;
+    validate_path(&output_path).map_err(|e| e.to_string())?;
     let original_size = std::fs::metadata(&input_path)
         .map(|m| m.len())
         .map_err(|e| format!("Metadata error: {}", e))?;
@@ -445,6 +462,8 @@ pub fn compress_pdf(input_path: String, output_path: String) -> AppResult<Compre
 
 #[tauri::command]
 pub fn add_text_watermark(req: WatermarkRequest) -> AppResult<()> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
 
@@ -593,6 +612,10 @@ pub fn images_to_pdf(req: ImagesToPdfRequest) -> AppResult<()> {
     if req.image_paths.is_empty() {
         return Err("No images provided".into());
     }
+    for p in &req.image_paths {
+        validate_path(p).map_err(|e| e.to_string())?;
+    }
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
 
     let mut doc = Document::with_version("1.4");
     let catalog_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
@@ -650,6 +673,8 @@ pub fn images_to_pdf(req: ImagesToPdfRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn reorder_pages(req: ReorderPagesRequest) -> AppResult<()> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
     let total = pages.len() as u32;
@@ -685,6 +710,9 @@ pub fn reorder_pages(req: ReorderPagesRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn insert_pages(req: InsertPagesRequest) -> AppResult<()> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.source_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
     let mut target = load_doc(&req.input_path)?;
     let mut source = load_doc(&req.source_path)?;
 
@@ -737,6 +765,9 @@ pub fn insert_pages(req: InsertPagesRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn sign_pdf(req: SignPdfRequest) -> AppResult<()> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.signature_image_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
     let mut doc = load_doc(&req.input_path)?;
 
     let sig_data = std::fs::read(&req.signature_image_path)
@@ -856,6 +887,7 @@ pub fn get_temp_dir() -> AppResult<String> {
 
 #[tauri::command]
 pub fn save_image_file(path: String, data: Vec<u8>) -> AppResult<()> {
+    validate_path(&path).map_err(|e| e.to_string())?;
     if let Some(parent) = std::path::Path::new(&path).parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Create dir: {}", e))?;
@@ -910,6 +942,8 @@ pub struct AddHighlightRequest {
 
 #[tauri::command]
 pub fn add_text_to_page(req: AddTextRequest) -> AppResult<()> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
     let page_id = pages.get(&req.page)
@@ -1016,6 +1050,8 @@ pub fn add_text_to_page(req: AddTextRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn add_rectangle(req: AddRectangleRequest) -> AppResult<()> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
     let page_id = pages.get(&req.page)
@@ -1089,6 +1125,8 @@ pub fn add_rectangle(req: AddRectangleRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn add_highlight(req: AddHighlightRequest) -> AppResult<()> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
     let page_id = pages.get(&req.page)
@@ -1204,6 +1242,8 @@ pub struct WhiteoutRequest {
 
 #[tauri::command]
 pub fn add_whiteout(req: WhiteoutRequest) -> AppResult<()> {
+    validate_path(&req.input_path).map_err(|e| e.to_string())?;
+    validate_path(&req.output_path).map_err(|e| e.to_string())?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
     let page_id = pages.get(&req.page)
@@ -1313,6 +1353,8 @@ mod tests {
         let p2 = create_test_pdf(dir.path(), "b.pdf", 3);
         let out = dir.path().join("merged.pdf");
         let out_str = out.to_string_lossy().to_string();
+        // Touch output so validate_path (canonicalize) succeeds
+        std::fs::write(&out, "").unwrap();
 
         merge_pdfs(vec![p1, p2], out_str.clone()).unwrap();
 
@@ -1326,6 +1368,8 @@ mod tests {
         let src = create_test_pdf(dir.path(), "r.pdf", 2);
         let out = dir.path().join("rotated.pdf");
         let out_str = out.to_string_lossy().to_string();
+        // Touch output so validate_path (canonicalize) succeeds
+        std::fs::write(&out, "").unwrap();
 
         rotate_pdf(RotatePdfRequest {
             input_path: src,
@@ -1355,6 +1399,8 @@ mod tests {
         let src = create_test_pdf(dir.path(), "d.pdf", 5);
         let out = dir.path().join("deleted.pdf");
         let out_str = out.to_string_lossy().to_string();
+        // Touch output so validate_path (canonicalize) succeeds
+        std::fs::write(&out, "").unwrap();
 
         delete_pages(DeletePagesRequest {
             input_path: src,
@@ -1390,6 +1436,8 @@ mod tests {
         let src = create_test_pdf(dir.path(), "da.pdf", 3);
         let out = dir.path().join("del_all.pdf");
         let out_str = out.to_string_lossy().to_string();
+        // Touch output so validate_path (canonicalize) succeeds
+        std::fs::write(&out, "").unwrap();
 
         // Deleting all pages — lopdf may error or produce empty doc
         let result = delete_pages(DeletePagesRequest {
@@ -1424,6 +1472,8 @@ pub fn apply_edit_operations(
     operations: Vec<EditOp>,
 ) -> AppResult<()> {
     use std::path::Path;
+    validate_path(&input_path).map_err(|e| e.to_string())?;
+    validate_path(&output_path).map_err(|e| e.to_string())?;
 
     // Start with a copy of the input file
     std::fs::copy(&input_path, &output_path)
@@ -1521,6 +1571,7 @@ pub struct PdfInfoResult {
 
 #[tauri::command]
 pub fn get_pdf_info(path: String) -> AppResult<PdfInfoResult> {
+    validate_path(&path).map_err(|e| e.to_string())?;
     let metadata = std::fs::metadata(&path)
         .map_err(|e| format!("Cannot read file: {}", e))?;
     let file_size = metadata.len();
