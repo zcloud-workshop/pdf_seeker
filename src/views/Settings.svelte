@@ -1,8 +1,11 @@
 <script lang="ts">
-  import { t } from "@/i18n/index.svelte.ts";
+  import { onMount } from "svelte";
+  import { t, setLocale } from "@/i18n/index.svelte.ts";
   import { Button, Input, Label, Separator } from "@/components/ui";
   import { invoke } from "@tauri-apps/api/core";
-  import type { AppConfig } from "@/lib/types";
+  import type { AppConfig, OcrModelSet, OcrSuggestedModel } from "@/types";
+  import { Download, CheckCircle2, XCircle, Loader2, RefreshCw, Zap, FolderCog, ExternalLink } from "lucide-svelte";
+  import { open as openPath } from "@tauri-apps/plugin-shell";
 
   let language = $state("zh");
   let theme = $state("system");
@@ -20,6 +23,22 @@
   let s3VersionTtl = $state("");
   let saveStatus = $state("");
   let connectionStatus = $state<"idle" | "testing" | "ok" | "fail">("idle");
+
+  // OCR state
+  let ocrSetupMode = $state<"paddle" | "custom">("paddle");
+  let ocrProxy = $state("");
+  let ocrBundleStatus = $state<"idle" | "downloading" | "ok" | "fail">("idle");
+  let ocrBundleMsg = $state("");
+  let ocrModelDir = $state("");
+  let ocrGpuEnabled = $state(true);
+  let ocrDetectedModels = $state<OcrModelSet[]>([]);
+  let ocrSuggestedModels = $state<OcrSuggestedModel[]>([]);
+  let ocrValidationStatus = $state<"idle" | "validating" | "ok" | "fail">("idle");
+  let ocrDownloading = $state<string | null>(null);
+  let ocrScanLoading = $state(false);
+  let ocrConfigured = $state(false);
+  let ocrApplyStatus = $state<"idle" | "applying" | "ok" | "fail">("idle");
+  let ocrApplyMsg = $state("");
 
   async function loadConfig() {
     try {
@@ -40,11 +59,128 @@
         s3MaxVersions = config.s3.max_versions?.toString() || "";
         s3VersionTtl = config.s3.version_ttl_days?.toString() || "";
       }
+      if (config.ocr) {
+        ocrSetupMode = "custom";
+        ocrModelDir = config.ocr.modelDir;
+        ocrGpuEnabled = config.ocr.gpuEnabled;
+      }
+      ocrConfigured = await invoke("ocr_check_configured");
+      ocrModelDir = await invoke("ocr_get_model_dir");
+      await scanModels(ocrModelDir);
+      loadSuggestedModels();
     } catch (_) {}
+  }
+
+  async function scanModels(dir: string) {
+    ocrScanLoading = true;
+    try {
+      ocrDetectedModels = await invoke("ocr_scan_models", { dirPath: dir });
+    } catch {
+      ocrDetectedModels = [];
+    } finally {
+      ocrScanLoading = false;
+    }
+  }
+
+  async function loadSuggestedModels() {
+    try {
+      ocrSuggestedModels = await invoke("ocr_get_suggested_models");
+    } catch {
+      ocrSuggestedModels = [];
+    }
+  }
+
+  async function openModelDir() {
+    try {
+      await openPath(ocrModelDir);
+    } catch (e) {
+      console.error("Failed to open directory:", e);
+    }
+  }
+
+  async function rescanAndApply() {
+    await scanModels(ocrModelDir);
+  }
+
+  async function applyCustomModels() {
+    if (ocrDetectedModels.length === 0) return;
+    ocrApplyStatus = "applying";
+    try {
+      await invoke("ocr_apply_local_models", {
+        language: ocrDetectedModels[0].language,
+        gpuEnabled: ocrGpuEnabled,
+      });
+      ocrApplyStatus = "ok";
+      ocrApplyMsg = t("settings.ocrDownloadSuccess");
+      ocrConfigured = true;
+    } catch (e) {
+      ocrApplyStatus = "fail";
+      ocrApplyMsg = String(e);
+    }
+    setTimeout(() => {
+      ocrApplyStatus = "idle";
+      ocrApplyMsg = "";
+    }, 4000);
+  }
+
+  async function downloadPaddleBundle() {
+    ocrBundleStatus = "downloading";
+    ocrBundleMsg = t("settings.ocrDownloadingBundle");
+    try {
+      await invoke("ocr_download_paddle_bundle", {
+        proxy: ocrProxy || null,
+      });
+      ocrBundleStatus = "ok";
+      ocrBundleMsg = t("settings.ocrDownloadSuccess");
+      ocrConfigured = true;
+      ocrGpuEnabled = true;
+      ocrModelDir = await invoke("ocr_get_model_dir");
+      await scanModels(ocrModelDir);
+    } catch (e) {
+      ocrBundleStatus = "fail";
+      ocrBundleMsg = t("settings.ocrDownloadFailed");
+      console.error("Bundle download failed:", e);
+    }
+    setTimeout(() => {
+      ocrBundleStatus = "idle";
+      ocrBundleMsg = "";
+    }, 5000);
+  }
+
+  async function downloadAdditionalModel(model: OcrSuggestedModel) {
+    ocrDownloading = model.language;
+    try {
+      if (model.recUrl) {
+        const recPath = `${ocrModelDir}/${model.language}_PP-OCRv5_mobile_rec_infer.mnn`;
+        await invoke("ocr_download_model", { url: model.recUrl, savePath: recPath, proxy: ocrProxy || null });
+      }
+      if (model.keysUrl) {
+        const keysPath = `${ocrModelDir}/ppocr_keys_${model.language}.txt`;
+        await invoke("ocr_download_model", { url: model.keysUrl, savePath: keysPath, proxy: ocrProxy || null });
+      }
+      await scanModels(ocrModelDir);
+    } catch (e) {
+      console.error("Download failed:", e);
+    } finally {
+      ocrDownloading = null;
+    }
   }
 
   async function saveConfig() {
     try {
+      let ocrConfig = null;
+      if (ocrModelDir && ocrDetectedModels.length > 0) {
+        const m = ocrDetectedModels[0];
+        ocrConfig = {
+          modelDir: ocrModelDir,
+          detModel: m.detPath.split(/[\\/]/).pop() || "",
+          recModel: m.recPath.split(/[\\/]/).pop() || "",
+          keysFile: m.keysPath.split(/[\\/]/).pop() || "",
+          language: m.language,
+          gpuEnabled: ocrGpuEnabled,
+        };
+      }
+
       const config: AppConfig = {
         general: {
           language,
@@ -67,6 +203,7 @@
               version_ttl_days: s3VersionTtl ? parseInt(s3VersionTtl) : null,
             }
           : null,
+        ocr: ocrConfig,
       };
       await invoke("update_config", { newConfig: config });
       saveStatus = t("settings.saved");
@@ -103,7 +240,7 @@
     setTimeout(() => (connectionStatus = "idle"), 4000);
   }
 
-  $effect(() => {
+  onMount(() => {
     loadConfig();
   });
 </script>
@@ -122,6 +259,7 @@
           <Label>{t("settings.language")}</Label>
           <select
             bind:value={language}
+            onchange={() => setLocale(language)}
             class="flex h-10 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
           >
             <option value="zh">中文</option>
@@ -139,6 +277,214 @@
             <option value="dark">{t("settings.themeDark")}</option>
           </select>
         </div>
+      </div>
+    </section>
+
+    <!-- OCR Settings -->
+    <section class="space-y-4">
+      <div class="flex items-center gap-2">
+        <h2 class="text-sm font-medium text-foreground">{t("settings.ocr")}</h2>
+        {#if ocrConfigured}
+          <CheckCircle2 size={14} class="text-green-600" />
+        {/if}
+      </div>
+      <Separator />
+
+      <p class="text-xs text-muted-foreground">{t("settings.ocrIntro")}</p>
+
+      <!-- Mode tabs -->
+      <div class="flex gap-2">
+        <button
+          class="flex-1 flex flex-col items-start gap-1 p-3 rounded-lg border transition-colors {ocrSetupMode === 'paddle' ? 'border-primary bg-primary/5' : 'border-border hover:bg-muted'}"
+          onclick={() => (ocrSetupMode = "paddle")}
+        >
+          <div class="flex items-center gap-1.5">
+            <Zap size={14} class={ocrSetupMode === 'paddle' ? 'text-primary' : 'text-muted-foreground'} />
+            <span class="text-sm font-medium">{t("settings.ocrMethodPaddle")}</span>
+          </div>
+          <span class="text-xs text-muted-foreground">{t("settings.ocrMethodPaddleDesc")}</span>
+        </button>
+        <button
+          class="flex-1 flex flex-col items-start gap-1 p-3 rounded-lg border transition-colors {ocrSetupMode === 'custom' ? 'border-primary bg-primary/5' : 'border-border hover:bg-muted'}"
+          onclick={() => (ocrSetupMode = "custom")}
+        >
+          <div class="flex items-center gap-1.5">
+            <FolderCog size={14} class={ocrSetupMode === 'custom' ? 'text-primary' : 'text-muted-foreground'} />
+            <span class="text-sm font-medium">{t("settings.ocrMethodCustom")}</span>
+          </div>
+          <span class="text-xs text-muted-foreground">{t("settings.ocrMethodCustomDesc")}</span>
+        </button>
+      </div>
+
+      <!-- Proxy -->
+      <div class="space-y-1">
+        <Label>{t("settings.ocrProxy")}</Label>
+        <Input bind:value={ocrProxy} placeholder={t("settings.ocrProxyPlaceholder")} />
+        <p class="text-xs text-muted-foreground">{t("settings.ocrProxyHint")}</p>
+      </div>
+
+      <!-- PaddleOCR path -->
+      {#if ocrSetupMode === "paddle"}
+        <div class="space-y-3 p-4 rounded-lg border border-border bg-muted/30">
+          {#if ocrBundleStatus === "ok"}
+            <div class="flex items-center gap-2 text-sm text-green-700">
+              <CheckCircle2 size={16} />
+              <span>{ocrBundleMsg}</span>
+            </div>
+          {:else if ocrBundleStatus === "fail"}
+            <div class="flex items-center gap-2 text-sm text-destructive">
+              <XCircle size={16} />
+              <span>{ocrBundleMsg}</span>
+            </div>
+          {/if}
+
+          <Button
+            onclick={downloadPaddleBundle}
+            disabled={ocrBundleStatus === "downloading"}
+            class="w-full"
+          >
+            {#if ocrBundleStatus === "downloading"}
+              <Loader2 size={14} class="animate-spin" />
+              <span class="ml-2">{t("settings.ocrDownloadingBundle")}</span>
+            {:else}
+              <Download size={14} class="mr-1.5" />
+              {t("settings.ocrOneClickDownload")}
+            {/if}
+          </Button>
+
+          <!-- Additional language models -->
+          {#if ocrConfigured && ocrSuggestedModels.length > 1}
+            <div class="space-y-1.5 pt-2">
+              <Label class="text-xs">{t("settings.ocrSuggestedModels")}</Label>
+              <p class="text-xs text-muted-foreground">{t("settings.ocrSuggestedModelsHint")}</p>
+              <div class="space-y-1">
+                {#each ocrSuggestedModels.filter(m => m.language !== "default") as model (model.language)}
+                  <div class="flex items-center justify-between px-3 py-2 rounded-lg border border-border text-sm">
+                    <div>
+                      <span class="text-foreground">{model.name}</span>
+                      <span class="text-muted-foreground text-xs ml-2">{model.totalSize}</span>
+                      <p class="text-xs text-muted-foreground">{model.description}</p>
+                    </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onclick={() => downloadAdditionalModel(model)}
+                      disabled={ocrDownloading !== null}
+                    >
+                      {#if ocrDownloading === model.language}
+                        <Loader2 size={14} class="animate-spin" />
+                      {:else}
+                        <Download size={14} class="mr-1" />
+                      {/if}
+                      {ocrDownloading === model.language
+                        ? t("settings.ocrDownloading")
+                        : t("settings.ocrDownload")}
+                    </Button>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </div>
+      {/if}
+
+      <!-- Custom path: guide user to copy files to app directory -->
+      {#if ocrSetupMode === "custom"}
+        <div class="space-y-3 p-4 rounded-lg border border-border bg-muted/30">
+          <!-- Step 1: Show model directory -->
+          <div class="space-y-1.5">
+            <Label>{t("settings.ocrModelDir")}</Label>
+            <div class="flex items-center gap-2">
+              <Input readonly value={ocrModelDir} class="flex-1 text-xs font-mono" />
+              <Button variant="outline" size="sm" onclick={openModelDir}>
+                <FolderCog size={14} class="mr-1" />{t("settings.ocrBrowse")}
+              </Button>
+            </div>
+            <p class="text-xs text-muted-foreground">{t("settings.ocrCustomStep1")}</p>
+            <ul class="list-disc list-inside text-xs text-muted-foreground space-y-0.5 ml-1">
+              <li><code class="text-foreground/80 bg-muted px-1 rounded">{t("settings.ocrCustomDet")}</code></li>
+              <li><code class="text-foreground/80 bg-muted px-1 rounded">{t("settings.ocrCustomRec")}</code></li>
+              <li><code class="text-foreground/80 bg-muted px-1 rounded">{t("settings.ocrCustomKeys")}</code></li>
+            </ul>
+          </div>
+
+          <!-- Step 2: Model download link -->
+          <div class="space-y-1">
+            <p class="text-xs text-muted-foreground">{t("settings.ocrCustomStep3")}</p>
+            <a
+              href="https://github.com/zibo-chen/rust-paddle-ocr/tree/next/models"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+            >
+              github.com/zibo-chen/rust-paddle-ocr/tree/next/models
+              <ExternalLink size={10} />
+            </a>
+            <p class="text-xs text-muted-foreground">{t("settings.ocrCustomStep2")}</p>
+            <p class="text-xs text-muted-foreground">{t("settings.ocrCustomStep4")}</p>
+          </div>
+
+          <Separator />
+
+          <!-- Step 3: Scan + detected models -->
+          <div class="space-y-1.5">
+            <div class="flex items-center justify-between">
+              <Label>{t("settings.ocrDetectedModels")}</Label>
+              <button
+                class="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-1"
+                onclick={rescanAndApply}
+              >
+                <RefreshCw size={12} class={ocrScanLoading ? 'animate-spin' : ''} />
+                Rescan
+              </button>
+            </div>
+            {#if ocrDetectedModels.length > 0}
+              <div class="space-y-1">
+                {#each ocrDetectedModels as model}
+                  <div class="flex items-center gap-2 px-3 py-2 rounded-lg border border-border text-sm">
+                    <CheckCircle2 size={14} class="text-green-600 shrink-0" />
+                    <span class="text-foreground">{model.displayName}</span>
+                  </div>
+                {/each}
+              </div>
+            {:else if !ocrScanLoading}
+              <p class="text-xs text-muted-foreground">{t("settings.ocrNoModels")}</p>
+            {/if}
+          </div>
+
+          <!-- Apply button -->
+          {#if ocrApplyStatus === "ok"}
+            <div class="flex items-center gap-2 text-sm text-green-700">
+              <CheckCircle2 size={16} />
+              <span>{ocrApplyMsg}</span>
+            </div>
+          {:else if ocrApplyStatus === "fail"}
+            <div class="flex items-center gap-2 text-sm text-destructive">
+              <XCircle size={16} />
+              <span>{ocrApplyMsg}</span>
+            </div>
+          {/if}
+          <Button
+            onclick={applyCustomModels}
+            disabled={ocrDetectedModels.length === 0 || ocrApplyStatus === "applying"}
+            class="w-full"
+          >
+            {#if ocrApplyStatus === "applying"}
+              <Loader2 size={14} class="animate-spin" />
+            {:else}
+              <CheckCircle2 size={14} class="mr-1.5" />
+            {/if}
+            {ocrApplyStatus === "applying" ? "Applying..." : "Apply Models"}
+          </Button>
+        </div>
+      {/if}
+
+      <!-- GPU toggle -->
+      <div class="flex items-center gap-2">
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="checkbox" bind:checked={ocrGpuEnabled} class="rounded" />
+          <span class="text-muted-foreground">{t("settings.ocrGpuEnabled")}</span>
+        </label>
       </div>
     </section>
 

@@ -124,7 +124,8 @@
     "noConfig": "请在设置中配置 S3 存储以启用云功能"
   },
   "editor": {
-    "save": "保存编辑"
+    "save": "保存编辑",
+    "saveAs": "另存为"
   },
   "print": {
     "title": "打印",

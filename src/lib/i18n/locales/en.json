@@ -124,7 +124,8 @@
     "noConfig": "Configure S3 storage in Settings to enable cloud features"
   },
   "editor": {
-    "save": "Save Edits"
+    "save": "Save Edits",
+    "saveAs": "Save As"
   },
   "print": {
     "title": "Print",
