@@ -1,6 +1,7 @@
 use lopdf::{Document, Object, ObjectId};
 use serde::{Deserialize, Serialize};
 use image as img_crate;
+use std::path::Path;
 
 pub type ObjId = ObjectId;
 pub type AppResult<T> = Result<T, String>;
@@ -843,68 +844,6 @@ pub fn sign_pdf(req: SignPdfRequest) -> AppResult<()> {
     save_doc(&mut doc, &req.output_path)
 }
 
-// ==================== OCR ====================
-
-#[tauri::command]
-pub fn check_tesseract_available() -> bool {
-    std::process::Command::new("tesseract")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-#[tauri::command]
-pub fn ocr_extract_from_images(req: OcrRequest) -> AppResult<TextExtractResult> {
-    if !check_tesseract_available() {
-        return Err("Tesseract OCR is not installed. Please install it from https://github.com/tesseract-ocr/tesseract".into());
-    }
-
-    let mut full_text = String::new();
-    let mut page_count = 0usize;
-
-    let mut entries: Vec<_> = std::fs::read_dir(&req.image_dir)
-        .map_err(|e| format!("Read dir '{}': {}", req.image_dir, e))?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("png"))
-                .unwrap_or(false)
-        })
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in &entries {
-        let path = entry.path();
-        let output = std::process::Command::new("tesseract")
-            .arg(&path)
-            .arg("stdout")
-            .arg("-l")
-            .arg(&req.language)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map_err(|e| format!("Tesseract error: {}", e))?;
-
-        if output.status.success() {
-            page_count += 1;
-            let text = String::from_utf8_lossy(&output.stdout);
-            full_text.push_str(&format!("\n--- Page {} ---\n", page_count));
-            full_text.push_str(&text);
-            full_text.push('\n');
-        }
-    }
-
-    if page_count == 0 {
-        return Err("No text could be extracted from the images".into());
-    }
-
-    Ok(TextExtractResult { text: full_text, pages: page_count })
-}
-
 // ==================== Temp Directory ====================
 
 #[tauri::command]
@@ -1251,6 +1190,68 @@ pub fn add_highlight(req: AddHighlightRequest) -> AppResult<()> {
     save_doc(&mut doc, &req.output_path)
 }
 
+// ==================== Whiteout (cover text area) ====================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WhiteoutRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub page: u32,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[tauri::command]
+pub fn add_whiteout(req: WhiteoutRequest) -> AppResult<()> {
+    let mut doc = load_doc(&req.input_path)?;
+    let pages = doc.get_pages();
+    let page_id = pages.get(&req.page)
+        .ok_or(format!("Page {} not found", req.page))?;
+
+    // Draw a filled white rectangle to cover the original text
+    let content = format!(
+        "1 1 1 rg {} {} {} {} re f",
+        req.x, req.y, req.width, req.height
+    ).into_bytes();
+
+    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+        lopdf::Dictionary::new(), content,
+    )));
+
+    // Append content stream
+    let has_contents_ref: Option<ObjectId> = {
+        let page_obj = doc.objects.get(page_id).unwrap();
+        let dict = page_obj.as_dict().unwrap();
+        match dict.get(b"Contents") {
+            Ok(c) => {
+                if let Ok(r) = c.as_reference() { Some(r) }
+                else if let Ok(arr) = c.as_array() { Some(doc.add_object(Object::Array(arr.clone()))) }
+                else { None }
+            }
+            Err(_) => None,
+        }
+    };
+    let new_contents_ref = match has_contents_ref {
+        Some(existing_ref) => {
+            let arr = Object::Array(vec![
+                Object::Reference(existing_ref),
+                Object::Reference(content_id),
+            ]);
+            doc.add_object(arr)
+        }
+        None => content_id,
+    };
+    let page_obj = doc.objects.get_mut(page_id).unwrap();
+    if let Ok(dict) = page_obj.as_dict_mut() {
+        dict.set("Contents", Object::Reference(new_contents_ref));
+    }
+
+    save_doc(&mut doc, &req.output_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1405,6 +1406,176 @@ mod tests {
                 assert_eq!(doc.get_pages().len(), 0);
             }
             Err(_) => {} // Also acceptable
+        }
+    }
+}
+
+// ==================== Apply Edit Operations (batch) ====================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditOp {
+    pub op_type: String,
+    pub params: serde_json::Value,
+}
+
+#[tauri::command]
+pub fn apply_edit_operations(
+    input_path: String,
+    output_path: String,
+    operations: Vec<EditOp>,
+) -> AppResult<()> {
+    use std::path::Path;
+
+    // Start with a copy of the input file
+    std::fs::copy(&input_path, &output_path)
+        .map_err(|e| format!("Failed to copy file: {}", e))?;
+
+    let mut current_path = output_path.clone();
+
+    for (i, op) in operations.iter().enumerate() {
+        // Use a temp output path for intermediate steps
+        let next_path = if i == operations.len() - 1 {
+            output_path.clone()
+        } else {
+            format!("{}.tmp_edit_{}", output_path, i)
+        };
+
+        match op.op_type.as_str() {
+            "addText" => {
+                add_text_to_page(AddTextRequest {
+                    input_path: current_path.clone(),
+                    output_path: next_path.clone(),
+                    text: op.params["text"].as_str().unwrap_or("").to_string(),
+                    page: op.params["page"].as_u64().unwrap_or(1) as u32,
+                    x: op.params["x"].as_f64().unwrap_or(72.0),
+                    y: op.params["y"].as_f64().unwrap_or(720.0),
+                    font_size: op.params["fontSize"].as_f64().unwrap_or(12.0),
+                    color: op.params["color"].as_str().unwrap_or("#000000").to_string(),
+                })?;
+            }
+            "addRectangle" => {
+                add_rectangle(AddRectangleRequest {
+                    input_path: current_path.clone(),
+                    output_path: next_path.clone(),
+                    page: op.params["page"].as_u64().unwrap_or(1) as u32,
+                    x: op.params["x"].as_f64().unwrap_or(100.0),
+                    y: op.params["y"].as_f64().unwrap_or(100.0),
+                    width: op.params["w"].as_f64().unwrap_or(200.0),
+                    height: op.params["h"].as_f64().unwrap_or(50.0),
+                    border_color: op.params["borderColor"].as_str().unwrap_or("#000000").to_string(),
+                    fill_color: if op.params["hasFill"].as_bool().unwrap_or(false) {
+                        Some(op.params["fillColor"].as_str().unwrap_or("#ffffff").to_string())
+                    } else {
+                        None
+                    },
+                    border_width: op.params["borderWidth"].as_f64().unwrap_or(1.0),
+                })?;
+            }
+            "addHighlight" => {
+                add_highlight(AddHighlightRequest {
+                    input_path: current_path.clone(),
+                    output_path: next_path.clone(),
+                    page: op.params["page"].as_u64().unwrap_or(1) as u32,
+                    x: op.params["x"].as_f64().unwrap_or(100.0),
+                    y: op.params["y"].as_f64().unwrap_or(100.0),
+                    width: op.params["w"].as_f64().unwrap_or(200.0),
+                    height: op.params["h"].as_f64().unwrap_or(20.0),
+                    color: op.params["color"].as_str().unwrap_or("#ffff00").to_string(),
+                    opacity: op.params["opacity"].as_f64().unwrap_or(0.4),
+                })?;
+            }
+            "addWhiteout" => {
+                add_whiteout(WhiteoutRequest {
+                    input_path: current_path.clone(),
+                    output_path: next_path.clone(),
+                    page: op.params["page"].as_u64().unwrap_or(1) as u32,
+                    x: op.params["x"].as_f64().unwrap_or(0.0),
+                    y: op.params["y"].as_f64().unwrap_or(0.0),
+                    width: op.params["w"].as_f64().unwrap_or(100.0),
+                    height: op.params["h"].as_f64().unwrap_or(20.0),
+                })?;
+            }
+            other => return Err(format!("Unknown edit operation: {}", other)),
+        }
+
+        // Clean up intermediate file
+        if current_path != input_path && Path::new(&current_path).exists() {
+            let _ = std::fs::remove_file(&current_path);
+        }
+        current_path = next_path;
+    }
+
+    Ok(())
+}
+
+// ─── PDF Info ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfInfoResult {
+    pub is_encrypted: bool,
+    pub pages: u32,
+    pub file_size: u64,
+    pub title: Option<String>,
+    pub author: Option<String>,
+}
+
+#[tauri::command]
+pub fn get_pdf_info(path: String) -> AppResult<PdfInfoResult> {
+    let metadata = std::fs::metadata(&path)
+        .map_err(|e| format!("Cannot read file: {}", e))?;
+    let file_size = metadata.len();
+
+    let doc = Document::load(&path);
+
+    match doc {
+        Ok(d) => {
+            let is_encrypted = d.is_encrypted();
+            let pages = if is_encrypted { 0 } else { d.get_pages().len() as u32 };
+
+            let title = d.trailer.get(b"Info")
+                .ok()
+                .and_then(|obj| obj.as_reference().ok())
+                .and_then(|id| d.objects.get(&id))
+                .and_then(|obj| {
+                    if let Object::Dictionary(dict) = obj {
+                        dict.get(b"Title").ok().and_then(|t| {
+                            let bytes: &[u8] = t.as_str().ok()?;
+                            String::from_utf8(bytes.to_vec()).ok()
+                        })
+                    } else { None }
+                });
+            let author = d.trailer.get(b"Info")
+                .ok()
+                .and_then(|obj| obj.as_reference().ok())
+                .and_then(|id| d.objects.get(&id))
+                .and_then(|obj| {
+                    if let Object::Dictionary(dict) = obj {
+                        dict.get(b"Author").ok().and_then(|a| {
+                            let bytes: &[u8] = a.as_str().ok()?;
+                            String::from_utf8(bytes.to_vec()).ok()
+                        })
+                    } else { None }
+                });
+            Ok(PdfInfoResult {
+                is_encrypted,
+                pages,
+                file_size,
+                title,
+                author,
+            })
+        }
+        Err(e) => {
+            let err_str = format!("{}", e);
+            let is_encrypted = err_str.contains("encrypted") || err_str.contains("password");
+            Ok(PdfInfoResult {
+                is_encrypted,
+                pages: 0,
+                file_size,
+                title: None,
+                author: None,
+            })
         }
     }
 }
