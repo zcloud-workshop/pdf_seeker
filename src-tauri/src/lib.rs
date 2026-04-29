@@ -12,6 +12,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .manage(Mutex::new(initial_config))
+        .manage(commands::recent::RecentFilesState(Mutex::new(Vec::new())))
         .setup(|app| {
             config::init(app.handle())?;
             Ok(())
