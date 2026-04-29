@@ -887,8 +887,9 @@ pub fn get_temp_dir() -> AppResult<String> {
 
 #[tauri::command]
 pub fn save_image_file(path: String, data: Vec<u8>) -> AppResult<()> {
-    validate_path(&path).map_err(|e| e.to_string())?;
-    if let Some(parent) = std::path::Path::new(&path).parent() {
+    let path_obj = std::path::Path::new(&path);
+    if let Some(parent) = path_obj.parent() {
+        validate_path(&parent.to_string_lossy()).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Create dir: {}", e))?;
     }

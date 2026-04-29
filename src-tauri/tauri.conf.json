@@ -22,11 +22,20 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data: blob:"
+    }
+  },
+  "plugins": {
+    "fs": {
+      "requireLiteralLeadingDot": false
+    },
+    "shell": {
+      "open": true
     }
   },
   "bundle": {
     "active": true,
+    "resources": ["models/*", "models/ocr/*"],
     "targets": "all",
     "icon": [
       "icons/32x32.png",

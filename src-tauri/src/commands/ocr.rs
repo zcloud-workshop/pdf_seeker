@@ -811,8 +811,8 @@ pub async fn ocr_download_model(
     save_path: String,
     proxy: Option<String>,
 ) -> AppResult<()> {
-    if url.is_empty() {
-        return Ok(());
+    if url.is_empty() || !url.starts_with("https://") {
+        return Err(AppError::Ocr("URL must use HTTPS scheme".to_string()));
     }
 
     let mut builder = reqwest::Client::builder()
