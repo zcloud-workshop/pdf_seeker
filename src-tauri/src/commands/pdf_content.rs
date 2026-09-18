@@ -190,10 +190,15 @@ mod tests {
         let page_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
             (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
             (b"Parent".to_vec(), Object::Reference(pages_id)),
-            (b"MediaBox".to_vec(), Object::Array(vec![
-                Object::Integer(0), Object::Integer(0),
-                Object::Integer(612), Object::Integer(792),
-            ])),
+            (
+                b"MediaBox".to_vec(),
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(612),
+                    Object::Integer(792),
+                ]),
+            ),
         ])));
         if let Some(pages_obj) = doc.objects.get_mut(&pages_id) {
             if let Ok(d) = pages_obj.as_dict_mut() {
@@ -207,9 +212,10 @@ mod tests {
     /// Create a page that already has a Resources reference and a Contents stream.
     fn create_page_with_resources_and_content() -> (ObjectId, Document) {
         let (page_id, mut doc) = create_empty_page_doc();
-        let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"Font".to_vec(), Object::Dictionary(lopdf::Dictionary::new())),
-        ])));
+        let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+            b"Font".to_vec(),
+            Object::Dictionary(lopdf::Dictionary::new()),
+        )])));
         let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
             lopdf::Dictionary::new(),
             b"BT /F1 12 Tf (Hello) Tj ET".to_vec(),
@@ -251,9 +257,13 @@ mod tests {
         {
             let page_obj = doc.objects.get_mut(&page_id).unwrap();
             let dict = page_obj.as_dict_mut().unwrap();
-            dict.set("Resources", Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                (b"XObject".to_vec(), Object::Dictionary(lopdf::Dictionary::new())),
-            ])));
+            dict.set(
+                "Resources",
+                Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                    b"XObject".to_vec(),
+                    Object::Dictionary(lopdf::Dictionary::new()),
+                )])),
+            );
         }
         let (needs_update, res_id) = get_or_create_resources(&mut doc, &page_id).unwrap();
         assert!(needs_update);
@@ -270,9 +280,7 @@ mod tests {
         assert!(needs_update);
 
         let font_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
-        ensure_resource_entry(
-            &mut doc, res_id, "Font", b"F1", Object::Reference(font_id),
-        ).unwrap();
+        ensure_resource_entry(&mut doc, res_id, "Font", b"F1", Object::Reference(font_id)).unwrap();
 
         let obj = doc.get_object(res_id).unwrap();
         let res_dict = obj.as_dict().unwrap();
@@ -287,8 +295,13 @@ mod tests {
 
         let gs_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
         ensure_resource_entry(
-            &mut doc, res_id, "ExtGState", b"GS1", Object::Reference(gs_id),
-        ).unwrap();
+            &mut doc,
+            res_id,
+            "ExtGState",
+            b"GS1",
+            Object::Reference(gs_id),
+        )
+        .unwrap();
 
         let obj = doc.get_object(res_id).unwrap();
         let res_dict = obj.as_dict().unwrap();

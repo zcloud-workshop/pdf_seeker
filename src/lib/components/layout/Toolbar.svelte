@@ -12,6 +12,8 @@
     Minimize,
     PanelLeftClose,
     PanelLeft,
+    Info,
+    X,
   } from "lucide-svelte";
   import {
     currentFilePath,
@@ -22,17 +24,42 @@
     sidebarCollapsed,
   } from "@/stores";
   import { invoke } from "@tauri-apps/api/core";
+  import PdfInfoDialog from "@/components/editor/PdfInfoDialog.svelte";
+
+  let infoDialogOpen = $state(false);
+
+  function handleCloseDocument() {
+    currentFilePath.set("");
+    currentFileName.set("");
+    currentView.set("home");
+  }
+
+  function handleKeydown(e: KeyboardEvent) {
+    if ((e.metaKey || e.ctrlKey) && e.key === "i" && $currentFilePath) {
+      e.preventDefault();
+      infoDialogOpen = true;
+    }
+  }
 
   async function handleOpen() {
     const selected = await open({
       multiple: false,
-      filters: [{ name: "PDF", extensions: ["pdf"] }],
+      filters: [
+        {
+          name: "所有支持的文档与电子书 (*.pdf, *.epub, *.cbz, *.txt, *.md)",
+          extensions: ["pdf", "epub", "cbz", "txt", "md", "markdown"],
+        },
+        { name: "PDF 文档 (*.pdf)", extensions: ["pdf"] },
+        { name: "EPUB 电子书 (*.epub)", extensions: ["epub"] },
+        { name: "漫画归档 (*.cbz)", extensions: ["cbz"] },
+        { name: "纯文本与 Markdown (*.txt, *.md)", extensions: ["txt", "md", "markdown"] },
+      ],
     });
     if (selected) {
       const path = typeof selected === "string" ? selected : String(selected);
       currentFilePath.set(path);
       currentFileName.set(path.split(/[\\/]/).pop() || "Untitled");
-      currentView.set("viewer");
+      currentView.set("editor");
       try {
         await invoke("add_recent_file", { path });
       } catch (_) {}
@@ -94,24 +121,33 @@
 
   <div class="flex-1"></div>
 
-  {#if $currentFileName}
-    <span
-      class="text-xs text-muted-foreground truncate max-w-[200px] mr-2"
-      title={$currentFileName}
-    >
-      {$currentFileName}
-    </span>
+  {#if $currentFilePath}
+    <div class="flex items-center gap-1.5 bg-accent/30 hover:bg-accent/50 px-2.5 py-1 rounded-lg border border-border/50 text-xs transition-colors mr-2">
+      <span
+        class="text-xs font-medium text-foreground truncate max-w-[180px]"
+        title={$currentFilePath}
+      >
+        {$currentFileName}
+      </span>
+      <Tooltip message="文档属性 (⌘I)">
+        <button
+          onclick={() => (infoDialogOpen = true)}
+          class="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-background/80 transition-colors"
+        >
+          <Info size={13} />
+        </button>
+      </Tooltip>
+      <div class="h-3 w-px bg-border/60"></div>
+      <Tooltip message="关闭当前文档">
+        <button
+          onclick={handleCloseDocument}
+          class="p-1 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+        >
+          <X size={13} />
+        </button>
+      </Tooltip>
+    </div>
   {/if}
-
-  <Tooltip message={$isFullscreen ? "Exit Fullscreen" : "Fullscreen (F11)"}>
-    <Button variant="ghost" size="icon" onclick={toggleFullscreen}>
-      {#if $isFullscreen}
-        <Minimize size={18} />
-      {:else}
-        <Maximize size={18} />
-      {/if}
-    </Button>
-  </Tooltip>
 
   <Tooltip message={$isDark ? t("settings.themeLight") : t("settings.themeDark")}>
     <Button variant="ghost" size="icon" onclick={toggleTheme}>
@@ -123,3 +159,7 @@
     </Button>
   </Tooltip>
 </header>
+
+<svelte:window onkeydown={handleKeydown} />
+
+<PdfInfoDialog bind:open={infoDialogOpen} />

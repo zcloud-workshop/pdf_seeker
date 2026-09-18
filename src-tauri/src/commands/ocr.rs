@@ -77,6 +77,7 @@ const MODEL_BASE_URL: &str =
 
 // ─── Engine State ─────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct OcrEngineHolder {
     engine: ocr_rs::OcrEngine,
     language: String,
@@ -209,10 +210,7 @@ pub async fn ocr_init_engine(
         #[cfg(target_os = "macos")]
         {
             backend_name = "metal";
-            Some(
-                ocr_rs::OcrEngineConfig::new()
-                    .with_backend(ocr_rs::Backend::Metal),
-            )
+            Some(ocr_rs::OcrEngineConfig::new().with_backend(ocr_rs::Backend::Metal))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -225,18 +223,37 @@ pub async fn ocr_init_engine(
     };
 
     let engine = ocr_rs::OcrEngine::new(
-        det.to_str().unwrap(),
-        rec.to_str().unwrap(),
-        keys.to_str().unwrap(),
+        det.to_str()
+            .ok_or_else(|| AppError::Ocr("Detection model path contains invalid UTF-8".into()))?,
+        rec.to_str()
+            .ok_or_else(|| AppError::Ocr("Recognition model path contains invalid UTF-8".into()))?,
+        keys.to_str()
+            .ok_or_else(|| AppError::Ocr("Keys file path contains invalid UTF-8".into()))?,
         config,
     )
     .map_err(|e| AppError::Ocr(format!("Engine init failed: {}", e)))?;
 
     // Record effective model paths for language switching
-    let model_dir = det.parent().unwrap_or(Path::new(".")).to_string_lossy().to_string();
-    let det_model = det.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let rec_model = rec.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let keys_file = keys.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let model_dir = det
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_string_lossy()
+        .to_string();
+    let det_model = det
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let rec_model = rec
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let keys_file = keys
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
 
     let mut guard = OCR_ENGINE
         .lock()
@@ -270,10 +287,7 @@ fn recognize_image(image_path: &str) -> AppResult<Vec<OcrTextBox>> {
         .ok_or_else(|| AppError::Ocr("OCR engine not initialized".into()))?;
 
     if !std::path::Path::new(image_path).exists() {
-        return Err(AppError::Ocr(format!(
-            "Image not found: {}",
-            image_path
-        )));
+        return Err(AppError::Ocr(format!("Image not found: {}", image_path)));
     }
 
     let img = image::open(image_path)
@@ -341,9 +355,7 @@ pub async fn ocr_recognize(
             let guard = OCR_ENGINE
                 .lock()
                 .map_err(|e| AppError::Ocr(format!("Lock: {}", e)))?;
-            guard
-                .as_ref()
-                .map_or(true, |h| h.language != *lang)
+            guard.as_ref().map_or(true, |h| h.language != *lang)
         };
         if needs_reinit {
             ocr_init_engine(app_handle, Some(lang.clone()), Some(true)).await?;
@@ -382,11 +394,11 @@ pub async fn ocr_recognize_structured(
         let ay = a.points.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
         let by = b.points.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
         ay.partial_cmp(&by)
-            .unwrap()
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
                 let ax = a.points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
                 let bx = b.points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
-                ax.partial_cmp(&bx).unwrap()
+                ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal)
             })
     });
 
@@ -404,7 +416,7 @@ pub async fn ocr_recognize_structured(
         12.0
     } else {
         let mut h = heights;
-        h.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        h.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         h[h.len() / 2]
     };
 
@@ -457,9 +469,7 @@ pub async fn ocr_recognize_structured(
 // ─── Language Management ─────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn ocr_get_languages(
-    app_handle: tauri::AppHandle,
-) -> AppResult<Vec<OcrLanguage>> {
+pub async fn ocr_get_languages(app_handle: tauri::AppHandle) -> AppResult<Vec<OcrLanguage>> {
     let models_dir = if let Some(ref cfg) = get_ocr_config(&app_handle)? {
         PathBuf::from(&cfg.model_dir)
     } else {
@@ -489,8 +499,7 @@ pub async fn ocr_get_languages(
                 }
                 // Check for matching keys file
                 let keys_name = format!("ppocr_keys_{}.txt", code);
-                let has_keys = models_dir.join(&keys_name).exists()
-                    || default_keys.exists();
+                let has_keys = models_dir.join(&keys_name).exists() || default_keys.exists();
                 if has_keys {
                     languages.push(OcrLanguage {
                         code: code.to_string(),
@@ -618,10 +627,12 @@ pub async fn ocr_scan_models(dir_path: String) -> AppResult<Vec<OcrModelSet>> {
     let mut model_sets = Vec::new();
 
     // Match default model set
-    let default_det = det_files.iter().find(|(n, _)| n.contains("PP-OCRv5_mobile_det"));
-    let default_rec = rec_files
+    let default_det = det_files
         .iter()
-        .find(|(n, _)| n == "PP-OCRv5_mobile_rec.mnn" || (!n.contains('_') && n.contains("PP-OCRv5")));
+        .find(|(n, _)| n.contains("PP-OCRv5_mobile_det"));
+    let default_rec = rec_files.iter().find(|(n, _)| {
+        n == "PP-OCRv5_mobile_rec.mnn" || (!n.contains('_') && n.contains("PP-OCRv5"))
+    });
     let default_keys = keys_files
         .iter()
         .find(|(n, _)| n == "ppocr_keys_v5.txt" || n == "ppocr_keys.txt");
@@ -642,11 +653,13 @@ pub async fn ocr_scan_models(dir_path: String) -> AppResult<Vec<OcrModelSet>> {
         if code.is_empty() {
             continue;
         }
-        let lang_keys = keys_files.iter().find(|(n, _)| {
-            n.contains(code) || n == "ppocr_keys_v5.txt" || n == "ppocr_keys.txt"
-        });
+        let lang_keys = keys_files
+            .iter()
+            .find(|(n, _)| n.contains(code) || n == "ppocr_keys_v5.txt" || n == "ppocr_keys.txt");
 
-        let det_match = det_files.iter().find(|(n, _)| n.contains("PP-OCRv5_mobile_det"));
+        let det_match = det_files
+            .iter()
+            .find(|(n, _)| n.contains("PP-OCRv5_mobile_det"));
 
         if let (Some(det), Some(keys)) = (det_match, lang_keys) {
             model_sets.push(OcrModelSet {
@@ -775,7 +788,8 @@ pub async fn ocr_get_suggested_models(
         OcrSuggestedModel {
             name: "PP-OCRv5 Latin".to_string(),
             language: "latin".to_string(),
-            description: "French, German, Spanish, Italian... (requires shared det model)".to_string(),
+            description: "French, German, Spanish, Italian... (requires shared det model)"
+                .to_string(),
             det_url: String::new(),
             rec_url: format!("{}/latin_PP-OCRv5_mobile_rec_infer.mnn", base),
             keys_url: format!("{}/ppocr_keys_latin.txt", base),
@@ -815,8 +829,7 @@ pub async fn ocr_download_model(
         return Err(AppError::Ocr("URL must use HTTPS scheme".to_string()));
     }
 
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300));
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300));
 
     if let Some(ref proxy_url) = proxy {
         if !proxy_url.is_empty() {
@@ -869,20 +882,32 @@ pub async fn ocr_download_paddle_bundle(
 
     let base = MODEL_BASE_URL;
     let files = [
-        ("PP-OCRv5_mobile_det.mnn", format!("{}/PP-OCRv5_mobile_det.mnn", base)),
-        ("PP-OCRv5_mobile_rec.mnn", format!("{}/PP-OCRv5_mobile_rec.mnn", base)),
+        (
+            "PP-OCRv5_mobile_det.mnn",
+            format!("{}/PP-OCRv5_mobile_det.mnn", base),
+        ),
+        (
+            "PP-OCRv5_mobile_rec.mnn",
+            format!("{}/PP-OCRv5_mobile_rec.mnn", base),
+        ),
         ("ppocr_keys_v5.txt", format!("{}/ppocr_keys_v5.txt", base)),
     ];
 
     for (filename, url) in &files {
         let save_path = models_dir.join(filename);
-        ocr_download_model(app_handle.clone(), url.clone(), save_path.to_string_lossy().to_string(), proxy.clone()).await?;
+        ocr_download_model(
+            app_handle.clone(),
+            url.clone(),
+            save_path.to_string_lossy().to_string(),
+            proxy.clone(),
+        )
+        .await?;
     }
 
     // Auto-configure and init engine
-    let det = models_dir.join("PP-OCRv5_mobile_det.mnn");
-    let rec = models_dir.join("PP-OCRv5_mobile_rec.mnn");
-    let keys = models_dir.join("ppocr_keys_v5.txt");
+    let _det = models_dir.join("PP-OCRv5_mobile_det.mnn");
+    let _rec = models_dir.join("PP-OCRv5_mobile_rec.mnn");
+    let _keys = models_dir.join("ppocr_keys_v5.txt");
 
     let ocr_config = OcrConfig {
         model_dir: models_dir.to_string_lossy().to_string(),
@@ -954,7 +979,11 @@ pub async fn ocr_apply_local_models(
         )
     };
 
-    for (name, path) in [("det", models_dir.join(&det_name)), ("rec", models_dir.join(&rec_name)), ("keys", models_dir.join(&keys_name))] {
+    for (name, path) in [
+        ("det", models_dir.join(&det_name)),
+        ("rec", models_dir.join(&rec_name)),
+        ("keys", models_dir.join(&keys_name)),
+    ] {
         if !path.exists() {
             return Err(AppError::Ocr(format!(
                 "Model file '{}' not found at {:?}. Please copy the file to the model directory.",
@@ -984,3 +1013,34 @@ pub async fn ocr_apply_local_models(
 
     ocr_init_engine(app_handle, Some(language), Some(gpu_enabled)).await
 }
+
+#[tauri::command]
+pub fn ocr_cluster_paragraphs(
+    boxes: Vec<OcrTextBox>,
+) -> Vec<crate::pdf::text_postprocess::ClusteredParagraph> {
+    let bboxes: Vec<crate::pdf::text_postprocess::BoundingBox> = boxes
+        .into_iter()
+        .map(|b| crate::pdf::text_postprocess::BoundingBox {
+            points: b.points,
+            text: b.text,
+            confidence: b.confidence,
+        })
+        .collect();
+    crate::pdf::text_postprocess::cluster_ocr_boxes(&bboxes)
+}
+
+#[tauri::command]
+pub fn ocr_detect_tables(
+    boxes: Vec<OcrTextBox>,
+) -> Vec<crate::pdf::text_postprocess::DetectedTable> {
+    let bboxes: Vec<crate::pdf::text_postprocess::BoundingBox> = boxes
+        .into_iter()
+        .map(|b| crate::pdf::text_postprocess::BoundingBox {
+            points: b.points,
+            text: b.text,
+            confidence: b.confidence,
+        })
+        .collect();
+    crate::pdf::text_postprocess::detect_tables(&bboxes)
+}
+

@@ -1,1350 +1,71 @@
-use lopdf::{Document, Object, ObjectId};
-use serde::{Deserialize, Serialize};
-use image as img_crate;
-
-use crate::commands::validation::validate_path;
-use crate::error::{AppError, AppResult};
-
-pub type ObjId = ObjectId;
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RotatePdfRequest {
-    pub input_path: String,
-    pub output_path: String,
-    pub angle: i32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeletePagesRequest {
-    pub input_path: String,
-    pub output_path: String,
-    pub pages_to_delete: Vec<u32>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TextExtractResult {
-    pub text: String,
-    pub pages: usize,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SplitPdfRequest {
-    pub input_path: String,
-    pub output_dir: String,
-    pub mode: String,
-    pub ranges: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExtractPagesRequest {
-    pub input_path: String,
-    pub output_path: String,
-    pub pages_to_extract: Vec<u32>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CompressResult {
-    pub original_size: u64,
-    pub compressed_size: u64,
-    pub ratio: f64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WatermarkRequest {
-    pub input_path: String,
-    pub output_path: String,
-    pub text: String,
-    pub font_size: f64,
-    pub opacity: f64,
-    pub angle: f64,
-    pub color: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ImagesToPdfRequest {
-    pub image_paths: Vec<String>,
-    pub output_path: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReorderPagesRequest {
-    pub input_path: String,
-    pub output_path: String,
-    pub new_order: Vec<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InsertPagesRequest {
-    pub input_path: String,
-    pub source_path: String,
-    pub output_path: String,
-    pub insert_position: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SignPdfRequest {
-    pub input_path: String,
-    pub output_path: String,
-    pub signature_image_path: String,
-    pub page: u32,
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OcrRequest {
-    pub image_dir: String,
-    pub language: String,
-}
-
-fn load_doc(path: &str) -> AppResult<Document> {
-    Document::load(path).map_err(|e| AppError::Pdf(format!("Load '{}': {}", path, e)))
-}
-
-fn save_doc(doc: &mut Document, path: &str) -> AppResult<()> {
-    doc.save(path)
-        .map(|_| ())
-        .map_err(|e| AppError::Pdf(format!("Save '{}': {}", path, e)))
-}
-
-fn escape_pdf_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-     .replace('(', "\\(")
-     .replace(')', "\\)")
-}
-
-fn parse_page_ranges(ranges: &str, max: u32) -> AppResult<Vec<Vec<u32>>> {
-    if ranges.trim().is_empty() {
-        return Err(AppError::Pdf("Empty ranges".into()));
-    }
-    let mut result = Vec::new();
-    for part in ranges.split(',') {
-        let trimmed = part.trim();
-        if trimmed.is_empty() { continue; }
-        if trimmed.contains('-') {
-            let nums: Vec<&str> = trimmed.split('-').collect();
-            if nums.len() != 2 { return Err(AppError::Pdf(format!("Invalid range: {}", trimmed))); }
-            let s: u32 = nums[0].parse().map_err(|_| AppError::Pdf(format!("Invalid number: {}", nums[0])))?;
-            let e: u32 = nums[1].parse().map_err(|_| AppError::Pdf(format!("Invalid number: {}", nums[1])))?;
-            if s < 1 || e > max || s > e { return Err(AppError::Pdf(format!("Range {} out of bounds (1-{})", trimmed, max))); }
-            result.push((s..=e).collect());
-        } else {
-            let n: u32 = trimmed.parse().map_err(|_| AppError::Pdf(format!("Invalid number: {}", trimmed)))?;
-            if n < 1 || n > max { return Err(AppError::Pdf(format!("Page {} out of bounds (1-{})", n, max))); }
-            result.push(vec![n]);
-        }
-    }
-    if result.is_empty() { return Err(AppError::Pdf("No valid ranges".into())); }
-    Ok(result)
-}
-
-fn embed_image(doc: &mut Document, data: &[u8], path: &str) -> AppResult<(ObjectId, u32, u32)> {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    if ext == "jpg" || ext == "jpeg" {
-        let img = img_crate::load_from_memory(data)
-            .map_err(|e| AppError::Pdf(format!("Image decode: {}", e)))?;
-        let (w, h) = (img.width(), img.height());
-        let dict = lopdf::Dictionary::from_iter(vec![
-            (b"Type".to_vec(), Object::Name(b"XObject".to_vec())),
-            (b"Subtype".to_vec(), Object::Name(b"Image".to_vec())),
-            (b"Width".to_vec(), Object::Integer(w as i64)),
-            (b"Height".to_vec(), Object::Integer(h as i64)),
-            (b"ColorSpace".to_vec(), Object::Name(b"DeviceRGB".to_vec())),
-            (b"BitsPerComponent".to_vec(), Object::Integer(8)),
-            (b"Filter".to_vec(), Object::Name(b"DCTDecode".to_vec())),
-        ]);
-        let id = doc.add_object(Object::Stream(lopdf::Stream::new(dict, data.to_vec())));
-        Ok((id, w, h))
-    } else {
-        let img = img_crate::load_from_memory(data)
-            .map_err(|e| AppError::Pdf(format!("Image decode: {}", e)))?;
-        let rgba = img.to_rgba8();
-        let (w, h) = (rgba.width(), rgba.height());
-        let mut rgb_data = Vec::with_capacity((w * h * 3) as usize);
-        let mut alpha_data = Vec::with_capacity((w * h) as usize);
-        for px in rgba.pixels() {
-            rgb_data.extend_from_slice(&[px[0], px[1], px[2]]);
-            alpha_data.push(px[3]);
-        }
-        let dict = lopdf::Dictionary::from_iter(vec![
-            (b"Type".to_vec(), Object::Name(b"XObject".to_vec())),
-            (b"Subtype".to_vec(), Object::Name(b"Image".to_vec())),
-            (b"Width".to_vec(), Object::Integer(w as i64)),
-            (b"Height".to_vec(), Object::Integer(h as i64)),
-            (b"ColorSpace".to_vec(), Object::Name(b"DeviceRGB".to_vec())),
-            (b"BitsPerComponent".to_vec(), Object::Integer(8)),
-            (b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec())),
-        ]);
-        let id = doc.add_object(Object::Stream(lopdf::Stream::new(dict, rgb_data)));
-        let smask_dict = lopdf::Dictionary::from_iter(vec![
-            (b"Type".to_vec(), Object::Name(b"XObject".to_vec())),
-            (b"Subtype".to_vec(), Object::Name(b"Image".to_vec())),
-            (b"Width".to_vec(), Object::Integer(w as i64)),
-            (b"Height".to_vec(), Object::Integer(h as i64)),
-            (b"ColorSpace".to_vec(), Object::Name(b"DeviceGray".to_vec())),
-            (b"BitsPerComponent".to_vec(), Object::Integer(8)),
-            (b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec())),
-        ]);
-        let smask_id = doc.add_object(Object::Stream(lopdf::Stream::new(smask_dict, alpha_data)));
-        if let Some(obj) = doc.objects.get_mut(&id) {
-            if let Ok(stream) = obj.as_stream_mut() {
-                stream.dict.set(b"SMask", Object::Reference(smask_id));
-            }
-        }
-        Ok((id, w, h))
-    }
-}
-
-fn get_pages_ref(doc: &Document) -> AppResult<ObjectId> {
-    let root_ref = doc.trailer.get(b"Root")
-        .and_then(|o| o.as_reference())
-        .map_err(|e| AppError::Pdf(format!("Root error: {}", e)))?;
-    doc.get_object(root_ref)
-        .and_then(|o| o.as_dict())
-        .and_then(|d| d.get(b"Pages"))
-        .and_then(|o| o.as_reference())
-        .map_err(|e| AppError::Pdf(format!("Pages error: {}", e)))
-}
-
-fn get_page_size(page_dict: &lopdf::Dictionary) -> (f64, f64) {
-    page_dict.get(b"MediaBox").ok()
-        .and_then(|mb| mb.as_array().ok())
-        .map(|arr| {
-            let w = arr.get(2).and_then(|o| o.as_i64().ok()).unwrap_or(612) as f64;
-            let h = arr.get(3).and_then(|o| o.as_i64().ok()).unwrap_or(792) as f64;
-            (w, h)
-        })
-        .unwrap_or((612.0, 792.0))
-}
-
-#[tauri::command]
-pub fn merge_pdfs(paths: Vec<String>, output_path: String) -> AppResult<()> {
-    if paths.is_empty() {
-        return Err(AppError::Pdf("No input PDFs".into()));
-    }
-    for p in &paths {
-        validate_path(p)?;
-    }
-    validate_path(&output_path)?;
-
-    let mut merged = load_doc(&paths[0])?;
-
-    for path in paths.iter().skip(1) {
-        let mut doc = load_doc(path)?;
-
-        // Collect page IDs and all object IDs BEFORE renumbering
-        let old_page_ids: Vec<ObjId> = doc.get_pages().values().copied().collect();
-        let mut sorted_old_ids: Vec<ObjId> = doc.objects.keys().copied().collect();
-        sorted_old_ids.sort();
-
-        // Renumber so IDs don't collide with merged's objects
-        let start_id = merged.max_id + 1;
-        doc.renumber_objects_with(start_id);
-
-        // Build old→new ID mapping (sorted old IDs → sequential new IDs)
-        let id_map: std::collections::BTreeMap<ObjId, ObjId> = sorted_old_ids
-            .iter()
-            .enumerate()
-            .map(|(i, old)| (*old, (start_id + i as u32, 0)))
-            .collect();
-
-        // Map old page IDs to new IDs
-        let doc_pages: Vec<ObjId> = old_page_ids
-            .iter()
-            .map(|old| *id_map.get(old).unwrap_or(old))
-            .collect();
-
-        for (id, obj) in doc.objects {
-            merged.objects.insert(id, obj);
-        }
-        // Update max_id so save() includes all objects in the xref table
-        if let Some(max_key) = merged.objects.keys().max() {
-            merged.max_id = merged.max_id.max(max_key.0);
-        }
-
-        let root_ref = merged
-            .trailer
-            .get(b"Root")
-            .and_then(|o| o.as_reference())
-            .map_err(|e| AppError::Pdf(format!("Root error: {}", e)))?;
-
-        let pages_ref = merged
-            .get_object(root_ref)
-            .and_then(|o| o.as_dict())
-            .and_then(|d| d.get(b"Pages"))
-            .and_then(|o| o.as_reference())
-            .map_err(|e| AppError::Pdf(format!("Pages error: {}", e)))?;
-
-        let merged_count = merged.get_pages().len();
-
-        let pages_obj = merged
-            .objects
-            .get_mut(&pages_ref)
-            .ok_or_else(|| AppError::Pdf("Pages object missing".into()))?;
-
-        let pages_dict = pages_obj
-            .as_dict_mut()
-            .map_err(|e| AppError::Pdf(format!("Pages dict error: {}", e)))?;
-
-        if let Ok(kids) = pages_dict.get_mut(b"Kids") {
-            if let Ok(arr) = kids.as_array_mut() {
-                for page_id in &doc_pages {
-                    arr.push(Object::Reference(*page_id));
-                }
-            }
-        }
-
-        let total_count = (merged_count + doc_pages.len()) as i64;
-        pages_dict.set("Count", Object::Integer(total_count));
-    }
-
-    save_doc(&mut merged, &output_path)
-}
-
-#[tauri::command]
-pub fn rotate_pdf(req: RotatePdfRequest) -> AppResult<()> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.output_path)?;
-    let mut doc = load_doc(&req.input_path)?;
-    let page_ids: Vec<ObjId> = doc.get_pages().values().copied().collect();
-
-    for page_id in page_ids {
-        if let Some(page_obj) = doc.objects.get_mut(&page_id) {
-            if let Ok(dict) = page_obj.as_dict_mut() {
-                let cur = dict
-                    .get(b"Rotate")
-                    .ok()
-                    .and_then(|o| o.as_i64().ok())
-                    .unwrap_or(0);
-
-                dict.set(
-                    "Rotate",
-                    Object::Integer((cur + req.angle as i64) % 360),
-                );
-            }
-        }
-    }
-
-    save_doc(&mut doc, &req.output_path)
-}
-
-#[tauri::command]
-pub fn delete_pages(req: DeletePagesRequest) -> AppResult<()> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.output_path)?;
-    let mut doc = load_doc(&req.input_path)?;
-    doc.delete_pages(&req.pages_to_delete);
-    save_doc(&mut doc, &req.output_path)
-}
-
-#[tauri::command]
-pub fn extract_text(path: String) -> AppResult<TextExtractResult> {
-    validate_path(&path)?;
-    let doc = load_doc(&path)?;
-    let pages = doc.get_pages();
-
-    let mut full_text = String::new();
-
-    for (page_num, _) in pages.iter() {
-        if let Ok(text) = doc.extract_text(&[*page_num]) {
-            full_text.push_str(&format!("\n--- Page {} ---\n", page_num));
-            full_text.push_str(&text);
-            full_text.push('\n');
-        }
-    }
-
-    Ok(TextExtractResult {
-        text: full_text,
-        pages: pages.len(),
-    })
-}
-
-// ==================== Split PDF ====================
-
-#[tauri::command]
-pub fn split_pdf(req: SplitPdfRequest) -> AppResult<Vec<String>> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.output_dir)?;
-    let doc = load_doc(&req.input_path)?;
-    let total = doc.get_pages().len() as u32;
-    let mut output_paths = Vec::new();
-
-    let ranges = if req.mode == "single" {
-        (1..=total).map(|p| vec![p]).collect::<Vec<_>>()
-    } else {
-        parse_page_ranges(&req.ranges.unwrap_or_default(), total)?
-    };
-
-    for range in &ranges {
-        let mut doc_clone = doc.clone();
-        let pages_to_delete: Vec<u32> = (1..=total)
-            .filter(|p| !range.contains(p))
-            .collect();
-        if !pages_to_delete.is_empty() {
-            doc_clone.delete_pages(&pages_to_delete);
-        }
-        let name = if range.len() == 1 {
-            format!("page_{}.pdf", range[0])
-        } else {
-            format!("pages_{}-{}.pdf", range[0], range[range.len() - 1])
-        };
-        let output_path = format!("{}/{}", req.output_dir.trim_end_matches('/').trim_end_matches('\\'), name);
-        save_doc(&mut doc_clone, &output_path)?;
-        output_paths.push(output_path);
-    }
-
-    Ok(output_paths)
-}
-
-// ==================== Extract Pages ====================
-
-#[tauri::command]
-pub fn extract_pages_pdf(req: ExtractPagesRequest) -> AppResult<()> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.output_path)?;
-    let mut doc = load_doc(&req.input_path)?;
-    let total = doc.get_pages().len() as u32;
-    let pages_to_delete: Vec<u32> = (1..=total)
-        .filter(|p| !req.pages_to_extract.contains(p))
-        .collect();
-    if !pages_to_delete.is_empty() {
-        doc.delete_pages(&pages_to_delete);
-    }
-    save_doc(&mut doc, &req.output_path)
-}
-
-// ==================== Compress PDF ====================
-
-#[tauri::command]
-pub fn compress_pdf(input_path: String, output_path: String) -> AppResult<CompressResult> {
-    validate_path(&input_path)?;
-    validate_path(&output_path)?;
-    let original_size = std::fs::metadata(&input_path)
-        .map(|m| m.len())
-        .map_err(AppError::from)?;
-
-    let mut doc = load_doc(&input_path)?;
-    doc.compress();
-    save_doc(&mut doc, &output_path)?;
-
-    let compressed_size = std::fs::metadata(&output_path)
-        .map(|m| m.len())
-        .map_err(AppError::from)?;
-
-    let ratio = if original_size > 0 {
-        (1.0 - compressed_size as f64 / original_size as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    Ok(CompressResult { original_size, compressed_size, ratio })
-}
-
-// ==================== Text Watermark ====================
-
-#[tauri::command]
-pub fn add_text_watermark(req: WatermarkRequest) -> AppResult<()> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.output_path)?;
-    let mut doc = load_doc(&req.input_path)?;
-    let pages = doc.get_pages();
-
-    // Parse color from hex string
-    let hex = req.color.trim_start_matches('#');
-    let r = u8::from_str_radix(&hex.get(0..2).unwrap_or("88"), 16).unwrap_or(136);
-    let g = u8::from_str_radix(&hex.get(2..4).unwrap_or("88"), 16).unwrap_or(136);
-    let b = u8::from_str_radix(&hex.get(4..6).unwrap_or("88"), 16).unwrap_or(136);
-
-    // Create standard font
-    let font_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-        (b"Type".to_vec(), Object::Name(b"Font".to_vec())),
-        (b"Subtype".to_vec(), Object::Name(b"Type1".to_vec())),
-        (b"BaseFont".to_vec(), Object::Name(b"Helvetica".to_vec())),
-        (b"Encoding".to_vec(), Object::Name(b"WinAnsiEncoding".to_vec())),
-    ])));
-
-    for (_, page_id) in pages.iter() {
-        let page = doc.get_object(*page_id).map_err(|e| AppError::Pdf(format!("Page error: {}", e)))?;
-        let page_dict = page.as_dict().map_err(|e| AppError::Pdf(format!("Page dict error: {}", e)))?;
-        let (pw, ph) = get_page_size(page_dict);
-
-        let opacity = req.opacity.min(1.0).max(0.0);
-        let angle_rad = req.angle.to_radians();
-        let cos_a = angle_rad.cos();
-        let sin_a = angle_rad.sin();
-        let cx = pw / 2.0;
-        let cy = ph / 2.0;
-        let escaped = escape_pdf_string(&req.text);
-
-        // Graphics state for opacity
-        let gs_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"Type".to_vec(), Object::Name(b"ExtGState".to_vec())),
-            (b"ca".to_vec(), Object::Real(opacity as f32)),
-        ])));
-
-        let neg_sin = -sin_a;
-        let watermark_bytes = format!(
-            "q /GS1 gs BT /F1 {fs:.1} Tf {cos:.4} {sin:.4} {neg_sin:.4} {cos:.4} {cx:.1} {cy:.1} Tm {r:.3} {g:.3} {b:.3} rg ({escaped}) Tj ET Q",
-            fs = req.font_size, cos = cos_a, sin = sin_a, neg_sin = neg_sin, cx = cx, cy = cy,
-            r = r as f64 / 255.0, g = g as f64 / 255.0, b = b as f64 / 255.0, escaped = escaped
-        ).into_bytes();
-
-        let watermark_id = doc.add_object(Object::Stream(lopdf::Stream::new(lopdf::Dictionary::new(), watermark_bytes)));
-
-        // Phase 1: get or create resources (immutable read first)
-        // Handle: no Resources, Resources as reference, Resources as inline dict
-        let res_ref = {
-            let page = doc.get_object(*page_id).map_err(|e| AppError::Pdf(format!("Page error: {}", e)))?;
-            let page_dict = page.as_dict().map_err(|e| AppError::Pdf(format!("Page dict error: {}", e)))?;
-            match page_dict.get(b"Resources") {
-                Err(_) => {
-                    let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
-                    (res_id, true) // needs update on page
-                }
-                Ok(res_obj) => {
-                    if let Ok(r) = res_obj.as_reference() {
-                        (r, false) // already a reference, no update needed
-                    } else {
-                        // Inline dictionary — promote to standalone object
-                        let res_id = doc.add_object(res_obj.clone());
-                        (res_id, true) // needs update on page
-                    }
-                }
-            }
-        };
-
-        // Phase 2: add font + gs to resources
-        if let Some(res_obj) = doc.objects.get_mut(&res_ref.0) {
-            if let Ok(res_dict) = res_obj.as_dict_mut() {
-                if res_dict.get(b"Font").is_err() {
-                    res_dict.set("Font", Object::Dictionary(lopdf::Dictionary::new()));
-                }
-                if let Ok(font_d) = res_dict.get_mut(b"Font") {
-                    if let Ok(fd) = font_d.as_dict_mut() {
-                        fd.set("F1", Object::Reference(font_id));
-                    }
-                }
-                if res_dict.get(b"ExtGState").is_err() {
-                    res_dict.set("ExtGState", Object::Dictionary(lopdf::Dictionary::new()));
-                }
-                if let Ok(gs_d) = res_dict.get_mut(b"ExtGState") {
-                    if let Ok(gd) = gs_d.as_dict_mut() {
-                        gd.set("GS1", Object::Reference(gs_id));
-                    }
-                }
-            }
-        }
-
-        // Phase 3: set resources on page if newly created
-        if res_ref.1 {
-            if let Some(page_obj) = doc.objects.get_mut(page_id) {
-                if let Ok(dict) = page_obj.as_dict_mut() {
-                    dict.set("Resources", Object::Reference(res_ref.0));
-                }
-            }
-        }
-
-        // Phase 4: append watermark content (two-phase to avoid double borrow)
-        {
-            // Phase 4a: read current contents
-            let has_contents_ref: Option<ObjectId> = {
-                let page_obj = doc.objects.get(page_id).unwrap();
-                let dict = page_obj.as_dict().unwrap();
-                match dict.get(b"Contents") {
-                    Ok(c) => {
-                        if let Ok(r) = c.as_reference() {
-                            Some(r)
-                        } else if let Ok(arr) = c.as_array() {
-                            Some(doc.add_object(Object::Array(arr.clone())))
-                        } else {
-                            None
-                        }
-                    }
-                    Err(_) => None,
-                }
-            };
-
-            // Phase 4b: create new contents array (no borrow held)
-            let new_contents_ref = match has_contents_ref {
-                Some(existing_ref) => {
-                    let arr = Object::Array(vec![
-                        Object::Reference(existing_ref),
-                        Object::Reference(watermark_id),
-                    ]);
-                    doc.add_object(arr)
-                }
-                None => watermark_id,
-            };
-
-            // Phase 4c: set contents on page
-            let page_obj = doc.objects.get_mut(page_id).unwrap();
-            if let Ok(dict) = page_obj.as_dict_mut() {
-                dict.set("Contents", Object::Reference(new_contents_ref));
-            }
-        }
-    }
-
-    save_doc(&mut doc, &req.output_path)
-}
-
-// ==================== Images to PDF ====================
-
-#[tauri::command]
-pub fn images_to_pdf(req: ImagesToPdfRequest) -> AppResult<()> {
-    if req.image_paths.is_empty() {
-        return Err(AppError::Pdf("No images provided".into()));
-    }
-    for p in &req.image_paths {
-        validate_path(p)?;
-    }
-    validate_path(&req.output_path)?;
-
-    let mut doc = Document::with_version("1.4");
-    let catalog_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
-    let pages_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-        (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
-        (b"Count".to_vec(), Object::Integer(req.image_paths.len() as i64)),
-        (b"Kids".to_vec(), Object::Array(vec![])),
-    ])));
-    if let Some(cat) = doc.objects.get_mut(&catalog_id) {
-        if let Ok(d) = cat.as_dict_mut() {
-            d.set("Type", Object::Name(b"Catalog".to_vec()));
-            d.set("Pages", Object::Reference(pages_id));
-        }
-    }
-    doc.trailer.set(b"Root", Object::Reference(catalog_id));
-
-    let mut kids = Vec::new();
-    for image_path in &req.image_paths {
-        let data = std::fs::read(image_path)
-            .map_err(|e| AppError::Pdf(format!("Read '{}': {}", image_path, e)))?;
-        let (image_id, w, h) = embed_image(&mut doc, &data, image_path)?;
-
-        let content = format!("q {} 0 0 {} 0 0 cm /Im1 Do Q", w, h);
-        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
-            lopdf::Dictionary::new(), content.into_bytes(),
-        )));
-        let resources_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"XObject".to_vec(), Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                (b"Im1".to_vec(), Object::Reference(image_id)),
-            ]))),
-        ])));
-        let page_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
-            (b"Parent".to_vec(), Object::Reference(pages_id)),
-            (b"MediaBox".to_vec(), Object::Array(vec![
-                Object::Integer(0), Object::Integer(0),
-                Object::Integer(w as i64), Object::Integer(h as i64),
-            ])),
-            (b"Contents".to_vec(), Object::Reference(content_id)),
-            (b"Resources".to_vec(), Object::Reference(resources_id)),
-        ])));
-        kids.push(Object::Reference(page_id));
-    }
-
-    if let Some(pages_obj) = doc.objects.get_mut(&pages_id) {
-        if let Ok(d) = pages_obj.as_dict_mut() {
-            d.set("Kids", Object::Array(kids));
-        }
-    }
-
-    save_doc(&mut doc, &req.output_path)
-}
-
-// ==================== Reorder Pages ====================
-
-#[tauri::command]
-pub fn reorder_pages(req: ReorderPagesRequest) -> AppResult<()> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.output_path)?;
-    let mut doc = load_doc(&req.input_path)?;
-    let pages = doc.get_pages();
-    let total = pages.len() as u32;
-
-    if req.new_order.len() != total as usize {
-        return Err(AppError::Pdf(format!("Expected {} page numbers, got {}", total, req.new_order.len())));
-    }
-
-    let mut current_order: Vec<(u32, ObjectId)> = pages.iter().map(|(n, id)| (*n, *id)).collect();
-    current_order.sort_by_key(|(n, _)| *n);
-
-    let mut new_kids = Vec::new();
-    for page_num in &req.new_order {
-        if *page_num < 1 || *page_num > total {
-            return Err(AppError::Pdf(format!("Invalid page number: {}", page_num)));
-        }
-        let (_, page_id) = current_order.iter().find(|(n, _)| *n == *page_num)
-            .ok_or_else(|| AppError::Pdf(format!("Page {} not found", page_num)))?;
-        new_kids.push(Object::Reference(*page_id));
-    }
-
-    let pages_ref = get_pages_ref(&doc)?;
-    if let Some(pages_obj) = doc.objects.get_mut(&pages_ref) {
-        if let Ok(dict) = pages_obj.as_dict_mut() {
-            dict.set("Kids", Object::Array(new_kids));
-        }
-    }
-
-    save_doc(&mut doc, &req.output_path)
-}
-
-// ==================== Insert Pages ====================
-
-#[tauri::command]
-pub fn insert_pages(req: InsertPagesRequest) -> AppResult<()> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.source_path)?;
-    validate_path(&req.output_path)?;
-    let mut target = load_doc(&req.input_path)?;
-    let mut source = load_doc(&req.source_path)?;
-
-    let old_source_page_ids: Vec<ObjectId> = source.get_pages().values().copied().collect();
-    let mut sorted_old_ids: Vec<ObjectId> = source.objects.keys().copied().collect();
-    sorted_old_ids.sort();
-
-    let start_id = target.max_id + 1;
-    source.renumber_objects_with(start_id);
-
-    let id_map: std::collections::BTreeMap<ObjectId, ObjectId> = sorted_old_ids
-        .iter().enumerate()
-        .map(|(i, old)| (*old, (start_id + i as u32, 0)))
-        .collect();
-
-    let source_page_ids: Vec<ObjectId> = old_source_page_ids
-        .iter().map(|old| *id_map.get(old).unwrap_or(old)).collect();
-
-    for (id, obj) in source.objects {
-        target.objects.insert(id, obj);
-    }
-    if let Some(max_key) = target.objects.keys().max() {
-        target.max_id = target.max_id.max(max_key.0);
-    }
-
-    let target_count = target.get_pages().len();
-    let pos = req.insert_position as usize;
-    if pos > target_count {
-        return Err(AppError::Pdf(format!("Insert position {} exceeds page count {}", pos, target_count)));
-    }
-
-    let pages_ref = get_pages_ref(&target)?;
-    if let Some(pages_obj) = target.objects.get_mut(&pages_ref) {
-        if let Ok(dict) = pages_obj.as_dict_mut() {
-            if let Ok(kids) = dict.get_mut(b"Kids") {
-                if let Ok(arr) = kids.as_array_mut() {
-                    for (i, page_id) in source_page_ids.iter().enumerate() {
-                        arr.insert(pos + i, Object::Reference(*page_id));
-                    }
-                }
-            }
-            dict.set("Count", Object::Integer((target_count + source_page_ids.len()) as i64));
-        }
-    }
-
-    save_doc(&mut target, &req.output_path)
-}
-
-// ==================== Sign PDF (visual) ====================
-
-#[tauri::command]
-pub fn sign_pdf(req: SignPdfRequest) -> AppResult<()> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.signature_image_path)?;
-    validate_path(&req.output_path)?;
-    let mut doc = load_doc(&req.input_path)?;
-
-    let sig_data = std::fs::read(&req.signature_image_path)
-        .map_err(|e| AppError::Pdf(format!("Read signature: {}", e)))?;
-    let (image_id, _w, _h) = embed_image(&mut doc, &sig_data, &req.signature_image_path)?;
-
-    let pages = doc.get_pages();
-    let page_id = pages.get(&req.page)
-        .ok_or_else(|| AppError::Pdf(format!("Page {} not found", req.page)))?;
-
-    let content = format!(
-        "q {} 0 0 {} {} {} cm /SigImg Do Q",
-        req.width, req.height, req.x, req.y
-    );
-    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
-        lopdf::Dictionary::new(), content.into_bytes(),
-    )));
-
-    // Get or create resources reference first
-    // Handle: no Resources, Resources as reference, Resources as inline dict
-    let (res_needs_page_update, res_id) = {
-        let page = doc.get_object(*page_id).map_err(|e| AppError::Pdf(format!("Page error: {}", e)))?;
-        let page_dict = page.as_dict().map_err(|e| AppError::Pdf(format!("Page dict error: {}", e)))?;
-        match page_dict.get(b"Resources") {
-            Err(_) => {
-                let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
-                (true, res_id)
-            }
-            Ok(res_obj) => {
-                if let Ok(r) = res_obj.as_reference() {
-                    (false, r)
-                } else {
-                    // Inline dictionary — promote to standalone object
-                    let res_id = doc.add_object(res_obj.clone());
-                    (true, res_id)
-                }
-            }
-        }
-    };
-
-    // Merge XObject into resources (preserves existing entries)
-    if let Some(res_obj) = doc.objects.get_mut(&res_id) {
-        if let Ok(res_dict) = res_obj.as_dict_mut() {
-            if res_dict.get(b"XObject").is_err() {
-                res_dict.set("XObject", Object::Dictionary(lopdf::Dictionary::new()));
-            }
-            if let Ok(xo_d) = res_dict.get_mut(b"XObject") {
-                if let Ok(xd) = xo_d.as_dict_mut() {
-                    xd.set("SigImg", Object::Reference(image_id));
-                }
-            }
-        }
-    }
-
-    // Set resources reference on page if newly created or promoted
-    if res_needs_page_update {
-        if let Some(page_obj) = doc.objects.get_mut(page_id) {
-            if let Ok(dict) = page_obj.as_dict_mut() {
-                dict.set("Resources", Object::Reference(res_id));
-            }
-        }
-    }
-
-    // Append content stream to page (two-phase to avoid double borrow)
-    {
-        // Phase 1: read current Contents
-        let has_contents_ref: Option<ObjectId> = {
-            let page_obj = doc.objects.get(page_id).unwrap();
-            let dict = page_obj.as_dict().unwrap();
-            match dict.get(b"Contents") {
-                Ok(c) => {
-                    if let Ok(r) = c.as_reference() {
-                        Some(r)
-                    } else if let Ok(arr) = c.as_array() {
-                        Some(doc.add_object(Object::Array(arr.clone())))
-                    } else {
-                        None
-                    }
-                }
-                Err(_) => None,
-            }
-        };
-
-        // Phase 2: create new contents array (no borrow held)
-        let new_contents_ref = match has_contents_ref {
-            Some(existing_ref) => {
-                let arr = Object::Array(vec![
-                    Object::Reference(existing_ref),
-                    Object::Reference(content_id),
-                ]);
-                doc.add_object(arr)
-            }
-            None => content_id,
-        };
-
-        // Phase 3: set contents on page
-        let page_obj = doc.objects.get_mut(page_id).unwrap();
-        if let Ok(dict) = page_obj.as_dict_mut() {
-            dict.set("Contents", Object::Reference(new_contents_ref));
-        }
-    }
-
-    save_doc(&mut doc, &req.output_path)
-}
-
-// ==================== Temp Directory ====================
-
-#[tauri::command]
-pub fn get_temp_dir() -> AppResult<String> {
-    let dir = std::env::temp_dir().join("pdf_seeker_ocr");
-    std::fs::create_dir_all(&dir)
-        .map_err(AppError::from)?;
-    Ok(dir.to_string_lossy().to_string())
-}
-
-// ==================== Save Image File (bypasses fs plugin) ====================
-
-#[tauri::command]
-pub fn save_image_file(path: String, data: Vec<u8>) -> AppResult<()> {
-    let path_obj = std::path::Path::new(&path);
-    if let Some(parent) = path_obj.parent() {
-        validate_path(&parent.to_string_lossy())?;
-        std::fs::create_dir_all(parent)
-            .map_err(AppError::from)?;
-    }
-    std::fs::write(&path, &data)
-        .map_err(|e| AppError::Pdf(format!("Write '{}': {}", path, e)))
-}
-
-// ==================== PDF Editing ====================
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AddTextRequest {
-    pub input_path: String,
-    pub output_path: String,
-    pub text: String,
-    pub page: u32,
-    pub x: f64,
-    pub y: f64,
-    pub font_size: f64,
-    pub color: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AddRectangleRequest {
-    pub input_path: String,
-    pub output_path: String,
-    pub page: u32,
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-    pub border_color: String,
-    pub fill_color: Option<String>,
-    pub border_width: f64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AddHighlightRequest {
-    pub input_path: String,
-    pub output_path: String,
-    pub page: u32,
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-    pub color: String,
-    pub opacity: f64,
-}
-
-#[tauri::command]
-pub fn add_text_to_page(req: AddTextRequest) -> AppResult<()> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.output_path)?;
-    let mut doc = load_doc(&req.input_path)?;
-    let pages = doc.get_pages();
-    let page_id = pages.get(&req.page)
-        .ok_or_else(|| AppError::Pdf(format!("Page {} not found", req.page)))?;
-
-    let hex = req.color.trim_start_matches('#');
-    let r = u8::from_str_radix(&hex.get(0..2).unwrap_or("00"), 16).unwrap_or(0);
-    let g = u8::from_str_radix(&hex.get(2..4).unwrap_or("00"), 16).unwrap_or(0);
-    let b = u8::from_str_radix(&hex.get(4..6).unwrap_or("00"), 16).unwrap_or(0);
-
-    let font_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-        (b"Type".to_vec(), Object::Name(b"Font".to_vec())),
-        (b"Subtype".to_vec(), Object::Name(b"Type1".to_vec())),
-        (b"BaseFont".to_vec(), Object::Name(b"Helvetica".to_vec())),
-        (b"Encoding".to_vec(), Object::Name(b"WinAnsiEncoding".to_vec())),
-    ])));
-
-    let escaped = escape_pdf_string(&req.text);
-    let content = format!(
-        "BT /F1 {fs:.1} Tf {r:.3} {g:.3} {b:.3} rg {x:.1} {y:.1} Td ({escaped}) Tj ET",
-        fs = req.font_size,
-        r = r as f64 / 255.0, g = g as f64 / 255.0, b = b as f64 / 255.0,
-        x = req.x, y = req.y, escaped = escaped
-    ).into_bytes();
-
-    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(lopdf::Dictionary::new(), content)));
-
-    // Handle resources
-    let res_ref = {
-        let page = doc.get_object(*page_id).map_err(|e| AppError::Pdf(format!("Page error: {}", e)))?;
-        let page_dict = page.as_dict().map_err(|e| AppError::Pdf(format!("Page dict error: {}", e)))?;
-        match page_dict.get(b"Resources") {
-            Err(_) => {
-                let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
-                (res_id, true)
-            }
-            Ok(res_obj) => {
-                if let Ok(r) = res_obj.as_reference() {
-                    (r, false)
-                } else {
-                    let res_id = doc.add_object(res_obj.clone());
-                    (res_id, true)
-                }
-            }
-        }
-    };
-
-    // Add font to resources
-    if let Some(res_obj) = doc.objects.get_mut(&res_ref.0) {
-        if let Ok(res_dict) = res_obj.as_dict_mut() {
-            if res_dict.get(b"Font").is_err() {
-                res_dict.set("Font", Object::Dictionary(lopdf::Dictionary::new()));
-            }
-            if let Ok(font_d) = res_dict.get_mut(b"Font") {
-                if let Ok(fd) = font_d.as_dict_mut() {
-                    fd.set("F1", Object::Reference(font_id));
-                }
-            }
-        }
-    }
-
-    if res_ref.1 {
-        if let Some(page_obj) = doc.objects.get_mut(page_id) {
-            if let Ok(dict) = page_obj.as_dict_mut() {
-                dict.set("Resources", Object::Reference(res_ref.0));
-            }
-        }
-    }
-
-    // Append content
-    let has_contents_ref: Option<ObjectId> = {
-        let page_obj = doc.objects.get(page_id).unwrap();
-        let dict = page_obj.as_dict().unwrap();
-        match dict.get(b"Contents") {
-            Ok(c) => {
-                if let Ok(r) = c.as_reference() {
-                    Some(r)
-                } else if let Ok(arr) = c.as_array() {
-                    Some(doc.add_object(Object::Array(arr.clone())))
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        }
-    };
-    let new_contents_ref = match has_contents_ref {
-        Some(existing_ref) => {
-            let arr = Object::Array(vec![
-                Object::Reference(existing_ref),
-                Object::Reference(content_id),
-            ]);
-            doc.add_object(arr)
-        }
-        None => content_id,
-    };
-    let page_obj = doc.objects.get_mut(page_id).unwrap();
-    if let Ok(dict) = page_obj.as_dict_mut() {
-        dict.set("Contents", Object::Reference(new_contents_ref));
-    }
-
-    save_doc(&mut doc, &req.output_path)
-}
-
-#[tauri::command]
-pub fn add_rectangle(req: AddRectangleRequest) -> AppResult<()> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.output_path)?;
-    let mut doc = load_doc(&req.input_path)?;
-    let pages = doc.get_pages();
-    let page_id = pages.get(&req.page)
-        .ok_or_else(|| AppError::Pdf(format!("Page {} not found", req.page)))?;
-
-    let hex = req.border_color.trim_start_matches('#');
-    let br = u8::from_str_radix(&hex.get(0..2).unwrap_or("00"), 16).unwrap_or(0);
-    let bg = u8::from_str_radix(&hex.get(2..4).unwrap_or("00"), 16).unwrap_or(0);
-    let bb = u8::from_str_radix(&hex.get(4..6).unwrap_or("00"), 16).unwrap_or(0);
-
-    let mut content = format!(
-        "{bw:.1} w {br:.3} {bg:.3} {bb:.3} RG ",
-        bw = req.border_width,
-        br = br as f64 / 255.0, bg = bg as f64 / 255.0, bb = bb as f64 / 255.0
-    );
-
-    if let Some(ref fill) = req.fill_color {
-        let fh = fill.trim_start_matches('#');
-        let fr = u8::from_str_radix(&fh.get(0..2).unwrap_or("00"), 16).unwrap_or(0);
-        let fg = u8::from_str_radix(&fh.get(2..4).unwrap_or("00"), 16).unwrap_or(0);
-        let fb = u8::from_str_radix(&fh.get(4..6).unwrap_or("00"), 16).unwrap_or(0);
-        content.push_str(&format!(
-            "{fr:.3} {fg:.3} {fb:.3} rg ",
-            fr = fr as f64 / 255.0, fg = fg as f64 / 255.0, fb = fb as f64 / 255.0
-        ));
-        content.push_str(&format!(
-            "{} {} {} {} re B Q",
-            req.x, req.y, req.width, req.height
-        ));
-    } else {
-        content.push_str(&format!(
-            "{} {} {} {} re S",
-            req.x, req.y, req.width, req.height
-        ));
-    }
-
-    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
-        lopdf::Dictionary::new(), content.into_bytes(),
-    )));
-
-    // Append content (no resources needed for basic shapes)
-    let has_contents_ref: Option<ObjectId> = {
-        let page_obj = doc.objects.get(page_id).unwrap();
-        let dict = page_obj.as_dict().unwrap();
-        match dict.get(b"Contents") {
-            Ok(c) => {
-                if let Ok(r) = c.as_reference() { Some(r) }
-                else if let Ok(arr) = c.as_array() { Some(doc.add_object(Object::Array(arr.clone()))) }
-                else { None }
-            }
-            Err(_) => None,
-        }
-    };
-    let new_contents_ref = match has_contents_ref {
-        Some(existing_ref) => {
-            let arr = Object::Array(vec![
-                Object::Reference(existing_ref),
-                Object::Reference(content_id),
-            ]);
-            doc.add_object(arr)
-        }
-        None => content_id,
-    };
-    let page_obj = doc.objects.get_mut(page_id).unwrap();
-    if let Ok(dict) = page_obj.as_dict_mut() {
-        dict.set("Contents", Object::Reference(new_contents_ref));
-    }
-
-    save_doc(&mut doc, &req.output_path)
-}
-
-#[tauri::command]
-pub fn add_highlight(req: AddHighlightRequest) -> AppResult<()> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.output_path)?;
-    let mut doc = load_doc(&req.input_path)?;
-    let pages = doc.get_pages();
-    let page_id = pages.get(&req.page)
-        .ok_or_else(|| AppError::Pdf(format!("Page {} not found", req.page)))?;
-
-    let hex = req.color.trim_start_matches('#');
-    let r = u8::from_str_radix(&hex.get(0..2).unwrap_or("ff"), 16).unwrap_or(255);
-    let g = u8::from_str_radix(&hex.get(2..4).unwrap_or("ff"), 16).unwrap_or(255);
-    let b = u8::from_str_radix(&hex.get(4..6).unwrap_or("00"), 16).unwrap_or(0);
-
-    // Graphics state for transparency
-    let gs_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-        (b"Type".to_vec(), Object::Name(b"ExtGState".to_vec())),
-        (b"ca".to_vec(), Object::Real(req.opacity.min(1.0).max(0.0) as f32)),
-    ])));
-
-    let rx = req.x;
-    let ry = req.y;
-    let rw = req.width;
-    let rh = req.height;
-    let content = format!(
-        "q /GS1 gs {r:.3} {g:.3} {b:.3} rg {rx} {ry} {rw} {rh} re f Q",
-        r = r as f64 / 255.0, g = g as f64 / 255.0, b = b as f64 / 255.0,
-        rx = rx, ry = ry, rw = rw, rh = rh
-    ).into_bytes();
-
-    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(lopdf::Dictionary::new(), content)));
-
-    // Handle resources (for ExtGState)
-    let res_ref = {
-        let page = doc.get_object(*page_id).map_err(|e| AppError::Pdf(format!("Page error: {}", e)))?;
-        let page_dict = page.as_dict().map_err(|e| AppError::Pdf(format!("Page dict error: {}", e)))?;
-        match page_dict.get(b"Resources") {
-            Err(_) => {
-                let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
-                (res_id, true)
-            }
-            Ok(res_obj) => {
-                if let Ok(r) = res_obj.as_reference() { (r, false) }
-                else {
-                    let res_id = doc.add_object(res_obj.clone());
-                    (res_id, true)
-                }
-            }
-        }
-    };
-
-    if let Some(res_obj) = doc.objects.get_mut(&res_ref.0) {
-        if let Ok(res_dict) = res_obj.as_dict_mut() {
-            if res_dict.get(b"ExtGState").is_err() {
-                res_dict.set("ExtGState", Object::Dictionary(lopdf::Dictionary::new()));
-            }
-            if let Ok(gs_d) = res_dict.get_mut(b"ExtGState") {
-                if let Ok(gd) = gs_d.as_dict_mut() {
-                    gd.set("GS1", Object::Reference(gs_id));
-                }
-            }
-        }
-    }
-
-    if res_ref.1 {
-        if let Some(page_obj) = doc.objects.get_mut(page_id) {
-            if let Ok(dict) = page_obj.as_dict_mut() {
-                dict.set("Resources", Object::Reference(res_ref.0));
-            }
-        }
-    }
-
-    // Append content
-    let has_contents_ref: Option<ObjectId> = {
-        let page_obj = doc.objects.get(page_id).unwrap();
-        let dict = page_obj.as_dict().unwrap();
-        match dict.get(b"Contents") {
-            Ok(c) => {
-                if let Ok(r) = c.as_reference() { Some(r) }
-                else if let Ok(arr) = c.as_array() { Some(doc.add_object(Object::Array(arr.clone()))) }
-                else { None }
-            }
-            Err(_) => None,
-        }
-    };
-    let new_contents_ref = match has_contents_ref {
-        Some(existing_ref) => {
-            let arr = Object::Array(vec![
-                Object::Reference(existing_ref),
-                Object::Reference(content_id),
-            ]);
-            doc.add_object(arr)
-        }
-        None => content_id,
-    };
-    let page_obj = doc.objects.get_mut(page_id).unwrap();
-    if let Ok(dict) = page_obj.as_dict_mut() {
-        dict.set("Contents", Object::Reference(new_contents_ref));
-    }
-
-    save_doc(&mut doc, &req.output_path)
-}
-
-// ==================== Whiteout (cover text area) ====================
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WhiteoutRequest {
-    pub input_path: String,
-    pub output_path: String,
-    pub page: u32,
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
-
-#[tauri::command]
-pub fn add_whiteout(req: WhiteoutRequest) -> AppResult<()> {
-    validate_path(&req.input_path)?;
-    validate_path(&req.output_path)?;
-    let mut doc = load_doc(&req.input_path)?;
-    let pages = doc.get_pages();
-    let page_id = pages.get(&req.page)
-        .ok_or_else(|| AppError::Pdf(format!("Page {} not found", req.page)))?;
-
-    // Draw a filled white rectangle to cover the original text
-    let content = format!(
-        "1 1 1 rg {} {} {} {} re f",
-        req.x, req.y, req.width, req.height
-    ).into_bytes();
-
-    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
-        lopdf::Dictionary::new(), content,
-    )));
-
-    // Append content stream
-    let has_contents_ref: Option<ObjectId> = {
-        let page_obj = doc.objects.get(page_id).unwrap();
-        let dict = page_obj.as_dict().unwrap();
-        match dict.get(b"Contents") {
-            Ok(c) => {
-                if let Ok(r) = c.as_reference() { Some(r) }
-                else if let Ok(arr) = c.as_array() { Some(doc.add_object(Object::Array(arr.clone()))) }
-                else { None }
-            }
-            Err(_) => None,
-        }
-    };
-    let new_contents_ref = match has_contents_ref {
-        Some(existing_ref) => {
-            let arr = Object::Array(vec![
-                Object::Reference(existing_ref),
-                Object::Reference(content_id),
-            ]);
-            doc.add_object(arr)
-        }
-        None => content_id,
-    };
-    let page_obj = doc.objects.get_mut(page_id).unwrap();
-    if let Ok(dict) = page_obj.as_dict_mut() {
-        dict.set("Contents", Object::Reference(new_contents_ref));
-    }
-
-    save_doc(&mut doc, &req.output_path)
-}
+//! PDF operations facade and comprehensive regression test suite.
+//!
+//! Specific PDF commands are implemented across dedicated submodules:
+//! - [`crate::commands::organize`]: Page-level manipulation (merge, rotate, delete, split, extract, reorder, insert)
+//! - [`crate::commands::annotate`]: Annotations and visual editing (watermark, sign, text, rect, highlight, whiteout, batch edits)
+//! - [`crate::commands::convert`]: Conversion and text extraction (images-to-PDF, extract text)
+//! - [`crate::commands::info`]: Document inspection and compression (PDF info, compress, temp dir, image saving)
+
+pub use crate::commands::annotate::*;
+pub use crate::commands::convert::*;
+pub use crate::commands::info::*;
+pub use crate::commands::organize::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::{Document, Object, ObjectId};
     use tempfile::TempDir;
 
-    /// Create a minimal valid multi-page PDF
+    /// Create a minimal valid multi-page PDF for unit tests.
     fn create_test_pdf(dir: &std::path::Path, name: &str, num_pages: u32) -> String {
         let path = dir.join(name);
         let mut doc = Document::with_version("1.4");
 
-        // 1. Create catalog
-        let catalog_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
-
-        // 2. Create pages node (empty kids for now)
-        let pages_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
-            (b"Count".to_vec(), Object::Integer(num_pages as i64)),
-            (b"Kids".to_vec(), Object::Array(vec![])),
+        let catalog_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::new()));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), lopdf::Object::Name(b"Pages".to_vec())),
+            (b"Count".to_vec(), lopdf::Object::Integer(num_pages as i64)),
+            (b"Kids".to_vec(), lopdf::Object::Array(vec![])),
         ])));
 
-        // 3. Link catalog → pages
         if let Some(cat) = doc.objects.get_mut(&catalog_id) {
             if let Ok(d) = cat.as_dict_mut() {
-                d.set("Type", Object::Name(b"Catalog".to_vec()));
-                d.set("Pages", Object::Reference(pages_id));
+                d.set("Type", lopdf::Object::Name(b"Catalog".to_vec()));
+                d.set("Pages", lopdf::Object::Reference(pages_id));
             }
         }
 
-        // 4. Create individual page objects
         let mut kids = Vec::new();
         for _ in 0..num_pages {
-            let page_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
-                    (b"Parent".to_vec(), Object::Reference(pages_id)),
-                    (b"MediaBox".to_vec(), Object::Array(vec![
-                        Object::Integer(0), Object::Integer(0),
-                        Object::Integer(612), Object::Integer(792),
-                    ])),
-                ])));
-            kids.push(Object::Reference(page_id));
+            let page_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+                (b"Type".to_vec(), lopdf::Object::Name(b"Page".to_vec())),
+                (b"Parent".to_vec(), lopdf::Object::Reference(pages_id)),
+                (
+                    b"MediaBox".to_vec(),
+                    lopdf::Object::Array(vec![
+                        lopdf::Object::Integer(0),
+                        lopdf::Object::Integer(0),
+                        lopdf::Object::Integer(612),
+                        lopdf::Object::Integer(792),
+                    ]),
+                ),
+            ])));
+            kids.push(lopdf::Object::Reference(page_id));
         }
 
-        // 5. Update pages node with actual kids
         if let Some(pages_obj) = doc.objects.get_mut(&pages_id) {
             if let Ok(d) = pages_obj.as_dict_mut() {
-                d.set("Kids", Object::Array(kids));
+                d.set("Kids", lopdf::Object::Array(kids));
             }
         }
 
-        // 6. Set trailer root
-        doc.trailer.set(b"Root", Object::Reference(catalog_id));
-
+        doc.trailer.set(b"Root", lopdf::Object::Reference(catalog_id));
         doc.save(&path).unwrap();
         path.to_string_lossy().to_string()
     }
+
+    // ─── Unit tests ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_merge_two_pdfs() {
@@ -1353,8 +74,6 @@ mod tests {
         let p2 = create_test_pdf(dir.path(), "b.pdf", 3);
         let out = dir.path().join("merged.pdf");
         let out_str = out.to_string_lossy().to_string();
-        // Touch output so validate_path (canonicalize) succeeds
-        std::fs::write(&out, "").unwrap();
 
         merge_pdfs(vec![p1, p2], out_str.clone()).unwrap();
 
@@ -1368,8 +87,6 @@ mod tests {
         let src = create_test_pdf(dir.path(), "r.pdf", 2);
         let out = dir.path().join("rotated.pdf");
         let out_str = out.to_string_lossy().to_string();
-        // Touch output so validate_path (canonicalize) succeeds
-        std::fs::write(&out, "").unwrap();
 
         rotate_pdf(RotatePdfRequest {
             input_path: src,
@@ -1380,7 +97,6 @@ mod tests {
 
         let doc = Document::load(&out_str).unwrap();
         assert_eq!(doc.get_pages().len(), 2);
-        // Verify rotation was set
         for (_, id) in doc.get_pages() {
             let obj = doc.get_object(id).unwrap();
             if let Ok(dict) = obj.as_dict() {
@@ -1394,13 +110,45 @@ mod tests {
     }
 
     #[test]
+    fn test_rotate_rejects_output_matching_input() {
+        let dir = TempDir::new().unwrap();
+        let source = create_test_pdf(dir.path(), "same.pdf", 2);
+
+        let result = rotate_pdf(RotatePdfRequest {
+            input_path: source.clone(),
+            output_path: source.clone(),
+            angle: 90,
+        });
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must differ"));
+        assert_eq!(Document::load(source).unwrap().get_pages().len(), 2);
+    }
+
+    #[test]
+    fn test_split_rejects_generated_output_matching_input() {
+        let dir = TempDir::new().unwrap();
+        let source = create_test_pdf(dir.path(), "page_1.pdf", 1);
+        let output_dir = dir.path().to_string_lossy().to_string();
+
+        let result = split_pdf(SplitPdfRequest {
+            input_path: source.clone(),
+            output_dir,
+            mode: "single".into(),
+            ranges: None,
+        });
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must differ"));
+        assert_eq!(Document::load(source).unwrap().get_pages().len(), 1);
+    }
+
+    #[test]
     fn test_delete_pages() {
         let dir = TempDir::new().unwrap();
         let src = create_test_pdf(dir.path(), "d.pdf", 5);
         let out = dir.path().join("deleted.pdf");
         let out_str = out.to_string_lossy().to_string();
-        // Touch output so validate_path (canonicalize) succeeds
-        std::fs::write(&out, "").unwrap();
 
         delete_pages(DeletePagesRequest {
             input_path: src,
@@ -1420,7 +168,6 @@ mod tests {
 
         let result = extract_text(src).unwrap();
         assert_eq!(result.pages, 1);
-        // Empty test PDF should still return a result
         assert!(result.text.contains("--- Page 1 ---"));
     }
 
@@ -1436,195 +183,690 @@ mod tests {
         let src = create_test_pdf(dir.path(), "da.pdf", 3);
         let out = dir.path().join("del_all.pdf");
         let out_str = out.to_string_lossy().to_string();
-        // Touch output so validate_path (canonicalize) succeeds
-        std::fs::write(&out, "").unwrap();
 
-        // Deleting all pages — lopdf may error or produce empty doc
         let result = delete_pages(DeletePagesRequest {
             input_path: src,
             output_path: out_str.clone(),
             pages_to_delete: vec![1, 2, 3],
         });
-        // Either it fails (acceptable) or produces 0 pages
-        match result {
-            Ok(()) => {
-                let doc = Document::load(&out_str).unwrap();
-                assert_eq!(doc.get_pages().len(), 0);
-            }
-            Err(_) => {} // Also acceptable
+        if let Ok(()) = result {
+            let doc = Document::load(&out_str).unwrap();
+            assert_eq!(doc.get_pages().len(), 0);
         }
     }
-}
 
-// ==================== Apply Edit Operations (batch) ====================
+    // ─── Fixture regression tests ───────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EditOp {
-    pub op_type: String,
-    pub params: serde_json::Value,
-}
+    const SINGLE_PAGE_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/single-page-text.pdf"
+    ));
+    const THREE_PAGE_TARGET_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/three-page-target.pdf"
+    ));
+    const TWO_PAGE_SOURCE_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/two-page-source.pdf"
+    ));
+    const ROTATED_CONTENTS_ARRAY_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rotated-contents-array.pdf"
+    ));
+    const IMAGE_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/two-by-two-rgba.png"
+    ));
+    const CORRUPTED_PDF_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/truncated-input.pdf"
+    ));
+    const CHINESE_TEXT_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/chinese-text.pdf"
+    ));
+    const ENCRYPTED_PDF_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/encrypted-test.pdf"
+    ));
 
-#[tauri::command]
-pub fn apply_edit_operations(
-    input_path: String,
-    output_path: String,
-    operations: Vec<EditOp>,
-) -> AppResult<()> {
-    use std::path::Path;
-    validate_path(&input_path)?;
-    validate_path(&output_path)?;
+    fn write_fixture(dir: &std::path::Path, name: &str, bytes: &[u8]) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_string_lossy().to_string()
+    }
 
-    // Start with a copy of the input file
-    std::fs::copy(&input_path, &output_path)
-        .map_err(|e| AppError::Pdf(format!("Failed to copy file: {}", e)))?;
+    fn prepare_output(dir: &std::path::Path, name: &str) -> String {
+        dir.join(name).to_string_lossy().to_string()
+    }
 
-    let mut current_path = output_path.clone();
+    fn assert_external_pdf_checks(path: &str) {
+        if std::env::var_os("PDF_SEEKER_EXTERNAL_PDF_CHECKS").is_none() {
+            return;
+        }
 
-    for (i, op) in operations.iter().enumerate() {
-        // Use a temp output path for intermediate steps
-        let next_path = if i == operations.len() - 1 {
-            output_path.clone()
-        } else {
-            format!("{}.tmp_edit_{}", output_path, i)
+        let qpdf = std::process::Command::new("qpdf")
+            .arg("--check")
+            .arg(path)
+            .status()
+            .expect("qpdf must be installed when external checks are enabled");
+        assert!(qpdf.success(), "qpdf validation failed for {path}");
+
+        let render_prefix = format!("{path}.render-check");
+        let poppler = std::process::Command::new("pdftoppm")
+            .args(["-f", "1", "-l", "1", "-png", "-singlefile"])
+            .arg(path)
+            .arg(&render_prefix)
+            .status()
+            .expect("pdftoppm must be installed when external checks are enabled");
+        assert!(poppler.success(), "Poppler rendering failed for {path}");
+
+        let rendered = format!("{render_prefix}.png");
+        assert!(std::path::Path::new(&rendered).is_file());
+        let _ = std::fs::remove_file(rendered);
+    }
+
+    #[test]
+    fn regression_fixture_extracts_known_text() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "single.pdf", SINGLE_PAGE_FIXTURE);
+
+        let result = extract_text(input).unwrap();
+        assert_eq!(result.pages, 1);
+        assert!(result.text.contains("PDF Seeker Fixture: single-page text"));
+    }
+
+    #[test]
+    fn regression_fixture_images_to_pdf_reopens() {
+        let dir = TempDir::new().unwrap();
+        let image = write_fixture(dir.path(), "fixture.png", IMAGE_FIXTURE);
+        let output = prepare_output(dir.path(), "image-output.pdf");
+
+        images_to_pdf(ImagesToPdfRequest {
+            image_paths: vec![image],
+            output_path: output.clone(),
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).expect("image-to-PDF output must reopen");
+        assert_eq!(doc.get_pages().len(), 1);
+        assert_external_pdf_checks(&output);
+    }
+
+    #[test]
+    fn regression_fixture_corrupted_input_fails_without_output() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "truncated.pdf", CORRUPTED_PDF_FIXTURE);
+        let output = prepare_output(dir.path(), "should-not-exist.pdf");
+
+        let result = rotate_pdf(RotatePdfRequest {
+            input_path: input,
+            output_path: output.clone(),
+            angle: 90,
+        });
+
+        assert!(result.is_err());
+        assert!(!std::path::Path::new(&output).exists());
+    }
+
+    #[test]
+    fn regression_fixture_rotated_contents_array_preserves_all_streams() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(
+            dir.path(),
+            "rotated-contents-array.pdf",
+            ROTATED_CONTENTS_ARRAY_FIXTURE,
+        );
+        let input_text = extract_text(input.clone()).unwrap().text;
+        assert!(input_text.contains("content-array part one"));
+        assert!(input_text.contains("content-array part two"));
+
+        let output = prepare_output(dir.path(), "rotated-contents-array-output.pdf");
+        rotate_pdf(RotatePdfRequest {
+            input_path: input,
+            output_path: output.clone(),
+            angle: 90,
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).expect("rotated content-array PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 1);
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+        assert_eq!(page.get(b"Rotate").unwrap().as_i64().unwrap(), 180);
+        assert_external_pdf_checks(&output);
+
+        let output_text = extract_text(output).unwrap().text;
+        assert!(output_text.contains("content-array part one"));
+        assert!(output_text.contains("content-array part two"));
+    }
+
+    #[test]
+    fn regression_fixture_rotation_reopens_and_preserves_page_count() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "target.pdf", THREE_PAGE_TARGET_FIXTURE);
+        let output = prepare_output(dir.path(), "rotated.pdf");
+
+        rotate_pdf(RotatePdfRequest {
+            input_path: input,
+            output_path: output.clone(),
+            angle: 90,
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).expect("rotated regression PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 3);
+        assert_external_pdf_checks(&output);
+        for (_, page_id) in doc.get_pages() {
+            let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+            assert_eq!(page.get(b"Rotate").unwrap().as_i64().unwrap(), 90);
+        }
+    }
+
+    #[test]
+    fn regression_fixture_insert_pages_reopens_with_ordered_content() {
+        let dir = TempDir::new().unwrap();
+        let target = write_fixture(dir.path(), "target.pdf", THREE_PAGE_TARGET_FIXTURE);
+        let source = write_fixture(dir.path(), "source.pdf", TWO_PAGE_SOURCE_FIXTURE);
+        let output = prepare_output(dir.path(), "inserted.pdf");
+
+        insert_pages(InsertPagesRequest {
+            input_path: target,
+            source_path: source,
+            output_path: output.clone(),
+            insert_position: 1,
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).expect("inserted regression PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 5);
+        assert_external_pdf_checks(&output);
+        let text = extract_text(output).unwrap().text;
+        assert!(text.contains("target page 1"));
+        assert!(text.contains("source page 1"));
+        assert!(text.contains("source page 2"));
+    }
+
+    #[test]
+    fn regression_fixture_batch_edits_reopen_and_keep_text() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "editable.pdf", SINGLE_PAGE_FIXTURE);
+        let output = prepare_output(dir.path(), "edited.pdf");
+
+        apply_edit_operations(
+            input,
+            output.clone(),
+            vec![
+                EditOp {
+                    op_type: "addText".into(),
+                    params: serde_json::json!({
+                        "page": 1,
+                        "text": "Regression text",
+                        "x": 72.0,
+                        "y": 680.0,
+                        "fontSize": 14.0,
+                        "color": "#000000"
+                    }),
+                },
+                EditOp {
+                    op_type: "addRectangle".into(),
+                    params: serde_json::json!({
+                        "page": 1,
+                        "x": 70.0,
+                        "y": 650.0,
+                        "w": 180.0,
+                        "h": 30.0,
+                        "borderColor": "#ff0000",
+                        "hasFill": true,
+                        "fillColor": "#ffeeee",
+                        "borderWidth": 1.0
+                    }),
+                },
+                EditOp {
+                    op_type: "addHighlight".into(),
+                    params: serde_json::json!({
+                        "page": 1,
+                        "x": 70.0,
+                        "y": 710.0,
+                        "w": 240.0,
+                        "h": 20.0,
+                        "color": "#ffff00",
+                        "opacity": 0.4
+                    }),
+                },
+            ],
+        )
+        .unwrap();
+
+        let doc = Document::load(&output).expect("edited regression PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 1);
+        assert_external_pdf_checks(&output);
+        let text = extract_text(output).unwrap().text;
+        assert!(text.contains("PDF Seeker Fixture: single-page text"));
+        assert!(text.contains("Regression text"));
+    }
+
+    // ─── Extended Phase 0 tests: Core page operations ───────────────────────
+
+    #[test]
+    fn test_split_fixture() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "target.pdf", THREE_PAGE_TARGET_FIXTURE);
+        let out_dir = dir.path().join("split_out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let outputs = split_pdf(SplitPdfRequest {
+            input_path: input,
+            output_dir: out_dir.to_string_lossy().to_string(),
+            mode: "single".into(),
+            ranges: None,
+        })
+        .unwrap();
+
+        assert_eq!(outputs.len(), 3);
+        for (idx, out_path) in outputs.iter().enumerate() {
+            let doc = Document::load(out_path).expect("split page must reopen");
+            assert_eq!(doc.get_pages().len(), 1);
+            let text = extract_text(out_path.clone()).unwrap().text;
+            assert!(text.contains(&format!("target page {}", idx + 1)));
+            assert_external_pdf_checks(out_path);
+        }
+    }
+
+    #[test]
+    fn test_extract_pages_fixture() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "target.pdf", THREE_PAGE_TARGET_FIXTURE);
+        let output = prepare_output(dir.path(), "extracted.pdf");
+
+        extract_pages_pdf(ExtractPagesRequest {
+            input_path: input,
+            output_path: output.clone(),
+            pages_to_extract: vec![1, 3],
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).expect("extracted PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 2);
+        let text = extract_text(output.clone()).unwrap().text;
+        assert!(text.contains("target page 1"));
+        assert!(!text.contains("target page 2"));
+        assert!(text.contains("target page 3"));
+        assert_external_pdf_checks(&output);
+    }
+
+    #[test]
+    fn test_reorder_fixture() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "target.pdf", THREE_PAGE_TARGET_FIXTURE);
+        let output = prepare_output(dir.path(), "reordered.pdf");
+
+        reorder_pages(ReorderPagesRequest {
+            input_path: input,
+            output_path: output.clone(),
+            new_order: vec![3, 1, 2],
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).expect("reordered PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 3);
+        let text = extract_text(output.clone()).unwrap().text;
+        let pos1 = text.find("target page 1").unwrap();
+        let pos2 = text.find("target page 2").unwrap();
+        let pos3 = text.find("target page 3").unwrap();
+        assert!(pos3 < pos1);
+        assert!(pos1 < pos2);
+        assert_external_pdf_checks(&output);
+    }
+
+    #[test]
+    fn test_merge_fixture_with_real_content() {
+        let dir = TempDir::new().unwrap();
+        let target = write_fixture(dir.path(), "target.pdf", THREE_PAGE_TARGET_FIXTURE);
+        let source = write_fixture(dir.path(), "source.pdf", TWO_PAGE_SOURCE_FIXTURE);
+        let output = prepare_output(dir.path(), "merged_real.pdf");
+
+        merge_pdfs(vec![target, source], output.clone()).unwrap();
+
+        let doc = Document::load(&output).expect("merged PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 5);
+        let text = extract_text(output.clone()).unwrap().text;
+        assert!(text.contains("target page 1"));
+        assert!(text.contains("target page 3"));
+        assert!(text.contains("source page 1"));
+        assert!(text.contains("source page 2"));
+        assert_external_pdf_checks(&output);
+    }
+
+    #[test]
+    fn test_delete_pages_fixture() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "target.pdf", THREE_PAGE_TARGET_FIXTURE);
+        let output = prepare_output(dir.path(), "deleted.pdf");
+
+        delete_pages(DeletePagesRequest {
+            input_path: input,
+            output_path: output.clone(),
+            pages_to_delete: vec![2],
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).expect("deleted page PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 2);
+        let text = extract_text(output.clone()).unwrap().text;
+        assert!(text.contains("target page 1"));
+        assert!(!text.contains("target page 2"));
+        assert!(text.contains("target page 3"));
+        assert_external_pdf_checks(&output);
+    }
+
+    #[test]
+    fn test_compress_fixture() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "target.pdf", THREE_PAGE_TARGET_FIXTURE);
+        let output = prepare_output(dir.path(), "compressed.pdf");
+
+        let res = compress_pdf(input, output.clone()).unwrap();
+        assert!(res.original_size > 0);
+        let doc = Document::load(&output).expect("compressed PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 3);
+        assert_external_pdf_checks(&output);
+    }
+
+    #[test]
+    fn test_watermark_fixture() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "single.pdf", SINGLE_PAGE_FIXTURE);
+        let output = prepare_output(dir.path(), "watermarked.pdf");
+
+        add_text_watermark(WatermarkRequest {
+            input_path: input,
+            output_path: output.clone(),
+            text: "CONFIDENTIAL".into(),
+            font_size: 36.0,
+            opacity: 0.3,
+            angle: 45.0,
+            color: "#FF0000".into(),
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).expect("watermarked PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 1);
+        let text = extract_text(output.clone()).unwrap().text;
+        assert!(text.contains("PDF Seeker Fixture: single-page text"));
+        assert_external_pdf_checks(&output);
+    }
+
+    // ─── Extended Phase 0 tests: Chinese text fixture ───────────────────────
+
+    #[test]
+    fn test_chinese_fixture_rotate_preserves_content() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "chinese.pdf", CHINESE_TEXT_FIXTURE);
+        let output = prepare_output(dir.path(), "chinese_rotated.pdf");
+
+        rotate_pdf(RotatePdfRequest {
+            input_path: input,
+            output_path: output.clone(),
+            angle: 90,
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).expect("rotated Chinese PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 2);
+        let text = extract_text(output.clone()).unwrap().text;
+        assert!(text.contains("CHINESE-FIXTURE-MARK Page 1"));
+        assert!(text.contains("CHINESE-FIXTURE-MARK Page 2"));
+        assert_external_pdf_checks(&output);
+    }
+
+    #[test]
+    fn test_chinese_fixture_merge_preserves_content() {
+        let dir = TempDir::new().unwrap();
+        let chinese = write_fixture(dir.path(), "chinese.pdf", CHINESE_TEXT_FIXTURE);
+        let single = write_fixture(dir.path(), "single.pdf", SINGLE_PAGE_FIXTURE);
+        let output = prepare_output(dir.path(), "chinese_merged.pdf");
+
+        merge_pdfs(vec![chinese, single], output.clone()).unwrap();
+
+        let doc = Document::load(&output).expect("merged Chinese PDF must reopen");
+        assert_eq!(doc.get_pages().len(), 3);
+        let text = extract_text(output.clone()).unwrap().text;
+        assert!(text.contains("CHINESE-FIXTURE-MARK"));
+        assert!(text.contains("PDF Seeker Fixture: single-page text"));
+        assert_external_pdf_checks(&output);
+    }
+
+    // ─── Extended Phase 0 tests: Encrypted & Corrupted inputs ───────────────
+
+    #[test]
+    fn test_encrypted_pdf_info_detection() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "encrypted.pdf", ENCRYPTED_PDF_FIXTURE);
+
+        let info = get_pdf_info(input).unwrap();
+        assert!(info.is_encrypted, "must detect PDF encryption");
+    }
+
+    #[test]
+    fn test_encrypted_pdf_rotate_fails_clearly() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "encrypted.pdf", ENCRYPTED_PDF_FIXTURE);
+        let output = prepare_output(dir.path(), "should_not_exist.pdf");
+
+        let result = rotate_pdf(RotatePdfRequest {
+            input_path: input,
+            output_path: output.clone(),
+            angle: 90,
+        });
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("password-protected") || err_msg.contains("encrypted"),
+            "Error message must clearly state password protection: {err_msg}"
+        );
+        assert!(!std::path::Path::new(&output).exists(), "Output file must not be generated");
+    }
+
+    #[test]
+    fn test_corrupted_input_split_fails_safely() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "corrupted.pdf", CORRUPTED_PDF_FIXTURE);
+        let out_dir = dir.path().join("split_fail_out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let result = split_pdf(SplitPdfRequest {
+            input_path: input,
+            output_dir: out_dir.to_string_lossy().to_string(),
+            mode: "single".into(),
+            ranges: None,
+        });
+
+        assert!(result.is_err());
+        let entries: Vec<_> = std::fs::read_dir(&out_dir).unwrap().collect();
+        assert!(entries.is_empty(), "No split output should be left on corruption");
+    }
+
+    #[test]
+    fn test_corrupted_input_merge_fails_safely() {
+        let dir = TempDir::new().unwrap();
+        let input1 = write_fixture(dir.path(), "corrupted.pdf", CORRUPTED_PDF_FIXTURE);
+        let input2 = write_fixture(dir.path(), "single.pdf", SINGLE_PAGE_FIXTURE);
+        let output = prepare_output(dir.path(), "merge_fail.pdf");
+
+        let result = merge_pdfs(vec![input1, input2], output.clone());
+        assert!(result.is_err());
+        assert!(!std::path::Path::new(&output).exists(), "Merge output must not exist on failure");
+    }
+
+    #[test]
+    fn test_add_page_numbers_success() {
+        let dir = TempDir::new().unwrap();
+        let input = create_test_pdf(dir.path(), "numbered_in.pdf", 3);
+        let output = prepare_output(dir.path(), "numbered_out.pdf");
+
+        let res = add_page_numbers(AddPageNumbersRequest {
+            input_path: input,
+            output_path: output.clone(),
+            format: "Page {n} of {total}".into(),
+            position: "bottom-center".into(),
+            start_page: Some(1),
+            start_number: Some(1),
+            font_size: Some(11.0),
+            margin: Some(25.0),
+            color: Some("#333333".into()),
+        });
+        assert!(res.is_ok(), "add_page_numbers failed: {:?}", res.err());
+
+        let doc = Document::load(&output).expect("load numbered pdf");
+        assert_eq!(doc.get_pages().len(), 3);
+    }
+
+    #[test]
+    fn test_sanitize_pdf_removes_info_and_metadata() {
+        let dir = TempDir::new().unwrap();
+        let input_path = dir.path().join("metadata_in.pdf");
+        let mut doc = Document::with_version("1.4");
+        let cat_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::new()));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), lopdf::Object::Name(b"Pages".to_vec())),
+            (b"Count".to_vec(), lopdf::Object::Integer(1)),
+            (b"Kids".to_vec(), lopdf::Object::Array(vec![])),
+        ])));
+        let page_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), lopdf::Object::Name(b"Page".to_vec())),
+            (b"Parent".to_vec(), lopdf::Object::Reference(pages_id)),
+            (b"MediaBox".to_vec(), lopdf::Object::Array(vec![
+                lopdf::Object::Integer(0), lopdf::Object::Integer(0),
+                lopdf::Object::Integer(612), lopdf::Object::Integer(792),
+            ])),
+        ])));
+        if let Some(pages_obj) = doc.objects.get_mut(&pages_id) {
+            if let Ok(d) = pages_obj.as_dict_mut() {
+                d.set("Kids", lopdf::Object::Array(vec![lopdf::Object::Reference(page_id)]));
+            }
+        }
+        if let Some(cat) = doc.objects.get_mut(&cat_id) {
+            if let Ok(d) = cat.as_dict_mut() {
+                d.set("Type", lopdf::Object::Name(b"Catalog".to_vec()));
+                d.set("Pages", lopdf::Object::Reference(pages_id));
+            }
+        }
+        let info_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Title".to_vec(), lopdf::Object::String(b"Secret Title".to_vec(), lopdf::StringFormat::Literal)),
+            (b"Author".to_vec(), lopdf::Object::String(b"Secret Author".to_vec(), lopdf::StringFormat::Literal)),
+        ])));
+        doc.trailer.set(b"Root", lopdf::Object::Reference(cat_id));
+        doc.trailer.set(b"Info", lopdf::Object::Reference(info_id));
+        doc.save(&input_path).unwrap();
+
+        let output = prepare_output(dir.path(), "sanitized_out.pdf");
+        let res = sanitize_pdf(input_path.to_string_lossy().to_string(), output.clone());
+        assert!(res.is_ok(), "sanitize_pdf failed: {:?}", res.err());
+
+        let clean_doc = Document::load(&output).expect("load sanitized pdf");
+        assert_eq!(clean_doc.get_pages().len(), 1);
+        assert!(clean_doc.trailer.get(b"Info").is_err(), "Info dictionary must be removed");
+    }
+
+    #[test]
+    fn test_rotate_negative_angle_normalized_to_positive() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "rotate_neg_input.pdf", SINGLE_PAGE_FIXTURE);
+        let output = prepare_output(dir.path(), "rotate_neg_output.pdf");
+
+        rotate_pdf(RotatePdfRequest {
+            input_path: input,
+            output_path: output.clone(),
+            angle: -90,
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).unwrap();
+        let pages = doc.get_pages();
+        let page_obj = doc.get_object(pages[&1]).unwrap();
+        let rotate = page_obj
+            .as_dict()
+            .unwrap()
+            .get(b"Rotate")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        assert_eq!(rotate, 270, "Negative 90 deg rotation must normalize to 270");
+    }
+
+    #[test]
+    fn test_delete_duplicate_pages_handled_safely() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "del_dup_input.pdf", THREE_PAGE_TARGET_FIXTURE);
+        let output = prepare_output(dir.path(), "del_dup_output.pdf");
+
+        delete_pages(DeletePagesRequest {
+            input_path: input,
+            output_path: output.clone(),
+            pages_to_delete: vec![1, 1],
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).unwrap();
+        assert_eq!(doc.get_pages().len(), 2, "3-page doc after deleting page 1 (with duplicate in request) must have 2 pages");
+    }
+
+    #[test]
+    fn test_extract_duplicate_pages_handled_safely() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "ext_dup_input.pdf", THREE_PAGE_TARGET_FIXTURE);
+        let output = prepare_output(dir.path(), "ext_dup_output.pdf");
+
+        extract_pages_pdf(ExtractPagesRequest {
+            input_path: input,
+            output_path: output.clone(),
+            pages_to_extract: vec![2, 2],
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).unwrap();
+        assert_eq!(doc.get_pages().len(), 1, "Extracting page 2 with duplicates must yield 1 page");
+    }
+
+    #[test]
+    fn test_single_annotation_contents_normalization() {
+        let dir = TempDir::new().unwrap();
+        let input = write_fixture(dir.path(), "rotated_contents.pdf", ROTATED_CONTENTS_ARRAY_FIXTURE);
+        let output = prepare_output(dir.path(), "annotated_normalized.pdf");
+
+        add_text_to_page(AddTextRequest {
+            input_path: input,
+            output_path: output.clone(),
+            text: "Normalized Content Test".to_string(),
+            page: 1,
+            x: 50.0,
+            y: 50.0,
+            font_size: 14.0,
+            color: "#FF0000".to_string(),
+        })
+        .unwrap();
+
+        let doc = Document::load(&output).unwrap();
+        let pages = doc.get_pages();
+        let page_obj = doc.get_object(pages[&1]).unwrap();
+        let contents = page_obj.as_dict().unwrap().get(b"Contents").unwrap();
+
+        let arr = match contents {
+            Object::Array(ref a) => a.clone(),
+            Object::Reference(id) => match doc.get_object(*id).unwrap() {
+                Object::Array(ref a) => a.clone(),
+                other => panic!("Expected array object, got {:?}", other),
+            },
+            other => panic!("Expected Contents array, got {:?}", other),
         };
 
-        match op.op_type.as_str() {
-            "addText" => {
-                add_text_to_page(AddTextRequest {
-                    input_path: current_path.clone(),
-                    output_path: next_path.clone(),
-                    text: op.params["text"].as_str().unwrap_or("").to_string(),
-                    page: op.params["page"].as_u64().unwrap_or(1) as u32,
-                    x: op.params["x"].as_f64().unwrap_or(72.0),
-                    y: op.params["y"].as_f64().unwrap_or(720.0),
-                    font_size: op.params["fontSize"].as_f64().unwrap_or(12.0),
-                    color: op.params["color"].as_str().unwrap_or("#000000").to_string(),
-                })?;
-            }
-            "addRectangle" => {
-                add_rectangle(AddRectangleRequest {
-                    input_path: current_path.clone(),
-                    output_path: next_path.clone(),
-                    page: op.params["page"].as_u64().unwrap_or(1) as u32,
-                    x: op.params["x"].as_f64().unwrap_or(100.0),
-                    y: op.params["y"].as_f64().unwrap_or(100.0),
-                    width: op.params["w"].as_f64().unwrap_or(200.0),
-                    height: op.params["h"].as_f64().unwrap_or(50.0),
-                    border_color: op.params["borderColor"].as_str().unwrap_or("#000000").to_string(),
-                    fill_color: if op.params["hasFill"].as_bool().unwrap_or(false) {
-                        Some(op.params["fillColor"].as_str().unwrap_or("#ffffff").to_string())
-                    } else {
-                        None
-                    },
-                    border_width: op.params["borderWidth"].as_f64().unwrap_or(1.0),
-                })?;
-            }
-            "addHighlight" => {
-                add_highlight(AddHighlightRequest {
-                    input_path: current_path.clone(),
-                    output_path: next_path.clone(),
-                    page: op.params["page"].as_u64().unwrap_or(1) as u32,
-                    x: op.params["x"].as_f64().unwrap_or(100.0),
-                    y: op.params["y"].as_f64().unwrap_or(100.0),
-                    width: op.params["w"].as_f64().unwrap_or(200.0),
-                    height: op.params["h"].as_f64().unwrap_or(20.0),
-                    color: op.params["color"].as_str().unwrap_or("#ffff00").to_string(),
-                    opacity: op.params["opacity"].as_f64().unwrap_or(0.4),
-                })?;
-            }
-            "addWhiteout" => {
-                add_whiteout(WhiteoutRequest {
-                    input_path: current_path.clone(),
-                    output_path: next_path.clone(),
-                    page: op.params["page"].as_u64().unwrap_or(1) as u32,
-                    x: op.params["x"].as_f64().unwrap_or(0.0),
-                    y: op.params["y"].as_f64().unwrap_or(0.0),
-                    width: op.params["w"].as_f64().unwrap_or(100.0),
-                    height: op.params["h"].as_f64().unwrap_or(20.0),
-                })?;
-            }
-            other => return Err(AppError::Pdf(format!("Unknown edit operation: {}", other))),
-        }
-
-        // Clean up intermediate file
-        if current_path != input_path && Path::new(&current_path).exists() {
-            let _ = std::fs::remove_file(&current_path);
-        }
-        current_path = next_path;
-    }
-
-    Ok(())
-}
-
-// ─── PDF Info ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PdfInfoResult {
-    pub is_encrypted: bool,
-    pub pages: u32,
-    pub file_size: u64,
-    pub title: Option<String>,
-    pub author: Option<String>,
-}
-
-#[tauri::command]
-pub fn get_pdf_info(path: String) -> AppResult<PdfInfoResult> {
-    validate_path(&path)?;
-    let metadata = std::fs::metadata(&path)
-        .map_err(AppError::from)?;
-    let file_size = metadata.len();
-
-    let doc = Document::load(&path);
-
-    match doc {
-        Ok(d) => {
-            let is_encrypted = d.is_encrypted();
-            let pages = if is_encrypted { 0 } else { d.get_pages().len() as u32 };
-
-            let title = d.trailer.get(b"Info")
-                .ok()
-                .and_then(|obj| obj.as_reference().ok())
-                .and_then(|id| d.objects.get(&id))
-                .and_then(|obj| {
-                    if let Object::Dictionary(dict) = obj {
-                        dict.get(b"Title").ok().and_then(|t| {
-                            let bytes: &[u8] = t.as_str().ok()?;
-                            String::from_utf8(bytes.to_vec()).ok()
-                        })
-                    } else { None }
-                });
-            let author = d.trailer.get(b"Info")
-                .ok()
-                .and_then(|obj| obj.as_reference().ok())
-                .and_then(|id| d.objects.get(&id))
-                .and_then(|obj| {
-                    if let Object::Dictionary(dict) = obj {
-                        dict.get(b"Author").ok().and_then(|a| {
-                            let bytes: &[u8] = a.as_str().ok()?;
-                            String::from_utf8(bytes.to_vec()).ok()
-                        })
-                    } else { None }
-                });
-            Ok(PdfInfoResult {
-                is_encrypted,
-                pages,
-                file_size,
-                title,
-                author,
-            })
-        }
-        Err(e) => {
-            let err_str = format!("{}", e);
-            let is_encrypted = err_str.contains("encrypted") || err_str.contains("password");
-            Ok(PdfInfoResult {
-                is_encrypted,
-                pages: 0,
-                file_size,
-                title: None,
-                author: None,
-            })
+        for item in arr {
+            let ref_id: ObjectId = item.as_reference().expect("Each item in Contents must be a Reference");
+            let target_obj = doc.get_object(ref_id).expect("Referenced object must exist");
+            assert!(matches!(target_obj, Object::Stream(_)), "Each Contents entry must reference a Stream, not an Array: {:?}", target_obj);
         }
     }
 }
+

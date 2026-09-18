@@ -12,11 +12,14 @@
     selectedEditId,
     signPlacement,
     ocrResults,
+    sidebarCollapsed,
+    activeToolTab,
   } from "@/stores";
+  import { privacyAuditor } from "@/models/privacy";
   import { Button, Tooltip, Input, Label } from "@/components/ui";
-  import { FileText, Loader2, Save, X, SaveAll } from "lucide-svelte";
+  import { FileText, Loader2, Save, X, SaveAll, Sun, Moon, FolderOpen } from "lucide-svelte";
   import { open, save } from "@tauri-apps/plugin-dialog";
-  import { readFile } from "@tauri-apps/plugin-fs";
+  import { readFile, writeFile } from "@tauri-apps/plugin-fs";
   import { invoke } from "@tauri-apps/api/core";
   import { loadPdf, getPageViewport, type PdfDocumentProxy } from "@/pdf-engine";
   import ToolbarTabs from "@/components/editor/ToolbarTabs.svelte";
@@ -24,26 +27,76 @@
   import StatusBar from "@/components/editor/StatusBar.svelte";
   import CanvasEditor from "@/components/editor/CanvasEditor.svelte";
   import type { EditOperation } from "@/edit-history";
-  import { pushOperation } from "@/edit-history";
+  import { pushOperation, getAppliedOperations } from "@/edit-history";
   import WatermarkDialog from "@/components/editor/WatermarkDialog.svelte";
   import PageToolsDialog from "@/components/editor/PageToolsDialog.svelte";
   import TextLayer from "@/components/editor/TextLayer.svelte";
   import OcrOverlay from "@/components/editor/OcrOverlay.svelte";
   import ThumbnailSidebar from "@/components/editor/ThumbnailSidebar.svelte";
-  import { PanelLeftClose, PanelLeft, Printer } from "lucide-svelte";
+  import { PanelLeftClose, PanelLeft, Printer, Eye, EyeOff, ScanLine, Layers, Trash, Sparkles, Download, Copy, Check, Table as IconTable, Globe, BookOpen, Info, ChevronLeft, ChevronRight, ZoomIn, ZoomOut } from "lucide-svelte";
   import { printPdf } from "@/print";
   import TabBar from "@/components/editor/TabBar.svelte";
   import { tabsStore } from "@/stores/tabs";
+  import ToolboxModal from "@/components/editor/ToolboxModal.svelte";
+  import PdfSearchBar from "@/components/editor/PdfSearchBar.svelte";
+  import ZenReadingOverlay from "@/components/editor/ZenReadingOverlay.svelte";
+  import PdfInfoDialog from "@/components/editor/PdfInfoDialog.svelte";
+  import CropTool from "@/components/tools/CropTool.svelte";
+  import MetadataTool from "@/components/tools/MetadataTool.svelte";
+  import { parseEpub, parseComicBook, formatTextToHtmlPages } from "@/utils/epub-parser";
+  import { isEbookFormat, convertEpubToPdf, convertCbzToPdf, convertTextToPdf } from "@/utils/ebook-to-pdf";
+  import { cleanOcrText } from "@/utils/text-cleaner";
+  import { computeVisiblePages, clampCanvasDimensions, type VirtualWindow } from "@/utils/virtual-viewport";
+  import { computeZoomLevel, computeScrollAnchor } from "@/utils/zoom-math";
+
+  export const SUPPORTED_OPEN_FILTERS = [
+    {
+      name: "所有支持的文档与电子书 (*.pdf, *.epub, *.cbz, *.txt, *.md)",
+      extensions: ["pdf", "epub", "cbz", "txt", "md", "markdown"],
+    },
+    { name: "PDF 文档 (*.pdf)", extensions: ["pdf"] },
+    { name: "EPUB 电子书 (*.epub)", extensions: ["epub"] },
+    { name: "漫画归档 (*.cbz)", extensions: ["cbz"] },
+    { name: "纯文本与 Markdown (*.txt, *.md)", extensions: ["txt", "md", "markdown"] },
+  ];
 
   // ─── Tool state ───────────────────────────────────────────────────────
 
   let activeCategory = $state<ToolCategory>("page");
   let activeTool = $state<ToolId | null>(null);
+  let searchOpen = $state(false);
   let pageDialogTool = $state<ToolId | null>(null);
   let watermarkDialogOpen = $state(false);
+  let toolboxVisible = $state(false);
   let thumbnailVisible = $state(true);
   let printDialogOpen = $state(false);
   let printBusy = $state(false);
+  let ocrOverlayVisible = $state(true);
+  let zenModeOpen = $state(false);
+  let pdfInfoOpen = $state(false);
+  let cropDialogOpen = $state(false);
+  let metadataDialogOpen = $state(false);
+  let showZenReminder = $state(false);
+  let zenReminderDismissed = $state(
+    typeof localStorage !== "undefined" && localStorage.getItem("pdf_seeker_zen_reminder_dismissed") === "true"
+  );
+
+  function dismissZenReminder(forever = false) {
+    showZenReminder = false;
+    if (forever) {
+      zenReminderDismissed = true;
+      try {
+        localStorage.setItem("pdf_seeker_zen_reminder_dismissed", "true");
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
+
+  function launchZenFromReminder() {
+    showZenReminder = false;
+    zenModeOpen = true;
+  }
 
   // Print state
   let printPageRange = $state("all");
@@ -107,6 +160,17 @@
     return hist.operations.find((o: EditOperation) => o.id === id) ?? null;
   });
 
+  let layersPanelOpen = $state(false);
+
+  const currentAppliedOperations = $derived(() => {
+    return getAppliedOperations($editHistory);
+  });
+
+  const currentPageOperations = $derived(() => {
+    const cur = $currentPage;
+    return currentAppliedOperations().filter((o: EditOperation) => o.params.page === cur);
+  });
+
   const showPropertyPanel = $derived(selectedElement() !== null);
 
   function clearSelection() {
@@ -129,16 +193,70 @@
   function deleteSelected() {
     const id = $selectedEditId;
     if (!id) return;
+    deleteOperationById(id);
+  }
+
+  function deleteOperationById(id: string) {
     const hist = $editHistory;
     const newOps = hist.operations.filter((o: EditOperation) => o.id !== id);
-    editHistory.set({ operations: newOps, currentIndex: newOps.length - 1 });
+    editHistory.set({
+      operations: newOps,
+      currentIndex: Math.min(hist.currentIndex, newOps.length - 1),
+    });
+    if ($selectedEditId === id) {
+      selectedEditId.set(null);
+    }
+  }
+
+  function clearPageOperations(pageNum: number) {
+    const hist = $editHistory;
+    const newOps = hist.operations.filter((o: EditOperation) => o.params.page !== pageNum);
+    editHistory.set({
+      operations: newOps,
+      currentIndex: Math.min(hist.currentIndex, newOps.length - 1),
+    });
+    selectedEditId.set(null);
+  }
+
+  function clearAllOperations() {
+    const hist = $editHistory;
+    editHistory.set({ operations: [], currentIndex: -1 });
     selectedEditId.set(null);
   }
 
   // ─── Tool action handler ──────────────────────────────────────────────
 
   function handleToolAction(toolId: ToolId) {
-    const pageTools: ToolId[] = ["merge", "split", "rotate", "delete", "extractPages", "reorder"];
+    if (toolId === "batchWorkspace") {
+      activeToolTab.set("batch");
+      currentView.set("tools");
+      return;
+    }
+    if (toolId === "compressionStudio") {
+      activeToolTab.set("compress");
+      currentView.set("tools");
+      return;
+    }
+    if (toolId === "privacyAudit") {
+      activeToolTab.set("privacy");
+      currentView.set("tools");
+      return;
+    }
+
+    if (toolId === "crop") {
+      cropDialogOpen = true;
+      return;
+    }
+    if (toolId === "metadata") {
+      metadataDialogOpen = true;
+      return;
+    }
+    if (toolId === "epub2pdf" || toolId === "cbz2pdf" || toolId === "text2pdf" || toolId === "md2pdf") {
+      handleMultiFormatImport(toolId);
+      return;
+    }
+
+    const pageTools: ToolId[] = ["merge", "split", "rotate", "delete", "extractPages", "reorder", "insertPages", "pageNumber", "sanitize", "compress"];
     const otherDialogTools: ToolId[] = ["img2pdf", "pdf2img", "pdf2text", "extractText", "table"];
 
     if (pageTools.includes(toolId)) {
@@ -153,9 +271,36 @@
       pageDialogTool = toolId;
     } else {
       // Edit tools: editText, editRect, editHighlight
+      activeCategory = "edit";
       activeTool = activeTool === toolId ? null : toolId;
       clearSelection();
     }
+  }
+
+  async function handleMultiFormatImport(toolId: ToolId) {
+    let extensions: string[] = ["epub"];
+    let filterName = "EPUB 电子书 (*.epub)";
+    if (toolId === "cbz2pdf") {
+      extensions = ["cbz", "zip"];
+      filterName = "漫画归档 (*.cbz, *.zip)";
+    } else if (toolId === "text2pdf") {
+      extensions = ["txt"];
+      filterName = "纯文本文件 (*.txt)";
+    } else if (toolId === "md2pdf") {
+      extensions = ["md", "markdown"];
+      filterName = "Markdown 笔记 (*.md)";
+    }
+
+    const selected = await open({
+      filters: [{ name: filterName, extensions }],
+    });
+    if (!selected) return;
+    const path = typeof selected === "string" ? selected : String(selected);
+    const fileName = path.split(/[\\/]/).pop() || "Ebook";
+
+    tabsStore.openTab(path, fileName);
+    currentFilePath.set(path);
+    currentFileName.set(fileName);
   }
 
   // ─── Signature ────────────────────────────────────────────────────────
@@ -307,38 +452,6 @@
     };
   });
 
-  // ─── Add Text (from CanvasEditor textplace event) ────────────────────
-
-  let textInput = $state<{ visible: boolean; x: number; y: number; pageNum: number; fontSize: number; color: string }>({
-    visible: false, x: 0, y: 0, pageNum: 1, fontSize: 14, color: "#000000",
-  });
-  let textInputValue = $state("");
-
-  function handleTextPlaceEvent(e: Event) {
-    const detail = (e as CustomEvent).detail;
-    if (!detail) return;
-    textInput = { visible: true, x: detail.screenX, y: detail.screenY, pageNum: detail.pageNum, fontSize: 14, color: "#000000" };
-    textInputValue = "";
-  }
-
-  function commitTextInput() {
-    if (!textInputValue.trim()) { textInput.visible = false; return; }
-    const pageIdx = textInput.pageNum - 1;
-    const pH = basePageHeights[pageIdx] ?? 842;
-    const s = $zoomLevel * baseFitScale;
-    const pdfX = textInput.x / s;
-    const pdfY = pH - textInput.y / s - (textInput.fontSize / s);
-    const pdfW = textInputValue.length * textInput.fontSize * 0.6;
-    const pdfH = textInput.fontSize;
-    editHistory.set(
-      pushOperation($editHistory, "addText", {
-        page: textInput.pageNum, x: pdfX, y: pdfY, w: pdfW, h: pdfH,
-        text: textInputValue, fontSize: textInput.fontSize, color: textInput.color,
-      }),
-    );
-    textInput.visible = false;
-  }
-
   async function handleOcrEdit() {
     if (!pdfDoc || ocrBusy) return;
 
@@ -395,6 +508,137 @@
     }
   }
 
+  // ─── OCR Post-processing & Sandwich PDF Export ─────────────────────
+
+  let ocrCopied = $state(false);
+  let exportingSearchablePdf = $state(false);
+  let ocrStatusMsg = $state<string | null>(null);
+
+  async function handleCopyCleanedOcrText() {
+    const results = $ocrResults;
+    const pages = Object.keys(results).map(Number).sort((a, b) => a - b);
+    if (pages.length === 0) return;
+
+    let allText = "";
+    for (const p of pages) {
+      const pageBlocks = results[p] || [];
+      const pageRaw = pageBlocks.map((b) => b.text).join("\n");
+      const cleaned = cleanOcrText(pageRaw);
+      if (cleaned.trim()) {
+        allText += (allText ? "\n\n" : "") + cleaned;
+      }
+    }
+
+    try {
+      await navigator.clipboard.writeText(allText);
+      ocrCopied = true;
+      setTimeout(() => {
+        ocrCopied = false;
+      }, 2000);
+    } catch (e) {
+      console.error("Failed to copy cleaned text:", e);
+    }
+  }
+
+  let tableCopied = $state(false);
+
+  async function handleExportOcrTable() {
+    const results = $ocrResults;
+    const cur = $currentPage;
+    const pageBlocks = results[cur] && results[cur].length ? results[cur] : Object.values(results).flat();
+    if (!pageBlocks.length) {
+      ocrStatusMsg = "当前页面暂无 OCR 识别数据";
+      setTimeout(() => { ocrStatusMsg = null; }, 2000);
+      return;
+    }
+
+    try {
+      const tables: any = await invoke("ocr_detect_tables", {
+        boxes: pageBlocks.map((b) => ({
+          points: b.points,
+          text: b.text,
+          confidence: b.confidence ?? 0.95,
+        })),
+      });
+
+      if (!tables || tables.length === 0) {
+        ocrStatusMsg = "当前页面未检测到结构化表格";
+        setTimeout(() => { ocrStatusMsg = null; }, 2500);
+        return;
+      }
+
+      const md = tables.map((t: any) => t.markdown).join("\n\n");
+      await navigator.clipboard.writeText(md);
+      tableCopied = true;
+      ocrStatusMsg = `已成功复制 ${tables.length} 个表格为 Markdown！`;
+      setTimeout(() => {
+        tableCopied = false;
+        ocrStatusMsg = null;
+      }, 3000);
+    } catch (e) {
+      ocrStatusMsg = `表格识别提取失败: ${e}`;
+      setTimeout(() => { ocrStatusMsg = null; }, 3000);
+    }
+  }
+
+  async function handleExportSearchablePdf() {
+    if (!$currentFilePath || exportingSearchablePdf) return;
+    const results = $ocrResults;
+    const pageNums = Object.keys(results).map(Number).sort((a, b) => a - b);
+    if (pageNums.length === 0) return;
+
+    exportingSearchablePdf = true;
+    ocrStatusMsg = null;
+    try {
+      const defaultName = ($currentFileName || "document").replace(/\.pdf$/i, "") + "_searchable.pdf";
+      const outPath = await save({
+        title: "导出双层可搜索 PDF",
+        defaultPath: defaultName,
+        filters: [{ name: "PDF", extensions: ["pdf"] }],
+      });
+
+      if (!outPath) {
+        exportingSearchablePdf = false;
+        return;
+      }
+
+      const pagesData = pageNums.map((p) => {
+        const blocks = results[p] || [];
+        const baseW = basePageWidths[p - 1] ?? 612;
+        const baseH = basePageHeights[p - 1] ?? 842;
+        // OCR render scale was 2
+        return {
+          page: p,
+          imageWidth: baseW * 2,
+          imageHeight: baseH * 2,
+          boxes: blocks.map((b) => ({
+            points: b.points,
+            text: b.text,
+            confidence: b.confidence,
+          })),
+        };
+      });
+
+      await invoke("create_searchable_pdf", {
+        req: {
+          inputPath: $currentFilePath,
+          outputPath: outPath,
+          pagesData,
+        },
+      });
+
+      ocrStatusMsg = "双层可搜索 PDF 导出成功！";
+      setTimeout(() => {
+        ocrStatusMsg = null;
+      }, 4000);
+    } catch (e: any) {
+      console.error("Export searchable PDF failed:", e);
+      ocrStatusMsg = `导出失败: ${e?.message || e}`;
+    } finally {
+      exportingSearchablePdf = false;
+    }
+  }
+
   // ─── Save edits ─────────────────────────────────────────────────────
 
   let saving = $state(false);
@@ -405,7 +649,11 @@
   });
 
   async function handleSaveEdits(overwrite: boolean = false) {
-    if (!$currentFilePath || !hasEdits() || saving) return;
+    if (!$currentFilePath || saving) return;
+    const isRemote = $currentFilePath.includes("pdf_seeker_remote");
+    const isEbook = isEbookFormat($currentFilePath);
+    if (!hasEdits() && !isRemote && !isEbook && overwrite) return;
+
     saving = true;
     try {
       const hist = $editHistory;
@@ -416,22 +664,40 @@
       }));
 
       let outputPath: string;
-      if (overwrite) {
+      if (overwrite && !isRemote && !isEbook) {
         outputPath = $currentFilePath;
       } else {
-        const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
-        if (!out) { saving = false; return; }
-        outputPath = out;
+        const defaultName = ($currentFileName || "document")
+          .replace(/\.(epub|cbz|cbr|txt|md|markdown|pdf)$/i, "") + ".pdf";
+        const out = await save({
+          title: "保存 PDF 到本地",
+          defaultPath: defaultName,
+          filters: [{ name: "PDF 文档", extensions: ["pdf"] }],
+        });
+        if (!out) {
+          saving = false;
+          return;
+        }
+        outputPath = typeof out === "string" ? out : (out as any).path;
       }
 
-      await invoke("apply_edit_operations", {
-        inputPath: $currentFilePath,
-        outputPath,
-        operations: ops,
-      });
+      if (ops.length > 0) {
+        await invoke("apply_edit_operations", {
+          inputPath: $currentFilePath,
+          outputPath,
+          operations: ops,
+        });
+      } else {
+        const fileBytes = convertedEbookPdfBytes || (await readFile($currentFilePath));
+        await writeFile(outputPath, fileBytes);
+      }
 
+      const newFileName = outputPath.split(/[\\/]/).pop() || "Untitled";
       currentFilePath.set(outputPath);
-      currentFileName.set(outputPath.split(/[\\/]/).pop() || "Untitled");
+      currentFileName.set(newFileName);
+      if ($tabsStore.activeTabId) {
+        tabsStore.updateTabPath($tabsStore.activeTabId, outputPath, newFileName);
+      }
       editHistory.set({ operations: [], currentIndex: -1 });
     } catch (e) {
       console.error("Save edits failed:", e);
@@ -458,6 +724,14 @@
     activeTool = null;
     pageDialogTool = null;
     ocrResults.set({});
+  }
+
+  function toggleTheme() {
+    const next = !$isDark;
+    isDark.set(next);
+    if (typeof document !== "undefined") {
+      document.documentElement.classList.toggle("dark", next);
+    }
   }
 
   function handleTabChange(filePath: string) {
@@ -511,6 +785,36 @@
   let renderQueue: number[] = [];
   let zoomDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Viewport Virtualization & RenderTask cancellation (pdf.js parity)
+  let virtualWindow = $state<VirtualWindow>({
+    visibleStart: 1,
+    visibleEnd: 1,
+    bufferedStart: 1,
+    bufferedEnd: 2,
+  });
+  let activeRenderTasks = new Map<number, any>();
+
+  function cancelRenderTask(pageNum: number) {
+    const task = activeRenderTasks.get(pageNum);
+    if (task && typeof task.cancel === "function") {
+      try {
+        task.cancel();
+      } catch {}
+    }
+    activeRenderTasks.delete(pageNum);
+  }
+
+  function cancelAllRenderTasks() {
+    for (const [_, task] of activeRenderTasks) {
+      if (task && typeof task.cancel === "function") {
+        try {
+          task.cancel();
+        } catch {}
+      }
+    }
+    activeRenderTasks.clear();
+  }
+
   let basePageHeights = $state<number[]>([]);
   let basePageWidths = $state<number[]>([]);
   let baseFitScale = 1;
@@ -528,10 +832,40 @@
 
   // ─── Document loading ───────────────────────────────────────────────
 
+  let showUrlDialog = $state(false);
+  let urlInput = $state("");
+  let urlLoading = $state(false);
+  let urlError = $state("");
+
+  async function handleOpenFromUrl() {
+    const url = urlInput.trim();
+    if (!url) return;
+    urlLoading = true;
+    urlError = "";
+    try {
+      const res: { localPath: string; fileName: string; fileSize: number } =
+        await invoke("download_pdf_from_url", { url });
+      tabsStore.openTab(res.localPath, res.fileName);
+      currentFilePath.set(res.localPath);
+      currentFileName.set(res.fileName);
+      try {
+        await invoke("add_recent_file", { path: res.localPath });
+      } catch (_) {}
+      showUrlDialog = false;
+      urlInput = "";
+    } catch (err: any) {
+      urlError = typeof err === "string" ? err : err?.message || String(err);
+    } finally {
+      urlLoading = false;
+    }
+  }
+
+  let convertedEbookPdfBytes: Uint8Array | null = null;
+
   async function handleOpen() {
     const selected = await open({
       multiple: false,
-      filters: [{ name: "PDF", extensions: ["pdf"] }],
+      filters: SUPPORTED_OPEN_FILTERS,
     });
     if (selected) {
       const path = typeof selected === "string" ? selected : String(selected);
@@ -545,7 +879,10 @@
   function handleDrop(e: DragEvent) {
     e.preventDefault();
     const file: File | undefined = e.dataTransfer?.files[0];
-    if (!file || !file.name.toLowerCase().endsWith(".pdf")) return;
+    if (!file) return;
+    const name = file.name.toLowerCase();
+    const isSupported = name.endsWith(".pdf") || isEbookFormat(name);
+    if (!isSupported) return;
     const path = (file as any).path || file.name;
     const fileName = path.split(/[\\/]/).pop() || "Untitled";
     tabsStore.openTab(path, fileName);
@@ -557,6 +894,8 @@
     loading = true;
     errorMsg = "";
     pdfDoc = null;
+    convertedEbookPdfBytes = null;
+    cancelAllRenderTasks();
     renderVersion++;
     pageCache.clear();
     pageHeights = [];
@@ -564,15 +903,33 @@
     basePageHeights = [];
     basePageWidths = [];
     try {
-      const data = await readFile(path);
-      const doc = await loadPdf(new Uint8Array(data));
+      const rawData = await readFile(path);
+      let pdfBytes: Uint8Array;
+
+      const lower = path.toLowerCase();
+      if (lower.endsWith(".epub")) {
+        pdfBytes = await convertEpubToPdf(rawData, path.split(/[\\/]/).pop()?.replace(/\.epub$/i, ""));
+        convertedEbookPdfBytes = pdfBytes;
+      } else if (lower.endsWith(".cbz") || lower.endsWith(".zip")) {
+        pdfBytes = await convertCbzToPdf(rawData, path.split(/[\\/]/).pop()?.replace(/\.(cbz|zip)$/i, ""));
+        convertedEbookPdfBytes = pdfBytes;
+      } else if (lower.endsWith(".txt") || lower.endsWith(".md") || lower.endsWith(".markdown")) {
+        const text = new TextDecoder().decode(rawData);
+        const title = path.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, "") || "Document";
+        pdfBytes = await convertTextToPdf(text, title);
+        convertedEbookPdfBytes = pdfBytes;
+      } else {
+        pdfBytes = new Uint8Array(rawData);
+      }
+
+      const doc = await loadPdf(pdfBytes);
       pdfDoc = doc;
       totalPages.set(doc.numPages);
       currentPage.set(1);
       zoomLevel.set(1.0);
-      renderedZoomLevel = 1.0;
       await loadBaseDimensions(doc);
       applyZoomToDimensions(1.0);
+      updateVirtualWindow(true);
     } catch (e) {
       errorMsg = String(e);
       pdfDoc = null;
@@ -589,15 +946,17 @@
     basePageWidths = [];
     for (let i = 1; i <= doc.numPages; i++) {
       const vp = await getPageViewport(doc, i, 1);
-      basePageHeights.push(vp.height);
-      basePageWidths.push(vp.width);
+      const h = Number.isFinite(vp.height) && vp.height > 0 ? vp.height : 842;
+      const w = Number.isFinite(vp.width) && vp.width > 0 ? vp.width : 595;
+      basePageHeights.push(h);
+      basePageWidths.push(w);
     }
   }
 
   function applyZoomToDimensions(zoom: number) {
     const s = zoom * baseFitScale;
-    pageHeights = basePageHeights.map((h) => h * s);
-    pageWidths = basePageWidths.map((w) => w * s);
+    pageHeights = basePageHeights.map((h) => Math.max(50, Math.round(h * s)));
+    pageWidths = basePageWidths.map((w) => Math.max(50, Math.round(w * s)));
   }
 
   function evictCache() {
@@ -608,17 +967,19 @@
     }
   }
 
-  // Tracks the zoom level at which canvases were last rendered.
-  // CSS transform = currentZoom / renderedZoom provides instant visual scaling.
-  let renderedZoomLevel = $state(1.0);
-  const cssTransformScale = $derived($zoomLevel / renderedZoomLevel);
-
-  // ─── Rendering ───────────────────────────────────────────────────────
+  // ─── Rendering Pipeline (pdf.js Virtualized Windowing) ──────────────────
 
   async function renderPage(pageNum: number) {
     const doc = pdfDoc;
+    if (!doc) return;
+
+    // Only render pages inside the active buffered window
+    if (pageNum < virtualWindow.bufferedStart || pageNum > virtualWindow.bufferedEnd) {
+      return;
+    }
+
     const canvas = canvasMap.get(pageNum);
-    if (!doc || !canvas) return;
+    if (!canvas) return;
 
     const version = renderVersion;
     const z = $zoomLevel;
@@ -628,10 +989,12 @@
       const key = cacheKey(pageNum, z);
       const cached = pageCache.get(key);
       if (cached) {
-        const ctx = canvas.getContext("2d")!;
-        canvas.width = cached.width;
-        canvas.height = cached.height;
-        ctx.drawImage(cached, 0, 0);
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          canvas.width = cached.width;
+          canvas.height = cached.height;
+          ctx.drawImage(cached, 0, 0);
+        }
         return;
       }
 
@@ -640,39 +1003,78 @@
         return;
       }
 
+      // Cancel any ongoing stale render task for this specific page
+      cancelRenderTask(pageNum);
       pendingRenders++;
+
       const page = await doc.getPage(pageNum);
-      if (renderVersion !== version) { pendingRenders--; processQueue(); return; }
+      if (renderVersion !== version) {
+        pendingRenders--;
+        processQueue();
+        return;
+      }
 
       const viewport = page.getViewport({ scale: effectiveScale });
-      const cw = Math.floor(viewport.width * DPR);
-      const ch = Math.floor(viewport.height * DPR);
+      const { canvasWidth, canvasHeight, effectiveDpr } = clampCanvasDimensions(
+        viewport.width,
+        viewport.height,
+        DPR
+      );
 
       const offscreen = document.createElement("canvas");
-      offscreen.width = cw;
-      offscreen.height = ch;
-      const offCtx = offscreen.getContext("2d")!;
-      offCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
-      await page.render({ canvasContext: offCtx, viewport }).promise;
+      offscreen.width = canvasWidth;
+      offscreen.height = canvasHeight;
+      const offCtx = offscreen.getContext("2d");
+      if (!offCtx) {
+        pendingRenders--;
+        processQueue();
+        return;
+      }
+      offCtx.setTransform(effectiveDpr, 0, 0, effectiveDpr, 0, 0);
 
-      if (renderVersion !== version) { pendingRenders--; processQueue(); return; }
+      const renderTask = page.render({ canvasContext: offCtx, viewport });
+      activeRenderTasks.set(pageNum, renderTask);
+
+      try {
+        await renderTask.promise;
+      } catch (err: any) {
+        if (err?.name === "RenderingCancelledException" || renderVersion !== version) {
+          pendingRenders--;
+          processQueue();
+          return;
+        }
+        throw err;
+      } finally {
+        activeRenderTasks.delete(pageNum);
+      }
+
+      if (renderVersion !== version) {
+        pendingRenders--;
+        processQueue();
+        return;
+      }
 
       pageCache.set(key, offscreen);
       evictCache();
 
-      const ctx = canvas.getContext("2d")!;
-      canvas.width = cw;
-      canvas.height = ch;
-      ctx.drawImage(offscreen, 0, 0);
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        canvas.width = canvasWidth;
+        canvas.height = canvasHeight;
+        ctx.drawImage(offscreen, 0, 0);
 
-      if ($isDark) {
-        ctx.fillStyle = "rgba(0, 0, 0, 0.15)";
-        ctx.fillRect(0, 0, cw, ch);
+        if ($isDark) {
+          ctx.fillStyle = "rgba(0, 0, 0, 0.15)";
+          ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+        }
       }
 
       pendingRenders--;
       processQueue();
-    } catch {
+    } catch (e: any) {
+      if (e?.name !== "RenderingCancelledException") {
+        console.warn(`Render page ${pageNum} error:`, e);
+      }
       pendingRenders--;
       processQueue();
     }
@@ -684,17 +1086,10 @@
   }
 
   function renderVisiblePages() {
-    if (!scrollContainer) return;
-    const containerRect = scrollContainer.getBoundingClientRect();
-    for (const [pageNum, slot] of pageSlots) {
-      const rect = slot.getBoundingClientRect();
-      if (rect.bottom > containerRect.top - 400 && rect.top < containerRect.bottom + 400) {
-        renderPage(pageNum);
-      }
-    }
+    updateVirtualWindow(true);
   }
 
-  // ─── IntersectionObserver ───────────────────────────────────────────
+  // ─── IntersectionObserver & Lifecycle ───────────────────────────────
 
   function setupObserver() {
     if (observer) observer.disconnect();
@@ -711,7 +1106,10 @@
 
   function observePage(node: HTMLDivElement, pageNum: number) {
     const canvas = node.querySelector("canvas") as HTMLCanvasElement;
-    if (canvas) canvasMap.set(pageNum, canvas);
+    if (canvas) {
+      canvasMap.set(pageNum, canvas);
+      renderPage(pageNum);
+    }
     pageSlots.set(pageNum, node);
     if (observer) observer.observe(node);
     return {
@@ -721,62 +1119,169 @@
         if (observer) observer.unobserve(node);
         pageNum = newPageNum;
         const c = node.querySelector("canvas") as HTMLCanvasElement;
-        if (c) canvasMap.set(newPageNum, c);
+        if (c) {
+          canvasMap.set(newPageNum, c);
+          renderPage(newPageNum);
+        }
         pageSlots.set(newPageNum, node);
         if (observer) observer.observe(node);
       },
       destroy() {
         if (observer) observer.unobserve(node);
+        cancelRenderTask(pageNum);
         canvasMap.delete(pageNum);
         pageSlots.delete(pageNum);
       },
     };
   }
 
-  // ─── Scroll → currentPage tracking ─────────────────────────────────
+  // ─── Virtual Window & Scroll Tracking ───────────────────────────────
 
   let scrollRaf = 0;
 
   function onScroll() {
+    if (!scrollContainer) return;
+    const top = scrollContainer.scrollTop;
+    if (top > 300 && !zenReminderDismissed && !zenModeOpen && !showZenReminder) {
+      showZenReminder = true;
+    }
+
     if (scrollRaf) cancelAnimationFrame(scrollRaf);
-    scrollRaf = requestAnimationFrame(updateCurrentPage);
+    scrollRaf = requestAnimationFrame(() => {
+      updateCurrentPage();
+      updateVirtualWindow();
+    });
+  }
+
+  function updateVirtualWindow(force = false) {
+    if (!scrollContainer || pageHeights.length === 0) return;
+    const scrollTop = scrollContainer.scrollTop;
+    const clientHeight = scrollContainer.clientHeight || 800;
+    const nextWin = computeVisiblePages(scrollTop, clientHeight, pageHeights, PAGE_GAP, 1);
+
+    const changed =
+      nextWin.bufferedStart !== virtualWindow.bufferedStart ||
+      nextWin.bufferedEnd !== virtualWindow.bufferedEnd ||
+      nextWin.visibleStart !== virtualWindow.visibleStart ||
+      nextWin.visibleEnd !== virtualWindow.visibleEnd;
+
+    if (changed || force) {
+      // Cancel tasks for pages that fell out of the active buffer
+      for (const [pageNum] of activeRenderTasks) {
+        if (pageNum < nextWin.bufferedStart || pageNum > nextWin.bufferedEnd) {
+          cancelRenderTask(pageNum);
+        }
+      }
+      virtualWindow = nextWin;
+
+      // Render visible pages first
+      for (let p = virtualWindow.visibleStart; p <= virtualWindow.visibleEnd; p++) {
+        renderPage(p);
+      }
+      // Pre-render buffered lookahead pages
+      for (let p = virtualWindow.bufferedStart; p <= virtualWindow.bufferedEnd; p++) {
+        if (p < virtualWindow.visibleStart || p > virtualWindow.visibleEnd) {
+          renderPage(p);
+        }
+      }
+    }
+  }
+
+  let isZooming = false;
+  let zoomLockTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function markZooming() {
+    isZooming = true;
+    if (zoomLockTimer) clearTimeout(zoomLockTimer);
+    zoomLockTimer = setTimeout(() => {
+      isZooming = false;
+    }, 280);
   }
 
   function updateCurrentPage() {
-    if (!scrollContainer || pageHeights.length === 0) return;
+    if (!scrollContainer || pageHeights.length === 0 || isZooming) return;
     const scrollTop = scrollContainer.scrollTop;
+    const viewportCenter = scrollTop + (scrollContainer.clientHeight / 2);
     let acc = 0;
     for (let i = 0; i < pageHeights.length; i++) {
-      acc += pageHeights[i] + PAGE_GAP;
-      if (acc > scrollTop + 50) {
+      const pageH = pageHeights[i] + PAGE_GAP;
+      if (acc + pageH >= viewportCenter) {
         if ($currentPage !== i + 1) currentPage.set(i + 1);
         return;
       }
+      acc += pageH;
     }
     if ($currentPage !== pageHeights.length) currentPage.set(pageHeights.length);
   }
 
-  // ─── Zoom with cursor-center (CSS-transform for smoothness) ─────────
+  function scrollToPage(pageNum: number) {
+    if (!scrollContainer || pageNum < 1 || pageHeights.length === 0) return;
+    const clamped = Math.min(pageNum, pageHeights.length);
+    let targetTop = 16;
+    for (let i = 0; i < clamped - 1; i++) {
+      targetTop += (pageHeights[i] || 0) + PAGE_GAP;
+    }
+    scrollContainer.scrollTo({
+      top: Math.max(0, targetTop - 20),
+      behavior: "smooth",
+    });
+  }
+
+  function changeZoom(newZ: number) {
+    const oldZ = $zoomLevel;
+    const clamped = Math.min(5.0, Math.max(0.25, Math.round(newZ * 20) / 20));
+    if (clamped === oldZ || !scrollContainer) return;
+    markZooming();
+    const rect = scrollContainer.getBoundingClientRect();
+    const { targetScrollLeft, targetScrollTop } = computeScrollAnchor(oldZ, clamped, {
+      clientX: rect.left + scrollContainer.clientWidth / 2,
+      clientY: rect.top + scrollContainer.clientHeight / 2,
+      rectLeft: rect.left,
+      rectTop: rect.top,
+      scrollLeft: scrollContainer.scrollLeft,
+      scrollTop: scrollContainer.scrollTop,
+    });
+    applyZoomToDimensions(clamped);
+    zoomLevel.set(clamped);
+    requestAnimationFrame(() => {
+      if (scrollContainer) {
+        scrollContainer.scrollLeft = Math.max(0, targetScrollLeft);
+        scrollContainer.scrollTop = Math.max(0, targetScrollTop);
+      }
+    });
+  }
+
+  // ─── Zoom with cursor-center (Trackpad pinch & Linear mouse wheel) ───
 
   function handleWheel(e: WheelEvent) {
     if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
       e.stopPropagation();
+      markZooming();
       const oldZ = $zoomLevel;
-      const delta = -e.deltaY * 0.002;
-      const newZ = Math.max(0.25, Math.min(5, oldZ + delta));
-      if (newZ === oldZ) return;
+      const newZ = computeZoomLevel(oldZ, e);
 
-      if (scrollContainer) {
-        const rect = scrollContainer.getBoundingClientRect();
-        const cursorX = e.clientX - rect.left + scrollContainer.scrollLeft;
-        const cursorY = e.clientY - rect.top + scrollContainer.scrollTop;
-        const ratio = newZ / oldZ;
-        scrollContainer.scrollLeft = cursorX * ratio - (e.clientX - rect.left);
-        scrollContainer.scrollTop = cursorY * ratio - (e.clientY - rect.top);
-      }
+      if (newZ === oldZ || !scrollContainer) return;
 
+      const rect = scrollContainer.getBoundingClientRect();
+      const { targetScrollLeft, targetScrollTop } = computeScrollAnchor(oldZ, newZ, {
+        clientX: e.clientX,
+        clientY: e.clientY,
+        rectLeft: rect.left,
+        rectTop: rect.top,
+        scrollLeft: scrollContainer.scrollLeft,
+        scrollTop: scrollContainer.scrollTop,
+      });
+
+      applyZoomToDimensions(newZ);
       zoomLevel.set(newZ);
+
+      requestAnimationFrame(() => {
+        if (scrollContainer) {
+          scrollContainer.scrollLeft = Math.max(0, targetScrollLeft);
+          scrollContainer.scrollTop = Math.max(0, targetScrollTop);
+        }
+      });
     }
   }
 
@@ -793,6 +1298,18 @@
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+    // Cmd+Shift+F for Zen Mode
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      zenModeOpen = !zenModeOpen;
+      return;
+    }
+    // Cmd+I for PDF Info
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "i") {
+      e.preventDefault();
+      pdfInfoOpen = true;
+      return;
+    }
     // Ctrl+Tab / Ctrl+Shift+Tab for tab switching
     if ((e.ctrlKey || e.metaKey) && e.key === "Tab") {
       e.preventDefault();
@@ -812,6 +1329,12 @@
       handleCloseFile();
       return;
     }
+    // Ctrl+F / Cmd+F for PDF keyword search
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      searchOpen = true;
+      return;
+    }
     switch (e.key) {
       case "ArrowLeft":
       case "PageUp":
@@ -823,23 +1346,30 @@
         e.preventDefault();
         if ($currentPage < $totalPages) currentPage.set($currentPage + 1);
         break;
+      case "z":
+      case "Z":
+        if (!e.ctrlKey && !e.metaKey && !e.altKey && $currentFilePath && !activeTool) {
+          e.preventDefault();
+          zenModeOpen = true;
+        }
+        break;
       case "+":
       case "=":
         if (e.ctrlKey || e.metaKey) {
           e.preventDefault();
-          zoomLevel.set(Math.min(Math.round(($zoomLevel + 0.25) * 20) / 20, 5));
+          changeZoom($zoomLevel + 0.25);
         }
         break;
       case "-":
         if (e.ctrlKey || e.metaKey) {
           e.preventDefault();
-          zoomLevel.set(Math.max(Math.round(($zoomLevel - 0.25) * 20) / 20, 0.25));
+          changeZoom($zoomLevel - 0.25);
         }
         break;
       case "0":
         if (e.ctrlKey || e.metaKey) {
           e.preventDefault();
-          zoomLevel.set(1.0);
+          changeZoom(1.0);
         }
         break;
       case "Escape":
@@ -886,14 +1416,13 @@
     void $zoomLevel;
     if (!pdfDoc) return;
     applyZoomToDimensions($zoomLevel);
-    // Debounce canvas re-render — CSS transform provides instant visual feedback
     if (zoomDebounceTimer) clearTimeout(zoomDebounceTimer);
     zoomDebounceTimer = setTimeout(() => {
-      renderedZoomLevel = $zoomLevel;
+      cancelAllRenderTasks();
       renderVersion++;
-      renderVisiblePages();
+      updateVirtualWindow(true);
       zoomDebounceTimer = null;
-    }, 250);
+    }, 120);
   });
 
   // Listen for sign placement events from CanvasEditor
@@ -902,14 +1431,6 @@
     if (!el) return;
     el.addEventListener("signplace", handleSignPlaceEvent);
     return () => el.removeEventListener("signplace", handleSignPlaceEvent);
-  });
-
-  // Listen for text placement events from CanvasEditor
-  $effect(() => {
-    const el = scrollContainer;
-    if (!el) return;
-    el.addEventListener("textplace", handleTextPlaceEvent);
-    return () => el.removeEventListener("textplace", handleTextPlaceEvent);
   });
 
   // ─── Derived ────────────────────────────────────────────────────────
@@ -925,84 +1446,260 @@
   <!-- Tab bar -->
   <TabBar
     onopenfile={handleOpen}
+    onopenurl={() => { showUrlDialog = true; urlError = ""; }}
     ontabchange={handleTabChange}
     ontabclose={handleTabClose}
   />
 
-  <!-- Toolbar tabs -->
-  <div class="flex items-center">
-    {#if $currentFilePath}
-      <Tooltip message={thumbnailVisible ? "Hide Thumbnails" : "Show Thumbnails"}>
-        <button
-          onclick={() => (thumbnailVisible = !thumbnailVisible)}
-          class="flex items-center justify-center w-8 h-8 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors mr-1"
-        >
-          {#if thumbnailVisible}
-            <PanelLeftClose size={14} />
-          {:else}
-            <PanelLeft size={14} />
-          {/if}
-        </button>
-      </Tooltip>
-    {/if}
-    <ToolbarTabs {activeCategory} {activeTool} ontoolaction={handleToolAction} />
-    {#if hasEdits() && $currentFilePath}
-      <button
-        onclick={() => handleSaveEdits(true)}
-        disabled={saving}
-        class="flex items-center gap-1.5 px-3 py-1.5 mx-2 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 whitespace-nowrap"
-      >
-        {#if saving}
-          <Loader2 size={13} class="animate-spin" />
-        {:else}
-          <Save size={13} />
+  <!-- Unified Integrated PDF Command Bar (Single sleek 42px row - No overlap, no redundancy) -->
+  <header class="flex items-center justify-between px-3 h-[42px] border-b border-border bg-card shrink-0 select-none gap-2 overflow-x-auto scrollbar-none z-10">
+    <!-- Left: Sidebar Toggle, Open File, Page Navigation & Zoom -->
+    <div class="flex items-center gap-1 shrink-0">
+      {#if $currentFilePath}
+        <!-- Toggle main app sidebar -->
+        <Tooltip message={$sidebarCollapsed ? "展开主导航" : "收起主导航"} placement="bottom">
+          <button
+            onclick={() => sidebarCollapsed.update((v) => !v)}
+            class="flex items-center justify-center w-7 h-7 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors shrink-0"
+          >
+            {#if $sidebarCollapsed}
+              <PanelLeft size={15} />
+            {:else}
+              <PanelLeftClose size={15} />
+            {/if}
+          </button>
+        </Tooltip>
+
+        <!-- Open other file -->
+        <Tooltip message={t("toolbar.openFile")} placement="bottom">
+          <button
+            onclick={handleOpen}
+            class="flex items-center justify-center w-7 h-7 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors shrink-0"
+          >
+            <FolderOpen size={15} />
+          </button>
+        </Tooltip>
+
+        <div class="h-4 w-px bg-border/60 mx-0.5 shrink-0"></div>
+
+        <!-- Thumbnail sidebar toggle -->
+        <Tooltip message={thumbnailVisible ? "收起页面缩略图" : "展开页面缩略图"} placement="bottom">
+          <button
+            onclick={() => (thumbnailVisible = !thumbnailVisible)}
+            class="flex items-center justify-center w-7 h-7 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors shrink-0"
+          >
+            <Layers size={14} class="opacity-75" />
+          </button>
+        </Tooltip>
+
+        <div class="h-4 w-px bg-border/60 mx-0.5 shrink-0"></div>
+
+        <!-- Page navigation -->
+        <div class="flex items-center shrink-0">
+          <Tooltip message="上一页 (PageUp / ←)" placement="bottom">
+            <button
+              onclick={() => scrollToPage($currentPage - 1)}
+              disabled={$currentPage <= 1}
+              class="flex items-center justify-center w-6 h-6 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-40 transition-colors shrink-0"
+            >
+              <ChevronLeft size={14} />
+            </button>
+          </Tooltip>
+
+          <span class="text-xs font-medium tabular-nums min-w-[3.4rem] text-center text-muted-foreground select-none whitespace-nowrap shrink-0">
+            {$currentPage} / {$totalPages || 1}
+          </span>
+
+          <Tooltip message="下一页 (PageDown / →)" placement="bottom">
+            <button
+              onclick={() => scrollToPage($currentPage + 1)}
+              disabled={$currentPage >= $totalPages}
+              class="flex items-center justify-center w-6 h-6 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-40 transition-colors shrink-0"
+            >
+              <ChevronRight size={14} />
+            </button>
+          </Tooltip>
+        </div>
+
+        <div class="h-4 w-px bg-border/60 mx-0.5 shrink-0"></div>
+
+        <!-- Zoom controls -->
+        <div class="flex items-center shrink-0">
+          <Tooltip message="缩小 (⌘-)" placement="bottom">
+            <button
+              onclick={() => changeZoom($zoomLevel - 0.25)}
+              class="flex items-center justify-center w-6 h-6 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors shrink-0"
+            >
+              <ZoomOut size={14} />
+            </button>
+          </Tooltip>
+
+          <Tooltip message="点击重置为 100% (⌘0)" placement="bottom">
+            <button
+              onclick={() => changeZoom(1.0)}
+              class="text-xs font-medium tabular-nums px-1.5 py-0.5 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors min-w-[3.2rem] text-center whitespace-nowrap shrink-0"
+            >
+              {Math.round($zoomLevel * 100)}%
+            </button>
+          </Tooltip>
+
+          <Tooltip message="放大 (⌘+)" placement="bottom">
+            <button
+              onclick={() => changeZoom($zoomLevel + 0.25)}
+              class="flex items-center justify-center w-6 h-6 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors shrink-0"
+            >
+              <ZoomIn size={14} />
+            </button>
+          </Tooltip>
+        </div>
+      {/if}
+    </div>
+
+    <!-- Center: Inline Bento Category Strip (Clean 4 Categories without overlap) -->
+    <div class="flex items-center justify-center shrink-0 relative px-1">
+      {#if $currentFilePath}
+        <ToolbarTabs
+          bind:activeCategory
+          bind:activeTool
+          ontoolaction={handleToolAction}
+        />
+      {/if}
+    </div>
+
+    <!-- Right: Unified Actions, Zen Reading & Toolbox -->
+    <div class="flex items-center gap-1.5 shrink-0">
+      {#if $currentFilePath && (hasEdits() || isEbookFormat($currentFilePath))}
+        {#if !isEbookFormat($currentFilePath)}
+          <button
+            onclick={() => handleSaveEdits(true)}
+            disabled={saving}
+            class="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 whitespace-nowrap shadow-xs shrink-0"
+          >
+            {#if saving}
+              <Loader2 size={12} class="animate-spin" />
+            {:else}
+              <Save size={12} />
+            {/if}
+            <span>{t("editor.save")}</span>
+          </button>
         {/if}
-        {t("editor.save")}
-      </button>
-      <button
-        onclick={() => handleSaveEdits(false)}
-        disabled={saving}
-        class="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-border hover:bg-accent transition-colors disabled:opacity-50 whitespace-nowrap"
-      >
-        <SaveAll size={13} />
-        {t("editor.saveAs")}
-      </button>
-    {/if}
-    {#if $currentFilePath}
-      <button
-        onclick={handleCloseFile}
-        class="flex items-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:bg-accent hover:text-destructive transition-colors whitespace-nowrap"
-      >
-        <X size={13} />
-      </button>
-    {/if}
-    {#if $currentFilePath}
-      <Tooltip message="Print">
         <button
-          onclick={() => (printDialogOpen = true)}
-          class="flex items-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors whitespace-nowrap"
+          onclick={() => handleSaveEdits(false)}
+          disabled={saving}
+          class="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium border border-border hover:bg-accent transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 {isEbookFormat($currentFilePath) ? 'bg-primary/10 border-primary/30 text-primary font-semibold' : ''}"
+          title="将当前文档/电子书保存为 PDF 文件"
         >
-          <Printer size={13} />
+          <SaveAll size={12} />
+          <span>{isEbookFormat($currentFilePath) ? "导出为 PDF" : t("editor.saveAs")}</span>
         </button>
-      </Tooltip>
-    {/if}
-  </div>
+        <div class="h-4 w-px bg-border/60 mx-0.5 shrink-0"></div>
+      {/if}
+
+      {#if $currentFilePath}
+        <!-- 统一规范的核心阅读模式入口 -->
+        <Tooltip message="开启全屏沉浸阅读 (快捷键 Z 或 ⌘Shift+F)" placement="bottom">
+          <button
+            onclick={() => (zenModeOpen = true)}
+            class="flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-primary text-primary-foreground shadow-xs hover:brightness-110 active:scale-95 transition-all whitespace-nowrap shrink-0"
+          >
+            <BookOpen size={13} class="shrink-0" />
+            <span>沉浸阅读</span>
+            <kbd class="px-1 py-0.2 text-[10px] font-mono bg-primary-foreground/20 text-primary-foreground rounded">Z</kbd>
+          </button>
+        </Tooltip>
+
+        <!-- 全部 50+ 工具箱 (⌘K) -->
+        <Tooltip message="全部 50+ 工具箱 (⌘K)" placement="bottom">
+          <button
+            onclick={() => (toolboxVisible = true)}
+            class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium text-primary hover:bg-primary/10 border border-primary/25 transition-colors whitespace-nowrap shadow-2xs shrink-0"
+          >
+            <Sparkles size={13} />
+            <span>工具箱</span>
+            <kbd class="ml-0.5 px-1 py-0.2 rounded bg-primary/15 text-[10px] font-mono leading-none">⌘K</kbd>
+          </button>
+        </Tooltip>
+
+        <div class="h-4 w-px bg-border/60 mx-0.5 shrink-0"></div>
+
+        <!-- 打印文档 (⌘P) -->
+        <Tooltip message="打印文档 (⌘P)" placement="bottom">
+          <button
+            onclick={() => (printDialogOpen = true)}
+            class="flex items-center justify-center w-7 h-7 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors shrink-0"
+          >
+            <Printer size={14} />
+          </button>
+        </Tooltip>
+
+        <!-- 批注与图层管理 -->
+        <Tooltip message="批注与图层面板" placement="bottom">
+          <button
+            onclick={() => (layersPanelOpen = !layersPanelOpen)}
+            class="flex items-center gap-1 px-2 h-7 rounded-md text-xs font-medium transition-colors shrink-0 {layersPanelOpen ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'}"
+          >
+            <span>图层</span>
+            {#if currentPageOperations().length > 0}
+              <span class="px-1 py-0.2 text-[10px] bg-primary/20 rounded-full font-mono">{currentPageOperations().length}</span>
+            {/if}
+          </button>
+        </Tooltip>
+
+        <div class="h-4 w-px bg-border/60 mx-0.5 shrink-0"></div>
+
+        <!-- 文档文件名 + 属性胶囊 (⌘I) -->
+        <div class="flex items-center gap-1 bg-accent/30 hover:bg-accent/50 px-2 py-0.5 rounded-lg border border-border/50 text-xs transition-colors max-w-[150px] shrink-0">
+          <span
+            class="text-xs font-medium text-foreground truncate"
+            title={$currentFilePath}
+          >
+            {$currentFileName}
+          </span>
+          <Tooltip message="文档属性 (⌘I)" placement="bottom">
+            <button
+              onclick={() => (pdfInfoOpen = true)}
+              class="p-0.5 rounded text-muted-foreground hover:text-foreground transition-colors shrink-0"
+            >
+              <Info size={12} />
+            </button>
+          </Tooltip>
+        </div>
+
+        <!-- 主题切换 -->
+        <Tooltip message={$isDark ? "切换明亮模式" : "切换暗黑模式"} placement="bottom">
+          <button
+            onclick={toggleTheme}
+            class="flex items-center justify-center w-7 h-7 rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors shrink-0"
+          >
+            {#if $isDark}
+              <Sun size={15} />
+            {:else}
+              <Moon size={15} />
+            {/if}
+          </button>
+        </Tooltip>
+
+        <!-- 关闭当前文档 -->
+        <Tooltip message="关闭文档 (⌘W)" placement="bottom">
+          <button
+            onclick={handleCloseFile}
+            class="flex items-center justify-center w-7 h-7 rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors shrink-0"
+          >
+            <X size={15} />
+          </button>
+        </Tooltip>
+      {/if}
+    </div>
+  </header>
 
   <!-- Main content area -->
-  <div class="flex flex-1 min-h-0 overflow-hidden">
+  <div class="flex flex-1 min-h-0 min-w-0 overflow-hidden relative">
     <!-- Thumbnail sidebar -->
     {#if $currentFilePath}
       <ThumbnailSidebar
         doc={pdfDoc}
         bind:visible={thumbnailVisible}
-        onpageclick={(pageNum: number) => {
-          if (scrollContainer) {
-            const targetSlot = scrollContainer.querySelector('.page-slot:nth-child(' + pageNum + ')');
-            if (targetSlot) {
-              targetSlot.scrollIntoView({ behavior: "smooth", block: "center" });
-            }
-          }
-        }}
+        onpageclick={(pageNum: number) => scrollToPage(pageNum)}
         onreorder={handleThumbnailReorder}
       />
     {/if}
@@ -1020,10 +1717,23 @@
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         bind:this={scrollContainer}
-        class="flex-1 overflow-auto {$isDark ? 'bg-zinc-900' : 'bg-gray-100'} transition-colors duration-200"
+        class="flex-1 min-w-0 overflow-y-auto overflow-x-auto relative {$isDark ? 'bg-zinc-900' : 'bg-gray-100'} transition-colors duration-200"
         ondragover={(e) => e.preventDefault()}
         ondrop={handleDrop}
       >
+        <PdfSearchBar
+          doc={pdfDoc}
+          bind:open={searchOpen}
+          onmatchchange={(matches, idx) => {
+            if (matches.length > 0 && idx >= 0) {
+              const m = matches[idx];
+              if (m) {
+                scrollToPage(m.pageNum);
+              }
+            }
+          }}
+        />
+
         {#if loading}
           <div class="flex flex-col items-center justify-center h-full gap-3">
             <Loader2 size={32} class="text-muted-foreground animate-spin" />
@@ -1035,52 +1745,140 @@
             <span class="text-sm text-destructive">{errorMsg}</span>
           </div>
         {:else if pageHeights.length > 0}
+          <!-- Floating OCR control bar when OCR results exist -->
+          {#if Object.keys($ocrResults).length > 0}
+            <div class="sticky top-3 z-30 flex flex-col items-center pointer-events-none mb-2 gap-1.5">
+              <div class="pointer-events-auto bg-card/95 backdrop-blur-md border border-border shadow-lg rounded-full px-4 py-1.5 flex items-center gap-3 text-xs">
+                <span class="flex items-center gap-1.5 font-medium text-foreground">
+                  <ScanLine size={14} class="text-primary" />
+                  OCR 识别 ({Object.values($ocrResults).flat().length} 处)
+                </span>
+                <div class="h-3 w-px bg-border"></div>
+                <button
+                  class="hover:text-primary transition-colors flex items-center gap-1 text-muted-foreground font-medium"
+                  onclick={handleCopyCleanedOcrText}
+                  title="智能合并断行与中西文空格排版并复制"
+                >
+                  {#if ocrCopied}
+                    <Check size={13} class="text-green-500" />
+                    <span class="text-green-500 font-medium">已复制清洗文本</span>
+                  {:else}
+                    <Sparkles size={13} class="text-amber-500" />
+                    <span>智能清洗复制</span>
+                  {/if}
+                </button>
+                <div class="h-3 w-px bg-border"></div>
+                <button
+                  class="hover:text-primary transition-colors flex items-center gap-1 text-muted-foreground font-medium disabled:opacity-50"
+                  disabled={exportingSearchablePdf}
+                  onclick={handleExportSearchablePdf}
+                  title="利用隐形文本层生成可划词检索复制的双层 Sandwich PDF"
+                >
+                  {#if exportingSearchablePdf}
+                    <Loader2 size={13} class="animate-spin text-primary" />
+                    <span>生成中...</span>
+                  {:else}
+                    <Download size={13} class="text-primary" />
+                    <span>导出可搜索 PDF</span>
+                  {/if}
+                </button>
+                <div class="h-3 w-px bg-border"></div>
+                <button
+                  class="hover:text-primary transition-colors flex items-center gap-1 text-muted-foreground font-medium"
+                  onclick={handleExportOcrTable}
+                  title="自动识别页面表格结构并复制为 Markdown 格式"
+                >
+                  {#if tableCopied}
+                    <Check size={13} class="text-green-500" />
+                    <span class="text-green-500 font-medium">已复制表格</span>
+                  {:else}
+                    <IconTable size={13} class="text-indigo-500" />
+                    <span>导出表格 (MD)</span>
+                  {/if}
+                </button>
+                <div class="h-3 w-px bg-border"></div>
+                <button
+                  class="hover:text-primary transition-colors flex items-center gap-1 text-muted-foreground"
+                  onclick={() => (ocrOverlayVisible = !ocrOverlayVisible)}
+                >
+                  {#if ocrOverlayVisible}
+                    <EyeOff size={13} /> 隐藏识别框
+                  {:else}
+                    <Eye size={13} /> 显示识别框
+                  {/if}
+                </button>
+                <div class="h-3 w-px bg-border"></div>
+                <button
+                  class="text-destructive hover:text-destructive/80 transition-colors flex items-center gap-1 font-medium"
+                  onclick={() => { ocrResults.set({}); }}
+                >
+                  <X size={13} /> 清除
+                </button>
+              </div>
+
+              {#if ocrStatusMsg}
+                <div class="pointer-events-auto text-xs px-3 py-1 rounded-full bg-primary/10 text-primary border border-primary/20 shadow-sm animate-in fade-in slide-in-from-top-1">
+                  {ocrStatusMsg}
+                </div>
+              {/if}
+            </div>
+          {/if}
+
           <div
             class="mx-auto py-4 flex flex-col items-center gap-2 {$isDark ? 'bg-zinc-900' : ''}"
             style="max-width: {typeof containerMaxWidth === 'number' ? containerMaxWidth + 'px' : containerMaxWidth};"
           >
             {#each pageHeights as height, i (i)}
+              {@const pageNum = i + 1}
+              {@const isBuffered = pageNum >= virtualWindow.bufferedStart && pageNum <= virtualWindow.bufferedEnd}
               <div
-                class="page-slot shrink-0 rounded-sm shadow-lg relative"
+                class="page-slot shrink-0 rounded-sm shadow-lg relative bg-card transition-shadow"
                 style="width: {pageWidths[i]}px; height: {height}px;"
+                data-page={pageNum}
               >
-                <div
-                  use:observePage={i + 1}
-                  data-page={i + 1}
-                  class="absolute inset-0 overflow-hidden"
-                  style="transform: scale({cssTransformScale}); transform-origin: top left;"
-                >
-                  <canvas class="block w-full h-full"></canvas>
-                </div>
-                <!-- Text layer for mouse selection -->
-                {#if pdfDoc}
-                  <TextLayer
-                    doc={pdfDoc}
-                    pageNum={i + 1}
+                {#if isBuffered}
+                  <div
+                    use:observePage={pageNum}
+                    data-page={pageNum}
+                    class="absolute inset-0 overflow-hidden"
+                  >
+                    <canvas class="block w-full h-full"></canvas>
+                  </div>
+                  <!-- Text layer for mouse selection -->
+                  {#if pdfDoc}
+                    <TextLayer
+                      doc={pdfDoc}
+                      pageNum={pageNum}
+                      scale={effectiveScale}
+                      pageHeight={basePageHeights[i] ?? 842}
+                      ontextedit={handleTextLayerEdit}
+                    />
+                  {/if}
+                  <!-- OCR results overlay -->
+                  {#if $ocrResults[pageNum]?.length}
+                    <OcrOverlay
+                      blocks={$ocrResults[pageNum]}
+                      pageNum={pageNum}
+                      scale={effectiveScale}
+                      pageHeight={basePageHeights[i] ?? 842}
+                      visible={ocrOverlayVisible}
+                    />
+                  {/if}
+                  <!-- CanvasEditor mounted for buffered pages -->
+                  <CanvasEditor
+                    activeTool={activeTool as any}
+                    pageNum={pageNum}
+                    pageWidth={basePageWidths[i] ?? 612}
+                    pageHeight={height / effectiveScale}
                     scale={effectiveScale}
-                    pageHeight={basePageHeights[i] ?? 842}
-                    ontextedit={handleTextLayerEdit}
+                    zIndex={activeTool ? 'z-[10]' : 'z-[5]'}
                   />
+                {:else}
+                  <!-- Virtualized lightweight skeleton placeholder: preserves geometry & scroll position with zero GPU burden -->
+                  <div class="absolute inset-0 flex items-center justify-center bg-muted/10 border border-border/20 rounded-sm select-none pointer-events-none">
+                    <span class="text-xs text-muted-foreground/40 font-mono tracking-wider">Page {pageNum}</span>
+                  </div>
                 {/if}
-                <!-- OCR results overlay -->
-                {#if $ocrResults[i + 1]?.length}
-                  <OcrOverlay
-                    blocks={$ocrResults[i + 1]}
-                    pageNum={i + 1}
-                    scale={effectiveScale}
-                    pageHeight={basePageHeights[i] ?? 842}
-                    visible={true}
-                  />
-                {/if}
-                <!-- CanvasEditor always mounted -->
-                <CanvasEditor
-                  activeTool={activeTool as any}
-                  pageNum={i + 1}
-                  pageWidth={basePageWidths[i] ?? 612}
-                  pageHeight={height / effectiveScale}
-                  scale={effectiveScale}
-                  zIndex={activeTool ? 'z-[10]' : 'z-[5]'}
-                />
               </div>
             {/each}
           </div>
@@ -1088,129 +1886,237 @@
       </div>
     {/if}
 
-    <!-- Right property panel (driven by selection, not tool) -->
-    {#if showPropertyPanel && selectedElement()}
-      {@const sel = selectedElement()!}
-      <div class="w-72 border-l border-border bg-card shrink-0 overflow-auto p-4">
-        <div class="flex items-center justify-between mb-3">
-          <span class="text-sm font-medium">
-            {#if sel.type === "addText"}Text
-            {:else if sel.type === "addRectangle"}Rectangle
-            {:else if sel.type === "addHighlight"}Highlight
-            {:else}Element{/if}
-          </span>
+    <!-- Right property & layers panel (driven by selection or toggle) -->
+    {#if selectedElement() || layersPanelOpen}
+      {@const sel = selectedElement()}
+      <div class="w-80 border-l border-border bg-card shrink-0 flex flex-col h-full overflow-hidden text-sm">
+        <!-- Header -->
+        <div class="flex items-center justify-between px-4 py-3 border-b border-border bg-muted/30">
+          <div class="flex items-center gap-2">
+            <Layers class="h-4 w-4 text-primary" />
+            <span class="font-medium text-xs uppercase tracking-wider text-foreground">
+              {sel ? "Element Properties" : "Page Layers"}
+            </span>
+          </div>
           <button
-            onclick={clearSelection}
-            class="text-xs text-muted-foreground hover:text-foreground"
-          >X</button>
+            onclick={() => {
+              if (sel) clearSelection();
+              else layersPanelOpen = false;
+            }}
+            class="text-xs text-muted-foreground hover:text-foreground p-1 rounded hover:bg-muted"
+            title="Close"
+          >✕</button>
         </div>
 
-        {#if sel.type === "addText"}
+        <div class="flex-1 overflow-y-auto p-4 space-y-5">
+          <!-- Selected Element Properties section (if an element is selected) -->
+          {#if sel}
+            <div class="space-y-3 pb-4 border-b border-border">
+              <div class="flex items-center justify-between">
+                <span class="text-xs font-semibold text-muted-foreground uppercase">
+                  {#if sel.type === "addText"}Text Element
+                  {:else if sel.type === "addRectangle"}Rectangle Element
+                  {:else if sel.type === "addHighlight"}Highlight Element
+                  {:else if sel.type === "addWhiteout"}Whiteout Element
+                  {:else}Element Properties{/if}
+                </span>
+                <button
+                  onclick={clearSelection}
+                  class="text-[11px] text-muted-foreground hover:text-foreground"
+                >Deselect</button>
+              </div>
+
+              {#if sel.type === "addText"}
+                <div class="space-y-3">
+                  <div class="space-y-1">
+                    <label class="text-xs text-muted-foreground">Content</label>
+                    <textarea
+                      rows="2"
+                      class="w-full p-2 rounded-lg border border-input bg-transparent text-sm resize-y"
+                      value={sel.params.text ?? ""}
+                      onchange={(e) => updateSelectedProperty("text", (e.target as HTMLTextAreaElement).value)}
+                    ></textarea>
+                  </div>
+                  <div class="grid grid-cols-2 gap-2">
+                    <div class="space-y-1">
+                      <label class="text-xs text-muted-foreground">Font Size</label>
+                      <input
+                        type="number"
+                        value={sel.params.fontSize ?? 16}
+                        min="6" max="120"
+                        class="w-full px-2 py-1 text-sm rounded border border-input bg-transparent"
+                        onchange={(e) => updateSelectedProperty("fontSize", Number((e.target as HTMLInputElement).value))}
+                      >
+                    </div>
+                    <div class="space-y-1">
+                      <label class="text-xs text-muted-foreground">Color</label>
+                      <input
+                        type="color"
+                        value={sel.params.color ?? "#000000"}
+                        class="w-full h-8 rounded cursor-pointer border border-input"
+                        onchange={(e) => updateSelectedProperty("color", (e.target as HTMLInputElement).value)}
+                      >
+                    </div>
+                  </div>
+                </div>
+              {:else if sel.type === "addRectangle"}
+                <div class="space-y-3">
+                  <div class="grid grid-cols-2 gap-2">
+                    <div class="space-y-1">
+                      <label class="text-xs text-muted-foreground">Border Color</label>
+                      <input
+                        type="color"
+                        value={sel.params.borderColor ?? "#000000"}
+                        class="w-full h-8 rounded cursor-pointer border border-input"
+                        onchange={(e) => updateSelectedProperty("borderColor", (e.target as HTMLInputElement).value)}
+                      >
+                    </div>
+                    <div class="space-y-1">
+                      <label class="text-xs text-muted-foreground">Border Width</label>
+                      <input
+                        type="number"
+                        value={sel.params.borderWidth ?? 2}
+                        min="1" max="20"
+                        class="w-full px-2 py-1 text-sm rounded border border-input bg-transparent"
+                        onchange={(e) => updateSelectedProperty("borderWidth", Number((e.target as HTMLInputElement).value))}
+                      >
+                    </div>
+                  </div>
+                  <label class="flex items-center gap-2 text-sm cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={sel.params.hasFill ?? false}
+                      class="rounded"
+                      onchange={(e) => updateSelectedProperty("hasFill", (e.target as HTMLInputElement).checked)}
+                    >
+                    <span class="text-xs text-muted-foreground">Fill</span>
+                  </label>
+                  {#if sel.params.hasFill}
+                    <div class="space-y-1">
+                      <label class="text-xs text-muted-foreground">Fill Color</label>
+                      <input
+                        type="color"
+                        value={sel.params.fillColor ?? "#ffffff"}
+                        class="w-full h-8 rounded cursor-pointer border border-input"
+                        onchange={(e) => updateSelectedProperty("fillColor", (e.target as HTMLInputElement).value)}
+                      >
+                    </div>
+                  {/if}
+                </div>
+              {:else if sel.type === "addHighlight"}
+                <div class="space-y-3">
+                  <div class="space-y-1">
+                    <label class="text-xs text-muted-foreground">Color</label>
+                    <input
+                      type="color"
+                      value={sel.params.color ?? "#ffff00"}
+                      class="w-full h-8 rounded cursor-pointer border border-input"
+                      onchange={(e) => updateSelectedProperty("color", (e.target as HTMLInputElement).value)}
+                    >
+                  </div>
+                  <div class="space-y-1">
+                    <label class="text-xs text-muted-foreground">Opacity: {Math.round((sel.params.opacity ?? 0.4) * 100)}%</label>
+                    <input
+                      type="range"
+                      min="0.1" max="1" step="0.05"
+                      value={sel.params.opacity ?? 0.4}
+                      class="w-full"
+                      oninput={(e) => updateSelectedProperty("opacity", Number((e.target as HTMLInputElement).value))}
+                    >
+                  </div>
+                </div>
+              {/if}
+
+              <div class="pt-2">
+                <button
+                  onclick={deleteSelected}
+                  class="text-xs text-destructive hover:underline flex items-center gap-1.5"
+                >
+                  <Trash class="h-3.5 w-3.5" />
+                  Delete Selected Element
+                </button>
+              </div>
+            </div>
+          {/if}
+
+          <!-- Scribus-style Page Elements / Layers List -->
           <div class="space-y-3">
-            <div class="space-y-1">
-              <label class="text-xs text-muted-foreground">Content</label>
-              <textarea
-                rows="2"
-                class="w-full p-2 rounded-lg border border-input bg-transparent text-sm resize-y"
-                value={sel.params.text ?? ""}
-                onchange={(e) => updateSelectedProperty("text", (e.target as HTMLTextAreaElement).value)}
-              ></textarea>
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold text-muted-foreground uppercase">
+                Page {$currentPage} Elements ({currentPageOperations().length})
+              </span>
+              {#if currentPageOperations().length > 0}
+                <button
+                  onclick={() => clearPageOperations($currentPage)}
+                  class="text-[11px] text-destructive hover:underline"
+                  title="Clear all annotations on current page"
+                >
+                  Clear Page
+                </button>
+              {/if}
             </div>
-            <div class="grid grid-cols-2 gap-2">
-              <div class="space-y-1">
-                <label class="text-xs text-muted-foreground">Font Size</label>
-                <input
-                  type="number"
-                  value={sel.params.fontSize ?? 16}
-                  min="6" max="120"
-                  class="w-full px-2 py-1 text-sm rounded border border-input bg-transparent"
-                  onchange={(e) => updateSelectedProperty("fontSize", Number((e.target as HTMLInputElement).value))}
-                >
+
+            {#if currentPageOperations().length === 0}
+              <div class="py-6 text-center text-xs text-muted-foreground border border-dashed rounded-lg p-4">
+                No annotations or modifications on Page {$currentPage}.
+                <div class="mt-1 text-[11px] opacity-75">
+                  Use Text, Shape, or Draw to add elements.
+                </div>
               </div>
-              <div class="space-y-1">
-                <label class="text-xs text-muted-foreground">Color</label>
-                <input
-                  type="color"
-                  value={sel.params.color ?? "#000000"}
-                  class="w-full h-8 rounded cursor-pointer border border-input"
-                  onchange={(e) => updateSelectedProperty("color", (e.target as HTMLInputElement).value)}
-                >
+            {:else}
+              <div class="space-y-1.5 max-h-[300px] overflow-y-auto pr-1">
+                {#each currentPageOperations() as op (op.id)}
+                  <div
+                    class="group flex items-center justify-between p-2 rounded-lg border text-xs transition-colors cursor-pointer {op.id === $selectedEditId ? 'border-primary bg-primary/10' : 'border-border/60 hover:bg-muted/50'}"
+                    onclick={() => selectedEditId.set(op.id)}
+                  >
+                    <div class="flex items-center gap-2 min-w-0 flex-1">
+                      <span class="px-1.5 py-0.5 rounded font-mono text-[10px] font-semibold {op.type === 'addText' ? 'bg-blue-500/10 text-blue-500' : op.type === 'addRectangle' ? 'bg-green-500/10 text-green-500' : op.type === 'addHighlight' ? 'bg-yellow-500/10 text-yellow-600' : 'bg-muted text-muted-foreground'}">
+                        {op.type === 'addText' ? 'T' : op.type === 'addRectangle' ? '▢' : op.type === 'addHighlight' ? 'H' : 'Op'}
+                      </span>
+                      <span class="truncate font-medium">
+                        {#if op.type === 'addText'}
+                          "{op.params.text || 'Text'}"
+                        {:else if op.type === 'addRectangle'}
+                          Rectangle
+                        {:else if op.type === 'addHighlight'}
+                          Highlight
+                        {:else if op.type === 'addWhiteout'}
+                          Whiteout
+                        {:else}
+                          {op.type}
+                        {/if}
+                      </span>
+                    </div>
+
+                    <button
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        deleteOperationById(op.id);
+                      }}
+                      class="opacity-0 group-hover:opacity-100 p-1 rounded hover:text-destructive hover:bg-destructive/10 transition-opacity"
+                      title="Delete layer"
+                    >
+                      <Trash class="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                {/each}
               </div>
-            </div>
-          </div>
-        {:else if sel.type === "addRectangle"}
-          <div class="space-y-3">
-            <div class="grid grid-cols-2 gap-2">
-              <div class="space-y-1">
-                <label class="text-xs text-muted-foreground">Border Color</label>
-                <input
-                  type="color"
-                  value={sel.params.borderColor ?? "#000000"}
-                  class="w-full h-8 rounded cursor-pointer border border-input"
-                  onchange={(e) => updateSelectedProperty("borderColor", (e.target as HTMLInputElement).value)}
+            {/if}
+
+            <!-- Document global summary -->
+            {#if currentAppliedOperations().length > 0}
+              <div class="pt-3 border-t border-border flex items-center justify-between text-[11px] text-muted-foreground">
+                <span>Total applied: {currentAppliedOperations().length} in document</span>
+                <button
+                  onclick={clearAllOperations}
+                  class="text-destructive hover:underline"
                 >
-              </div>
-              <div class="space-y-1">
-                <label class="text-xs text-muted-foreground">Border Width</label>
-                <input
-                  type="number"
-                  value={sel.params.borderWidth ?? 2}
-                  min="1" max="20"
-                  class="w-full px-2 py-1 text-sm rounded border border-input bg-transparent"
-                  onchange={(e) => updateSelectedProperty("borderWidth", Number((e.target as HTMLInputElement).value))}
-                >
-              </div>
-            </div>
-            <label class="flex items-center gap-2 text-sm cursor-pointer">
-              <input
-                type="checkbox"
-                checked={sel.params.hasFill ?? false}
-                class="rounded"
-                onchange={(e) => updateSelectedProperty("hasFill", (e.target as HTMLInputElement).checked)}
-              >
-              <span class="text-xs text-muted-foreground">Fill</span>
-            </label>
-            {#if sel.params.hasFill}
-              <div class="space-y-1">
-                <label class="text-xs text-muted-foreground">Fill Color</label>
-                <input
-                  type="color"
-                  value={sel.params.fillColor ?? "#ffffff"}
-                  class="w-full h-8 rounded cursor-pointer border border-input"
-                  onchange={(e) => updateSelectedProperty("fillColor", (e.target as HTMLInputElement).value)}
-                >
+                  Clear All
+                </button>
               </div>
             {/if}
           </div>
-        {:else if sel.type === "addHighlight"}
-          <div class="space-y-3">
-            <div class="space-y-1">
-              <label class="text-xs text-muted-foreground">Color</label>
-              <input
-                type="color"
-                value={sel.params.color ?? "#ffff00"}
-                class="w-full h-8 rounded cursor-pointer border border-input"
-                onchange={(e) => updateSelectedProperty("color", (e.target as HTMLInputElement).value)}
-              >
-            </div>
-            <div class="space-y-1">
-              <label class="text-xs text-muted-foreground">Opacity: {Math.round((sel.params.opacity ?? 0.4) * 100)}%</label>
-              <input
-                type="range"
-                min="0.1" max="1" step="0.05"
-                value={sel.params.opacity ?? 0.4}
-                class="w-full"
-                oninput={(e) => updateSelectedProperty("opacity", Number((e.target as HTMLInputElement).value))}
-              >
-            </div>
-          </div>
-        {/if}
-
-        <div class="mt-4 pt-3 border-t border-border">
-          <button
-            onclick={deleteSelected}
-            class="text-xs text-destructive hover:underline"
-          >Delete Element</button>
         </div>
       </div>
     {/if}
@@ -1218,7 +2124,10 @@
 
   <!-- Status bar -->
   {#if $currentFilePath && pageHeights.length > 0 && !loading && !errorMsg}
-    <StatusBar />
+    <StatusBar
+      onopensearch={() => (searchOpen = true)}
+      onopenzen={() => (zenModeOpen = true)}
+    />
   {/if}
 </div>
 
@@ -1321,44 +2230,6 @@
   </div>
 {/if}
 
-<!-- Text input overlay (for Add Text tool) -->
-{#if textInput.visible}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="fixed inset-0 z-[100]" onclick={() => { if (textInput.visible) commitTextInput(); }}>
-    <div
-      class="absolute"
-      style="left: {textInput.x}px; top: {textInput.y}px;"
-      onclick={(e) => e.stopPropagation()}
-    >
-      <div class="flex items-center gap-2 mb-1 bg-white border border-gray-200 rounded-lg shadow-lg px-2 py-1">
-        <input
-          type="number"
-          value={textInput.fontSize}
-          min="6" max="120"
-          class="w-14 px-1 py-0.5 text-xs rounded border border-input bg-transparent text-center"
-          onchange={(e) => textInput.fontSize = Number((e.target as HTMLInputElement).value)}
-        >
-        <span class="text-[10px] text-muted-foreground">pt</span>
-        <input
-          type="color"
-          value={textInput.color}
-          class="w-6 h-6 rounded cursor-pointer border border-input"
-          onchange={(e) => textInput.color = (e.target as HTMLInputElement).value}
-        >
-      </div>
-      <textarea
-        bind:value={textInputValue}
-        autofocus
-        rows="1"
-        class="block border-2 border-blue-500 bg-white text-black outline-none resize min-w-[120px] px-1 py-0.5 rounded"
-        style="font-size: {textInput.fontSize * effectiveScale}px; line-height: 1.2;"
-        onclick={(e) => e.stopPropagation()}
-        onkeydown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitTextInput(); } if (e.key === "Escape") { textInput.visible = false; } }}
-      ></textarea>
-    </div>
-  </div>
-{/if}
-
 <!-- Edit text overlay (for TextLayer Edit button) -->
 {#if editTextOverlay.visible}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1380,3 +2251,187 @@
     </div>
   </div>
 {/if}
+
+<!-- Global ⌘K Tool Finder Shortcut -->
+<svelte:window onkeydown={(e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    toolboxVisible = !toolboxVisible;
+  }
+}} />
+
+<!-- Toolbox Modal -->
+<ToolboxModal bind:visible={toolboxVisible} onselecttool={handleToolAction} />
+
+{#if showUrlDialog}
+  <!-- URL Input Dialog Modal -->
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-in fade-in">
+    <div class="w-full max-w-md p-6 bg-card border border-border rounded-2xl shadow-2xl space-y-4">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2 text-foreground font-semibold">
+          <Globe size={18} class="text-primary" />
+          <span>从网络网址打开 PDF</span>
+        </div>
+        <button
+          onclick={() => (showUrlDialog = false)}
+          class="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+        >
+          <X size={16} />
+        </button>
+      </div>
+
+      <p class="text-xs text-muted-foreground leading-relaxed">
+        输入远程 PDF 文件的完整 HTTP 或 HTTPS 地址。下载后将在新标签页中打开，在编辑或批注后可随时保存至本地。
+      </p>
+
+      <div class="space-y-1.5">
+        <input
+          bind:value={urlInput}
+          onkeydown={(e) => {
+            if (e.key === 'Enter') handleOpenFromUrl();
+            if (e.key === 'Escape') showUrlDialog = false;
+          }}
+          type="url"
+          placeholder="https://example.com/sample.pdf"
+          class="w-full px-3.5 py-2.5 bg-muted/40 border border-border rounded-xl text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
+        />
+        {#if urlError}
+          <p class="text-xs text-destructive font-medium px-1 pt-1">{urlError}</p>
+        {/if}
+      </div>
+
+      <div class="flex items-center justify-end gap-2.5 pt-2">
+        <Button variant="ghost" size="sm" onclick={() => (showUrlDialog = false)}>
+          取消
+        </Button>
+        <Button
+          variant="default"
+          size="sm"
+          onclick={handleOpenFromUrl}
+          disabled={urlLoading || !urlInput.trim()}
+          class="gap-1.5"
+        >
+          {#if urlLoading}
+            <Loader2 size={14} class="animate-spin" />
+            <span>下载中...</span>
+          {:else}
+            <span>下载并打开</span>
+          {/if}
+        </Button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if zenModeOpen && pdfDoc}
+  <ZenReadingOverlay
+    doc={pdfDoc}
+    initialPage={$currentPage}
+    fileName={$currentFileName}
+    onclose={(page: number) => {
+      zenModeOpen = false;
+      if (page >= 1 && page <= $totalPages) {
+        currentPage.set(page);
+        scrollToPage(page);
+      }
+    }}
+  />
+{/if}
+
+<PdfInfoDialog bind:open={pdfInfoOpen} />
+
+{#if cropDialogOpen}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div
+    class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4 animate-in fade-in duration-150 select-none"
+    onclick={() => (cropDialogOpen = false)}
+  >
+    <div
+      class="bg-card border border-border rounded-2xl shadow-2xl w-full max-w-2xl overflow-hidden"
+      onclick={(e) => e.stopPropagation()}
+    >
+      <CropTool
+        doc={pdfDoc}
+        currentPage={$currentPage}
+        totalPages={$totalPages}
+        oncancel={() => (cropDialogOpen = false)}
+        onapplycrop={({ pageRange, top, right, bottom, left }) => {
+          cropDialogOpen = false;
+        }}
+      />
+    </div>
+  </div>
+{/if}
+
+{#if metadataDialogOpen}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div
+    class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4 animate-in fade-in duration-150 select-none"
+    onclick={() => (metadataDialogOpen = false)}
+  >
+    <div
+      class="bg-card border border-border rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden"
+      onclick={(e) => e.stopPropagation()}
+    >
+      <MetadataTool
+        initialMetadata={{
+          title: $currentFileName.replace(/\.pdf$/i, ""),
+          author: "",
+          subject: "",
+          keywords: "",
+          creator: "PDF Seeker",
+          producer: "lopdf / Rust",
+        }}
+        oncancel={() => (metadataDialogOpen = false)}
+        onsave={(meta) => {
+          metadataDialogOpen = false;
+        }}
+      />
+    </div>
+  </div>
+{/if}
+
+{#if showZenReminder && !zenReminderDismissed && !zenModeOpen && $currentFilePath}
+  <aside
+    aria-label="沉浸式阅读提示"
+    class="fixed bottom-6 right-6 z-50 max-w-sm p-4 bg-card/95 backdrop-blur-md border border-primary/40 rounded-xl shadow-2xl flex flex-col gap-2.5 animate-in fade-in slide-in-from-bottom-3 duration-200 select-none"
+  >
+    <div class="flex items-start justify-between gap-3">
+      <div class="flex items-center gap-2.5">
+        <div class="w-8 h-8 rounded-lg bg-primary/15 text-primary flex items-center justify-center shrink-0">
+          <BookOpen size={16} />
+        </div>
+        <div>
+          <h4 class="text-xs font-bold text-foreground">开启沉浸阅读模式？</h4>
+          <p class="text-[11px] text-muted-foreground leading-snug mt-0.5">
+            检测到长文档翻阅。沉浸模式支持 3D 仿真翻页、双页开本、无干扰阅读与护眼背景。
+          </p>
+        </div>
+      </div>
+      <button
+        onclick={() => dismissZenReminder(false)}
+        class="text-muted-foreground hover:text-foreground p-1 rounded-md transition-colors"
+        title="关闭本次提示"
+      >
+        <X size={13} />
+      </button>
+    </div>
+
+    <div class="flex items-center justify-end gap-2 pt-2 border-t border-border/50">
+      <button
+        onclick={() => dismissZenReminder(true)}
+        class="text-[11px] text-muted-foreground hover:text-foreground px-2 py-1 rounded transition-colors"
+      >
+        不再提醒
+      </button>
+      <button
+        onclick={launchZenFromReminder}
+        class="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold bg-primary text-primary-foreground hover:bg-primary/90 transition-all shadow-xs"
+      >
+        <span>立即体验</span>
+        <kbd class="px-1 py-0.2 text-[10px] font-mono bg-primary-foreground/20 rounded">Z</kbd>
+      </button>
+    </div>
+  </aside>
+{/if}
+

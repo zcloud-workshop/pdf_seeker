@@ -28,6 +28,9 @@ directories = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 log = "0.4"
+ocr-rs = { git = "https://github.com/zibo-chen/rust-paddle-ocr.git", rev = "b7141e7d0289eff67d4a97e79a00d9db72345d89" }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 

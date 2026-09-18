@@ -197,13 +197,23 @@
           }
           case "compress": {
             const outPath = `${dir}/${name}_compressed.pdf`;
-            const res = await invoke<{ originalSize: number; compressedSize: number; ratio: number }>("compress_pdf", {
-              req: { inputPath: filePath, outputPath: outPath },
+            const res = await invoke<{
+              originalSize?: number;
+              original_size?: number;
+              compressedSize?: number;
+              compressed_size?: number;
+              ratio?: number;
+            }>("compress_pdf", {
+              inputPath: filePath,
+              outputPath: outPath,
             });
+            const orig = res.original_size ?? res.originalSize ?? 0;
+            const comp = res.compressed_size ?? res.compressedSize ?? orig;
+            const ratio = res.ratio ?? (orig > 0 ? ((orig - comp) / orig) * 100 : 0);
             results[i] = {
               file: filePath,
               status: "done",
-              result: `${formatBytes(res.originalSize)} -> ${formatBytes(res.compressedSize)} (${Math.round(res.ratio * 100)}%)`,
+              result: `${formatBytes(orig)} -> ${formatBytes(comp)} (${Math.round(ratio)}%)`,
             };
             break;
           }

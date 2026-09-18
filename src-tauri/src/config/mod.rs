@@ -8,6 +8,18 @@ use tauri::Manager;
 pub struct AppConfig {
     pub general: GeneralConfig,
     pub s3: Option<S3Config>,
+    pub ocr: Option<OcrConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrConfig {
+    pub model_dir: String,
+    pub det_model: String,
+    pub rec_model: String,
+    pub keys_file: String,
+    pub language: String,
+    pub gpu_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +67,7 @@ impl Default for AppConfig {
                 recent_files_max: 20,
             },
             s3: None,
+            ocr: None,
         }
     }
 }

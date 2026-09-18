@@ -1,0 +1,411 @@
+//! Transactional PDF write layer.
+//!
+//! Guarantees:
+//! 1. Original input is never modified.
+//! 2. Output is written to a temporary file first.
+//! 3. The temporary file is reopened and validated before committing.
+//! 4. An atomic rename commits the validated output.
+//! 5. On any failure the temporary file is cleaned up and the original is untouched.
+
+use lopdf::Document;
+use std::path::Path;
+use std::time::Instant;
+
+use crate::error::{AppError, AppResult};
+
+/// Policy for validating a written PDF before committing.
+#[derive(Debug, Clone, Default)]
+pub struct ValidationPolicy {
+    /// If set, assert that the reopened document has exactly this many pages.
+    pub expected_pages: Option<usize>,
+    /// If true, verify the page tree structure (Kids array length matches Count).
+    pub check_page_tree: bool,
+}
+
+/// Result metadata from a successful transactional write.
+#[derive(Debug, Clone)]
+pub struct WriteResult {
+    /// Size of the output file in bytes.
+    pub output_size: u64,
+    /// Wall-clock duration of the write + validate + commit cycle.
+    pub elapsed: std::time::Duration,
+}
+
+/// RAII guard that ensures a temporary file is deleted if not defused.
+struct TempFileGuard {
+    path: std::path::PathBuf,
+    defused: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            defused: false,
+        }
+    }
+
+    /// Defuse the guard so the temp file is NOT deleted on drop.
+    fn defuse(&mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if !self.defused {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Load a PDF document from the given path.
+pub fn load_doc(path: &str) -> AppResult<Document> {
+    Document::load(path).map_err(|e| AppError::Pdf(format!("Load '{}': {}", path, e)))
+}
+
+/// Check if a document is encrypted and return an error if so.
+///
+/// Call this after `load_doc` on any write-path command to prevent
+/// producing unreadable output from encrypted inputs.
+pub fn reject_encrypted(doc: &Document, path: &str) -> AppResult<()> {
+    if doc.is_encrypted() {
+        return Err(AppError::Encrypted(path.to_string()));
+    }
+    Ok(())
+}
+
+/// Write a PDF document transactionally with validation.
+///
+/// The document is:
+/// 1. Saved to a unique temporary file in the same directory as `output_path`.
+/// 2. Reopened with `lopdf` to verify structural integrity.
+/// 3. Validated against `policy` (page count, page tree).
+/// 4. Atomically renamed to the final `output_path`.
+///
+/// On any failure, the temporary file is cleaned up and the original is untouched.
+pub fn write_transactional(
+    doc: &mut Document,
+    output_path: &str,
+    policy: &ValidationPolicy,
+) -> AppResult<WriteResult> {
+    let start = Instant::now();
+    let output = Path::new(output_path);
+
+    let parent = output
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .ok_or_else(|| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Output path must have a parent directory",
+            ))
+        })?;
+    let file_name = output
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Output path must include a file name",
+            ))
+        })?;
+
+    // Generate unique temporary file name
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| AppError::Pdf(format!("Create output nonce: {}", e)))?
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{}.pdf-seeker-{}-{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        nonce
+    ));
+
+    let mut guard = TempFileGuard::new(temporary.clone());
+
+    // Step 1: Save to temporary file
+    doc.save(&temporary).map_err(|e| {
+        AppError::Pdf(format!(
+            "Save temporary '{}': {}",
+            temporary.display(),
+            e
+        ))
+    })?;
+
+    // Step 2: Reopen and validate
+    let reopened = Document::load(&temporary).map_err(|e| {
+        AppError::Pdf(format!(
+            "Validation failed — reopening temporary PDF '{}': {}",
+            temporary.display(),
+            e
+        ))
+    })?;
+
+    // Step 3: Apply validation policy
+    if let Some(expected) = policy.expected_pages {
+        let actual = reopened.get_pages().len();
+        if actual != expected {
+            return Err(AppError::Pdf(format!(
+                "Page count mismatch: expected {} pages, got {} in '{}'",
+                expected,
+                actual,
+                temporary.display()
+            )));
+        }
+    }
+
+    if policy.check_page_tree {
+        validate_page_tree(&reopened)?;
+    }
+
+    // Step 4: Atomic commit via rename
+    std::fs::rename(&temporary, output).map_err(|e| {
+        AppError::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "Commit validated PDF '{}' to '{}': {}",
+                temporary.display(),
+                output.display(),
+                e
+            ),
+        ))
+    })?;
+
+    // Success — defuse the cleanup guard
+    guard.defuse();
+
+    let output_size = std::fs::metadata(output)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    Ok(WriteResult {
+        output_size,
+        elapsed: start.elapsed(),
+    })
+}
+
+/// Validate that the page tree is internally consistent.
+fn validate_page_tree(doc: &Document) -> AppResult<()> {
+    let root_ref = doc
+        .trailer
+        .get(b"Root")
+        .and_then(|o| o.as_reference())
+        .map_err(|e| AppError::Pdf(format!("Page tree validation — Root: {}", e)))?;
+
+    let pages_ref = doc
+        .get_object(root_ref)
+        .and_then(|o| o.as_dict())
+        .and_then(|d| d.get(b"Pages"))
+        .and_then(|o| o.as_reference())
+        .map_err(|e| AppError::Pdf(format!("Page tree validation — Pages: {}", e)))?;
+
+    let pages_dict = doc
+        .get_object(pages_ref)
+        .and_then(|o| o.as_dict())
+        .map_err(|e| AppError::Pdf(format!("Page tree validation — Pages dict: {}", e)))?;
+
+    let count = pages_dict
+        .get(b"Count")
+        .and_then(|o| o.as_i64())
+        .unwrap_or(-1);
+
+    let kids = pages_dict
+        .get(b"Kids")
+        .and_then(|o| o.as_array())
+        .map(|arr| arr.len())
+        .unwrap_or(0);
+
+    if count >= 0 && kids != count as usize {
+        return Err(AppError::Pdf(format!(
+            "Page tree inconsistent: Count={} but Kids has {} entries",
+            count, kids
+        )));
+    }
+
+    Ok(())
+}
+
+/// Verify that the output path does not match any input path.
+pub fn ensure_distinct_output(output_path: &str, input_paths: &[&str]) -> AppResult<()> {
+    use crate::commands::validation::{validate_output_path, validate_path};
+
+    let output = validate_output_path(output_path)?;
+    for input_path in input_paths {
+        let input = validate_path(input_path)?;
+        if input == output {
+            return Err(AppError::Pdf(format!(
+                "Output path '{}' must differ from input path '{}'",
+                output.display(),
+                input.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::Object;
+    use tempfile::TempDir;
+
+    /// Create a minimal valid PDF for testing.
+    fn create_test_doc(num_pages: u32) -> Document {
+        let mut doc = Document::with_version("1.4");
+        let catalog_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
+        let pages_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
+            (b"Count".to_vec(), Object::Integer(num_pages as i64)),
+            (b"Kids".to_vec(), Object::Array(vec![])),
+        ])));
+
+        if let Some(cat) = doc.objects.get_mut(&catalog_id) {
+            if let Ok(d) = cat.as_dict_mut() {
+                d.set("Type", Object::Name(b"Catalog".to_vec()));
+                d.set("Pages", Object::Reference(pages_id));
+            }
+        }
+
+        let mut kids = Vec::new();
+        for _ in 0..num_pages {
+            let page_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+                (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
+                (b"Parent".to_vec(), Object::Reference(pages_id)),
+                (
+                    b"MediaBox".to_vec(),
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                ),
+            ])));
+            kids.push(Object::Reference(page_id));
+        }
+
+        if let Some(pages_obj) = doc.objects.get_mut(&pages_id) {
+            if let Ok(d) = pages_obj.as_dict_mut() {
+                d.set("Kids", Object::Array(kids));
+            }
+        }
+
+        doc.trailer.set(b"Root", Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn test_write_transactional_basic() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("output.pdf");
+        let mut doc = create_test_doc(3);
+
+        let result = write_transactional(
+            &mut doc,
+            output.to_str().unwrap(),
+            &ValidationPolicy::default(),
+        )
+        .unwrap();
+
+        assert!(output.exists());
+        assert!(result.output_size > 0);
+        assert!(Document::load(&output).is_ok());
+    }
+
+    #[test]
+    fn test_write_transactional_validates_page_count() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("output.pdf");
+        let mut doc = create_test_doc(3);
+
+        let policy = ValidationPolicy {
+            expected_pages: Some(3),
+            ..Default::default()
+        };
+        let result = write_transactional(&mut doc, output.to_str().unwrap(), &policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_transactional_rejects_wrong_page_count() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("output.pdf");
+        let mut doc = create_test_doc(3);
+
+        let policy = ValidationPolicy {
+            expected_pages: Some(5),
+            ..Default::default()
+        };
+        let result = write_transactional(&mut doc, output.to_str().unwrap(), &policy);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Page count mismatch"));
+        // Temp file should have been cleaned up
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn test_write_transactional_checks_page_tree() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("output.pdf");
+        let mut doc = create_test_doc(2);
+
+        let policy = ValidationPolicy {
+            check_page_tree: true,
+            ..Default::default()
+        };
+        let result = write_transactional(&mut doc, output.to_str().unwrap(), &policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_transactional_no_temp_file_on_failure() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("output.pdf");
+        let mut doc = create_test_doc(3);
+
+        let policy = ValidationPolicy {
+            expected_pages: Some(99), // Deliberately wrong
+            ..Default::default()
+        };
+        let _ = write_transactional(&mut doc, output.to_str().unwrap(), &policy);
+
+        // No temp files should remain
+        let temp_files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("pdf-seeker")
+            })
+            .collect();
+        assert!(temp_files.is_empty(), "Temp files should be cleaned up");
+    }
+
+    #[test]
+    fn test_load_doc_success() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.pdf");
+        let mut doc = create_test_doc(1);
+        doc.save(&path).unwrap();
+
+        let loaded = load_doc(path.to_str().unwrap());
+        assert!(loaded.is_ok());
+    }
+
+    #[test]
+    fn test_load_doc_missing_file() {
+        let result = load_doc("/nonexistent/path/to/file.pdf");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_encrypted_on_normal_doc() {
+        let doc = create_test_doc(1);
+        let result = reject_encrypted(&doc, "test.pdf");
+        assert!(result.is_ok());
+    }
+}
+

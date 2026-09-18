@@ -24,4 +24,48 @@ export interface S3Config {
 export interface AppConfig {
   general: GeneralConfig;
   s3: S3Config | null;
+  ocr: OcrConfig | null;
+}
+
+export interface OcrConfig {
+  modelDir: string;
+  detModel: string;
+  recModel: string;
+  keysFile: string;
+  language: string;
+  gpuEnabled: boolean;
+}
+
+export interface OcrModelSet {
+  detPath: string;
+  recPath: string;
+  keysPath: string;
+  language: string;
+  displayName: string;
+}
+
+export interface OcrSuggestedModel {
+  name: string;
+  language: string;
+  description: string;
+  detUrl: string;
+  recUrl: string;
+  keysUrl: string;
+  totalSize: string;
+}
+
+export interface PdfInfo {
+  isEncrypted: boolean;
+  pages: number;
+  fileSize: number;
+  title: string | null;
+  author: string | null;
+  subject: string | null;
+  keywords: string | null;
+  creator: string | null;
+  producer: string | null;
+  creationDate: string | null;
+  modDate: string | null;
+  pdfVersion: string | null;
+  pageSize: string | null;
 }

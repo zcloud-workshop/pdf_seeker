@@ -1,7 +1,12 @@
+pub mod annotate;
 pub mod config;
+pub mod convert;
+pub mod info;
 pub mod ocr;
+pub mod organize;
 pub mod pdf_content;
 pub mod pdf_ops;
 pub mod recent;
 pub mod s3_ops;
+pub mod searchable_pdf;
 pub mod validation;

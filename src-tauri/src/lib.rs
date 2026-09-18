@@ -1,6 +1,7 @@
-mod commands;
-mod config;
-mod error;
+pub mod commands;
+pub mod config;
+pub mod error;
+pub mod pdf;
 
 use std::sync::Mutex;
 
@@ -58,6 +59,8 @@ pub fn run() {
             commands::pdf_ops::add_whiteout,
             commands::pdf_ops::apply_edit_operations,
             commands::pdf_ops::get_pdf_info,
+            commands::pdf_ops::add_page_numbers,
+            commands::pdf_ops::sanitize_pdf,
             commands::s3_ops::s3_test_connection,
             commands::s3_ops::s3_list_files,
             commands::s3_ops::s3_upload_file,
@@ -67,6 +70,11 @@ pub fn run() {
             commands::s3_ops::s3_delete_version,
             commands::s3_ops::s3_create_folder,
             commands::s3_ops::s3_get_presigned_url,
+            commands::searchable_pdf::create_searchable_pdf,
+            commands::searchable_pdf::postprocess_text,
+            commands::ocr::ocr_cluster_paragraphs,
+            commands::ocr::ocr_detect_tables,
+            commands::pdf_ops::download_pdf_from_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

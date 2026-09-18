@@ -8,6 +8,9 @@ pub enum AppError {
     #[error("{0}")]
     Pdf(String),
 
+    #[error("This PDF is password-protected and cannot be processed: {0}")]
+    Encrypted(String),
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 
@@ -25,6 +28,9 @@ pub enum AppError {
 
     #[error("S3 presign error: {0}")]
     S3Presign(#[from] aws_sdk_s3::presigning::PresigningConfigError),
+
+    #[error("OCR error: {0}")]
+    Ocr(String),
 }
 
 impl Serialize for AppError {

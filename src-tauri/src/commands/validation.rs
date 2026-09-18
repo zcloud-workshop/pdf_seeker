@@ -2,18 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
 
-/// Validates and canonicalizes a file path.
-///
-/// - Rejects paths containing `..` components in the original input
-///   (before canonicalization) to prevent directory traversal.
-/// - Canonicalizes the path to resolve symlinks, `.`, and redundant separators.
-/// - Returns the canonicalized `PathBuf` on success.
-/// - Returns `AppError::Io` if the path cannot be canonicalized.
-pub fn validate_path(path: &str) -> AppResult<PathBuf> {
-    let path = Path::new(path);
-
-    // Reject any path component that is ".." in the original input.
-    // This prevents directory traversal even before canonicalization.
+fn reject_parent_components(path: &Path) -> AppResult<()> {
     for component in path.components() {
         if let std::path::Component::ParentDir = component {
             return Err(AppError::Io(std::io::Error::new(
@@ -22,126 +11,112 @@ pub fn validate_path(path: &str) -> AppResult<PathBuf> {
             )));
         }
     }
-
-    // Canonicalize to resolve symlinks, `.`, and produce an absolute path.
-    // This can fail if the path does not exist; callers that need to validate
-    // a path for *creation* (e.g., an output file) should use
-    // `validate_output_path` or handle the missing-file case separately.
-    let canonical = path
-        .canonicalize()
-        .map_err(|e| std::io::Error::new(e.kind(), format!("Failed to canonicalize path: {e}")))?;
-
-    Ok(canonical)
+    Ok(())
 }
 
-/// Validates an output path and ensures it falls within one of the allowed directories.
+/// Validates an existing input path.
 ///
-/// Calls [`validate_path`] first, then checks that the canonicalized path is a
-/// descendant of (or equal to) one of the `allowed_dirs`.
-pub fn validate_output_path(path: &str, allowed_dirs: &[PathBuf]) -> AppResult<PathBuf> {
-    let canonical = validate_path(path)?;
+/// Input files and directories must exist so symbolic links can be resolved and
+/// callers receive a clear error before attempting a PDF operation.
+pub fn validate_path(path: &str) -> AppResult<PathBuf> {
+    let path = Path::new(path);
+    reject_parent_components(path)?;
 
-    for allowed_dir in allowed_dirs {
-        // Canonicalize the allowed directory so we are comparing like-for-like.
-        let canonical_dir = allowed_dir
-            .canonicalize()
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to canonicalize allowed directory {:?}: {e}", allowed_dir),
-                )
-            })?;
+    path.canonicalize().map_err(|e| {
+        AppError::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to canonicalize existing path: {e}"),
+        ))
+    })
+}
 
-        if canonical.starts_with(&canonical_dir) {
-            return Ok(canonical);
-        }
-    }
+/// Validates a final output file path without requiring the file to exist.
+///
+/// The parent directory must already exist and is canonicalized before the
+/// filename is joined. This supports normal Save As behavior while retaining
+/// traversal protection and rejecting missing output directories.
+pub fn validate_output_path(path: &str) -> AppResult<PathBuf> {
+    let path = Path::new(path);
+    reject_parent_components(path)?;
 
-    Err(AppError::Io(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        format!(
-            "Output path {:?} is outside all allowed directories",
-            canonical
-        ),
-    )))
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Output path must have a parent directory",
+            ))
+        })?;
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Output path must include a file name",
+            ))
+        })?;
+    let canonical_parent = parent.canonicalize().map_err(|e| {
+        AppError::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to canonicalize output parent directory: {e}"),
+        ))
+    })?;
+
+    Ok(canonical_parent.join(file_name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn test_validate_path_rejects_parent_dir() {
         let result = validate_path("/tmp/some/../etc/passwd");
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains(".."),
-            "Error message should mention '..': {err}"
-        );
+        assert!(result.unwrap_err().to_string().contains(".."));
     }
 
     #[test]
     fn test_validate_path_rejects_trailing_parent() {
-        let result = validate_path("/tmp/some/..");
-        assert!(result.is_err());
+        assert!(validate_path("/tmp/some/..").is_err());
     }
 
     #[test]
     fn test_validate_path_canonicalizes_existing() {
-        // Use a path that is guaranteed to exist on any Unix-like system.
-        let result = validate_path("/tmp");
-        assert!(result.is_ok());
-        let canonical = result.unwrap();
+        let canonical = validate_path("/tmp").unwrap();
         assert!(canonical.is_absolute());
-        // Canonicalized /tmp should not contain any "." or ".." components.
         assert!(!canonical.to_string_lossy().contains(".."));
     }
 
     #[test]
-    fn test_validate_output_path_within_allowed() {
-        let tmp = std::env::temp_dir();
-        // Create a file inside temp so canonicalization succeeds.
-        let test_file = tmp.join("pdf_seeker_validation_test.txt");
-        fs::write(&test_file, "test").unwrap();
-
-        let result = validate_output_path(
-            test_file.to_str().unwrap(),
-            &[tmp.clone()],
-        );
-        assert!(result.is_ok());
-
-        // Clean up.
-        let _ = fs::remove_file(&test_file);
+    fn test_validate_path_rejects_missing_input() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(validate_path(dir.path().join("missing.pdf").to_str().unwrap()).is_err());
     }
 
     #[test]
-    fn test_validate_output_path_outside_allowed() {
-        let tmp = std::env::temp_dir();
-        // Create a file inside temp.
-        let test_file = tmp.join("pdf_seeker_validation_test_outside.txt");
-        fs::write(&test_file, "test").unwrap();
+    fn test_validate_output_path_accepts_new_file_in_existing_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = dir.path().join("new-output.pdf");
 
-        // Provide a different allowed directory (the binary's own directory,
-        // which is almost certainly not /tmp).
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("/usr/bin"));
+        let canonical_parent = dir.path().canonicalize().unwrap();
+        let expected = canonical_parent.join("new-output.pdf");
+        let validated = validate_output_path(output.to_str().unwrap()).unwrap();
+        assert_eq!(validated, expected);
+        assert!(!validated.exists());
+    }
 
-        let result = validate_output_path(
-            test_file.to_str().unwrap(),
-            &[exe_dir],
-        );
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("outside all allowed directories"),
-            "Error message should mention allowed directories: {err}"
-        );
+    #[test]
+    fn test_validate_output_path_rejects_missing_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = dir.path().join("missing-parent").join("new-output.pdf");
+        assert!(validate_output_path(output.to_str().unwrap()).is_err());
+    }
 
-        // Clean up.
-        let _ = fs::remove_file(&test_file);
+    #[test]
+    fn test_validate_output_path_rejects_parent_dir() {
+        assert!(validate_output_path("/tmp/some/../new-output.pdf").is_err());
     }
 }

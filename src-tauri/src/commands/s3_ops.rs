@@ -16,13 +16,15 @@ async fn build_client(cfg: &S3Config) -> AppResult<aws_sdk_s3::Client> {
             // Public bucket — build client directly, skip default credential chain entirely
             let mut builder = aws_sdk_s3::config::Builder::new()
                 .behavior_version(aws_config::BehaviorVersion::latest())
-                .region(aws_sdk_s3::config::Region::new(if region.is_empty() { "us-east-1".into() } else { region }))
+                .region(aws_sdk_s3::config::Region::new(if region.is_empty() {
+                    "us-east-1".into()
+                } else {
+                    region
+                }))
                 .force_path_style(force_path_style)
-                .credentials_provider(
-                    aws_sdk_s3::config::SharedCredentialsProvider::new(
-                        aws_sdk_s3::config::Credentials::new("ANONYMOUS", "", None, None, "anon"),
-                    ),
-                );
+                .credentials_provider(aws_sdk_s3::config::SharedCredentialsProvider::new(
+                    aws_sdk_s3::config::Credentials::new("ANONYMOUS", "", None, None, "anon"),
+                ));
 
             if !endpoint.is_empty() {
                 builder = builder.endpoint_url(endpoint);
@@ -41,7 +43,11 @@ async fn build_client(cfg: &S3Config) -> AppResult<aws_sdk_s3::Client> {
             let sdk_config = config_loader.load().await;
 
             let mut builder = aws_sdk_s3::config::Builder::from(&sdk_config)
-                .region(aws_sdk_s3::config::Region::new(if region.is_empty() { "us-east-1".into() } else { region }))
+                .region(aws_sdk_s3::config::Region::new(if region.is_empty() {
+                    "us-east-1".into()
+                } else {
+                    region
+                }))
                 .force_path_style(force_path_style);
 
             if matches!(cfg.auth_mode, crate::config::S3AuthMode::Static) {
@@ -173,18 +179,13 @@ pub async fn s3_list_files(s3_config: S3Config, folder: String) -> AppResult<S3L
                 if key.ends_with('/') && key == full_prefix {
                     continue;
                 }
-                let name = key
-                    .trim_start_matches(&full_prefix)
-                    .to_string();
+                let name = key.trim_start_matches(&full_prefix).to_string();
                 let name = name.trim_end_matches('/').to_string();
                 if name.is_empty() {
                     continue;
                 }
                 let size = obj.size.unwrap_or(0) as u64;
-                let last_modified = obj
-                    .last_modified
-                    .map(|t| t.to_string())
-                    .unwrap_or_default();
+                let last_modified = obj.last_modified.map(|t| t.to_string()).unwrap_or_default();
                 items.push(S3FileItem {
                     key,
                     name,
@@ -270,7 +271,11 @@ pub async fn s3_download_file(
         .await
         .map_err(|e| AppError::S3(e.to_string()))?;
 
-    let data = resp.body.collect().await.map_err(|e| AppError::S3(e.to_string()))?;
+    let data = resp
+        .body
+        .collect()
+        .await
+        .map_err(|e| AppError::S3(e.to_string()))?;
     let bytes = data.to_vec();
 
     // Ensure parent directory exists
@@ -334,10 +339,7 @@ pub async fn s3_list_versions(
         for v in vers {
             let vid = v.version_id.unwrap_or_else(|| "null".to_string());
             let size = v.size.unwrap_or(0) as u64;
-            let last_modified = v
-                .last_modified
-                .map(|t| t.to_string())
-                .unwrap_or_default();
+            let last_modified = v.last_modified.map(|t| t.to_string()).unwrap_or_default();
             let is_latest = v.is_latest.unwrap_or(false);
             versions.push(S3VersionItem {
                 version_id: vid,
