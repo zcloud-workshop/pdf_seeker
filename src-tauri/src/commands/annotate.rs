@@ -443,9 +443,9 @@ pub fn sign_pdf(req: SignPdfRequest) -> AppResult<()> {
             .objects
             .get(page_id)
             .ok_or_else(|| AppError::Pdf(format!("Page object {} not found", page_id.0)))?;
-        let dict = page_obj.as_dict().map_err(|e| {
-            AppError::Pdf(format!("Page {} is not a dictionary: {}", page_id.0, e))
-        })?;
+        let dict = page_obj
+            .as_dict()
+            .map_err(|e| AppError::Pdf(format!("Page {} is not a dictionary: {}", page_id.0, e)))?;
         match dict.get(b"Contents") {
             Ok(c) => {
                 if let Ok(r) = c.as_reference() {
@@ -1058,14 +1058,7 @@ pub fn add_whiteout(req: WhiteoutRequest) -> AppResult<()> {
     let expected_pages = doc.get_pages().len();
     let page_id = get_page_id_by_num(&doc, req.page)?;
 
-    apply_whiteout_to_doc(
-        &mut doc,
-        page_id,
-        req.x,
-        req.y,
-        req.width,
-        req.height,
-    )?;
+    apply_whiteout_to_doc(&mut doc, page_id, req.x, req.y, req.width, req.height)?;
     normalize_page_contents(&mut doc, page_id)?;
 
     let policy = ValidationPolicy {
@@ -1229,4 +1222,3 @@ pub fn add_page_numbers(req: AddPageNumbersRequest) -> AppResult<()> {
     io::write_transactional(&mut doc, &req.output_path, &policy)?;
     Ok(())
 }
-

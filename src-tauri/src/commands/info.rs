@@ -31,15 +31,11 @@ pub struct PdfInfoResult {
 }
 
 fn extract_info_string(d: &Document, key: &[u8]) -> Option<String> {
-    let info_obj = d
-        .trailer
-        .get(b"Info")
-        .ok()
-        .and_then(|obj| match obj {
-            Object::Reference(id) => d.objects.get(id),
-            Object::Dictionary(_) => Some(obj),
-            _ => None,
-        })?;
+    let info_obj = d.trailer.get(b"Info").ok().and_then(|obj| match obj {
+        Object::Reference(id) => d.objects.get(id),
+        Object::Dictionary(_) => Some(obj),
+        _ => None,
+    })?;
 
     let dict = match info_obj {
         Object::Dictionary(ref dict) => dict,
@@ -149,10 +145,22 @@ pub fn get_pdf_info(path: String) -> AppResult<PdfInfoResult> {
                 let box_obj = dict.get(b"MediaBox").ok()?;
                 let arr = box_obj.as_array().ok()?;
                 if arr.len() >= 4 {
-                    let x0 = arr[0].as_float().or_else(|_| arr[0].as_i64().map(|v| v as f32)).ok()?;
-                    let y0 = arr[1].as_float().or_else(|_| arr[1].as_i64().map(|v| v as f32)).ok()?;
-                    let x1 = arr[2].as_float().or_else(|_| arr[2].as_i64().map(|v| v as f32)).ok()?;
-                    let y1 = arr[3].as_float().or_else(|_| arr[3].as_i64().map(|v| v as f32)).ok()?;
+                    let x0 = arr[0]
+                        .as_float()
+                        .or_else(|_| arr[0].as_i64().map(|v| v as f32))
+                        .ok()?;
+                    let y0 = arr[1]
+                        .as_float()
+                        .or_else(|_| arr[1].as_i64().map(|v| v as f32))
+                        .ok()?;
+                    let x1 = arr[2]
+                        .as_float()
+                        .or_else(|_| arr[2].as_i64().map(|v| v as f32))
+                        .ok()?;
+                    let y1 = arr[3]
+                        .as_float()
+                        .or_else(|_| arr[3].as_i64().map(|v| v as f32))
+                        .ok()?;
                     let w = (x1 - x0).abs();
                     let h = (y1 - y0).abs();
                     let name = if (w - 595.0).abs() < 10.0 && (h - 842.0).abs() < 10.0 {
@@ -164,7 +172,13 @@ pub fn get_pdf_info(path: String) -> AppResult<PdfInfoResult> {
                     } else {
                         "Custom"
                     };
-                    Some(format!("{name} ({:.0} × {:.0} pt / {:.1} × {:.1} mm)", w, h, w * 0.352778, h * 0.352778))
+                    Some(format!(
+                        "{name} ({:.0} × {:.0} pt / {:.1} × {:.1} mm)",
+                        w,
+                        h,
+                        w * 0.352778,
+                        h * 0.352778
+                    ))
                 } else {
                     None
                 }
@@ -334,6 +348,3 @@ pub async fn download_pdf_from_url(url: String) -> AppResult<RemotePdfInfo> {
         file_size: bytes.len() as u64,
     })
 }
-
-
-

@@ -122,4 +122,3 @@ pub fn extract_text(path: String) -> AppResult<TextExtractResult> {
         pages: pages.len(),
     })
 }
-

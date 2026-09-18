@@ -14,7 +14,10 @@ fn is_cjk(c: char) -> bool {
 }
 
 fn is_sentence_terminator(c: char) -> bool {
-    matches!(c, '.' | '!' | '?' | ';' | ':' | '。' | '！' | '？' | '；' | '：')
+    matches!(
+        c,
+        '.' | '!' | '?' | ';' | ':' | '。' | '！' | '？' | '；' | '：'
+    )
 }
 
 /// Strip trailing hyphenation from words broken across lines (e.g. "inter-\nnational" -> "international").
@@ -127,10 +130,32 @@ pub fn is_math_expression(text: &str) -> bool {
         return true;
     }
     const MATH_KEYWORDS: &[&str] = &[
-        "\\frac", "\\sum", "\\int", "\\sqrt", "\\prod", "\\lim", "\\alpha", "\\beta",
-        "\\gamma", "\\theta", "\\lambda", "\\sigma", "\\infty", "\\approx", "\\neq",
-        "\\le", "\\ge", "\\pm", "\\times", "\\div", "\\partial", "\\nabla", "\\in",
-        "\\subset", "\\cup", "\\cap",
+        "\\frac",
+        "\\sum",
+        "\\int",
+        "\\sqrt",
+        "\\prod",
+        "\\lim",
+        "\\alpha",
+        "\\beta",
+        "\\gamma",
+        "\\theta",
+        "\\lambda",
+        "\\sigma",
+        "\\infty",
+        "\\approx",
+        "\\neq",
+        "\\le",
+        "\\ge",
+        "\\pm",
+        "\\times",
+        "\\div",
+        "\\partial",
+        "\\nabla",
+        "\\in",
+        "\\subset",
+        "\\cup",
+        "\\cap",
     ];
     for kw in MATH_KEYWORDS {
         if text.contains(kw) {
@@ -138,11 +163,14 @@ pub fn is_math_expression(text: &str) -> bool {
         }
     }
     // Greek and math operator symbols
-    let has_math_char = text.chars().any(|c| matches!(c,
-        '±' | '×' | '÷' | '≠' | '≤' | '≥' | '≈' | '∑' | '∏' | '∫' | '∂' | '∇' | '∞' |
-        'α'..='ω' | 'Α'..='Ω'
-    ));
-    has_math_char && (text.contains('^') || text.contains('_') || text.contains('=') || text.contains('/'))
+    let has_math_char = text.chars().any(|c| {
+        matches!(c,
+            '±' | '×' | '÷' | '≠' | '≤' | '≥' | '≈' | '∑' | '∏' | '∫' | '∂' | '∇' | '∞' |
+            'α'..='ω' | 'Α'..='Ω'
+        )
+    });
+    has_math_char
+        && (text.contains('^') || text.contains('_') || text.contains('=') || text.contains('/'))
 }
 
 /// Comprehensive OCR text cleaning pipeline with math formula preservation.
@@ -190,10 +218,18 @@ fn get_rect_bounds(points: &[[f32; 2]]) -> (f32, f32, f32, f32) {
     let mut min_y = points[0][1];
     let mut max_y = points[0][1];
     for pt in points {
-        if pt[0] < min_x { min_x = pt[0]; }
-        if pt[0] > max_x { max_x = pt[0]; }
-        if pt[1] < min_y { min_y = pt[1]; }
-        if pt[1] > max_y { max_y = pt[1]; }
+        if pt[0] < min_x {
+            min_x = pt[0];
+        }
+        if pt[0] > max_x {
+            max_x = pt[0];
+        }
+        if pt[1] < min_y {
+            min_y = pt[1];
+        }
+        if pt[1] > max_y {
+            max_y = pt[1];
+        }
     }
     (min_x, min_y, max_x, max_y)
 }
@@ -213,9 +249,14 @@ pub fn cluster_ocr_boxes(boxes: &[BoundingBox]) -> Vec<ClusteredParagraph> {
         .collect();
 
     sorted.sort_by(|a, b| {
-        let y_diff = a.2 .1.partial_cmp(&b.2 .1).unwrap_or(std::cmp::Ordering::Equal);
+        let y_diff =
+            a.2 .1
+                .partial_cmp(&b.2 .1)
+                .unwrap_or(std::cmp::Ordering::Equal);
         if y_diff == std::cmp::Ordering::Equal {
-            a.2 .0.partial_cmp(&b.2 .0).unwrap_or(std::cmp::Ordering::Equal)
+            a.2 .0
+                .partial_cmp(&b.2 .0)
+                .unwrap_or(std::cmp::Ordering::Equal)
         } else {
             y_diff
         }
@@ -237,8 +278,10 @@ pub fn cluster_ocr_boxes(boxes: &[BoundingBox]) -> Vec<ClusteredParagraph> {
 
                 // Vertical gap within 1.6x line height and horizontal overlap or left margin alignment
                 let x_margin_diff = (min_x - last_bounds.0).abs();
-                let is_vertically_adjacent = vertical_gap >= -4.0 && vertical_gap <= last_height * 1.6;
-                let is_horizontally_aligned = x_margin_diff <= last_height * 3.0 || min_x <= last_bounds.2;
+                let is_vertically_adjacent =
+                    vertical_gap >= -4.0 && vertical_gap <= last_height * 1.6;
+                let is_horizontally_aligned =
+                    x_margin_diff <= last_height * 3.0 || min_x <= last_bounds.2;
 
                 if is_vertically_adjacent && is_horizontally_aligned {
                     last_cluster.push(bbox);
@@ -326,15 +369,17 @@ pub fn detect_tables(boxes: &[BoundingBox]) -> Vec<DetectedTable> {
 
     // Sort each row left-to-right
     for row in &mut rows {
-        row.sort_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+        row.sort_by(|a, b| {
+            a.1 .0
+                .partial_cmp(&b.1 .0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     // Find consecutive rows that have multiple columns (table candidate)
     let mut table_rows: Vec<Vec<String>> = Vec::new();
-    let multi_col_rows: Vec<&Vec<(&BoundingBox, (f32, f32, f32, f32))>> = rows
-        .iter()
-        .filter(|r| r.len() >= 2)
-        .collect();
+    let multi_col_rows: Vec<&Vec<(&BoundingBox, (f32, f32, f32, f32))>> =
+        rows.iter().filter(|r| r.len() >= 2).collect();
 
     if multi_col_rows.len() < 2 {
         return Vec::new();
@@ -407,7 +452,10 @@ mod tests {
     #[test]
     fn test_clean_hyphenation() {
         let input = "The inter-\n   national organization was founded.";
-        assert_eq!(clean_hyphenation(input), "The international organization was founded.");
+        assert_eq!(
+            clean_hyphenation(input),
+            "The international organization was founded."
+        );
 
         let compound = "state-of-the-art technology";
         assert_eq!(clean_hyphenation(compound), "state-of-the-art technology");
@@ -417,7 +465,8 @@ mod tests {
     fn test_merge_paragraphs_latin() {
         let input = "This is a single sentence that was split\nacross two lines by the scanner.\nAnd this is a new sentence.";
         let res = merge_paragraphs(input);
-        assert!(res.contains("This is a single sentence that was split across two lines by the scanner."));
+        assert!(res
+            .contains("This is a single sentence that was split across two lines by the scanner."));
         assert!(res.contains("And this is a new sentence."));
     }
 
@@ -457,15 +506,33 @@ mod tests {
         let clusters = cluster_ocr_boxes(&[b1, b2]);
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].line_count, 2);
-        assert!(clusters[0].text.contains("This is the first line of a paragraph that continues here."));
+        assert!(clusters[0]
+            .text
+            .contains("This is the first line of a paragraph that continues here."));
     }
 
     #[test]
     fn test_detect_tables() {
-        let c11 = BoundingBox { points: vec![[10.0, 10.0], [50.0, 10.0], [50.0, 25.0], [10.0, 25.0]], text: "Name".to_string(), confidence: 0.99 };
-        let c12 = BoundingBox { points: vec![[60.0, 10.0], [100.0, 10.0], [100.0, 25.0], [60.0, 25.0]], text: "Age".to_string(), confidence: 0.99 };
-        let c21 = BoundingBox { points: vec![[10.0, 30.0], [50.0, 30.0], [50.0, 45.0], [10.0, 45.0]], text: "Alice".to_string(), confidence: 0.98 };
-        let c22 = BoundingBox { points: vec![[60.0, 30.0], [100.0, 30.0], [100.0, 45.0], [60.0, 45.0]], text: "30".to_string(), confidence: 0.98 };
+        let c11 = BoundingBox {
+            points: vec![[10.0, 10.0], [50.0, 10.0], [50.0, 25.0], [10.0, 25.0]],
+            text: "Name".to_string(),
+            confidence: 0.99,
+        };
+        let c12 = BoundingBox {
+            points: vec![[60.0, 10.0], [100.0, 10.0], [100.0, 25.0], [60.0, 25.0]],
+            text: "Age".to_string(),
+            confidence: 0.99,
+        };
+        let c21 = BoundingBox {
+            points: vec![[10.0, 30.0], [50.0, 30.0], [50.0, 45.0], [10.0, 45.0]],
+            text: "Alice".to_string(),
+            confidence: 0.98,
+        };
+        let c22 = BoundingBox {
+            points: vec![[60.0, 30.0], [100.0, 30.0], [100.0, 45.0], [60.0, 45.0]],
+            text: "30".to_string(),
+            confidence: 0.98,
+        };
 
         let tables = detect_tables(&[c11, c12, c21, c22]);
         assert_eq!(tables.len(), 1);
@@ -475,4 +542,3 @@ mod tests {
         assert!(tables[0].csv.contains("Alice,30"));
     }
 }
-

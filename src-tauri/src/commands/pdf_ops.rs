@@ -23,11 +23,13 @@ mod tests {
         let mut doc = Document::with_version("1.4");
 
         let catalog_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::new()));
-        let pages_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"Type".to_vec(), lopdf::Object::Name(b"Pages".to_vec())),
-            (b"Count".to_vec(), lopdf::Object::Integer(num_pages as i64)),
-            (b"Kids".to_vec(), lopdf::Object::Array(vec![])),
-        ])));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(
+            vec![
+                (b"Type".to_vec(), lopdf::Object::Name(b"Pages".to_vec())),
+                (b"Count".to_vec(), lopdf::Object::Integer(num_pages as i64)),
+                (b"Kids".to_vec(), lopdf::Object::Array(vec![])),
+            ],
+        )));
 
         if let Some(cat) = doc.objects.get_mut(&catalog_id) {
             if let Ok(d) = cat.as_dict_mut() {
@@ -38,19 +40,21 @@ mod tests {
 
         let mut kids = Vec::new();
         for _ in 0..num_pages {
-            let page_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                (b"Type".to_vec(), lopdf::Object::Name(b"Page".to_vec())),
-                (b"Parent".to_vec(), lopdf::Object::Reference(pages_id)),
-                (
-                    b"MediaBox".to_vec(),
-                    lopdf::Object::Array(vec![
-                        lopdf::Object::Integer(0),
-                        lopdf::Object::Integer(0),
-                        lopdf::Object::Integer(612),
-                        lopdf::Object::Integer(792),
-                    ]),
-                ),
-            ])));
+            let page_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(
+                vec![
+                    (b"Type".to_vec(), lopdf::Object::Name(b"Page".to_vec())),
+                    (b"Parent".to_vec(), lopdf::Object::Reference(pages_id)),
+                    (
+                        b"MediaBox".to_vec(),
+                        lopdf::Object::Array(vec![
+                            lopdf::Object::Integer(0),
+                            lopdf::Object::Integer(0),
+                            lopdf::Object::Integer(612),
+                            lopdf::Object::Integer(792),
+                        ]),
+                    ),
+                ],
+            )));
             kids.push(lopdf::Object::Reference(page_id));
         }
 
@@ -60,7 +64,8 @@ mod tests {
             }
         }
 
-        doc.trailer.set(b"Root", lopdf::Object::Reference(catalog_id));
+        doc.trailer
+            .set(b"Root", lopdf::Object::Reference(catalog_id));
         doc.save(&path).unwrap();
         path.to_string_lossy().to_string()
     }
@@ -666,7 +671,10 @@ mod tests {
             err_msg.contains("password-protected") || err_msg.contains("encrypted"),
             "Error message must clearly state password protection: {err_msg}"
         );
-        assert!(!std::path::Path::new(&output).exists(), "Output file must not be generated");
+        assert!(
+            !std::path::Path::new(&output).exists(),
+            "Output file must not be generated"
+        );
     }
 
     #[test]
@@ -685,7 +693,10 @@ mod tests {
 
         assert!(result.is_err());
         let entries: Vec<_> = std::fs::read_dir(&out_dir).unwrap().collect();
-        assert!(entries.is_empty(), "No split output should be left on corruption");
+        assert!(
+            entries.is_empty(),
+            "No split output should be left on corruption"
+        );
     }
 
     #[test]
@@ -697,7 +708,10 @@ mod tests {
 
         let result = merge_pdfs(vec![input1, input2], output.clone());
         assert!(result.is_err());
-        assert!(!std::path::Path::new(&output).exists(), "Merge output must not exist on failure");
+        assert!(
+            !std::path::Path::new(&output).exists(),
+            "Merge output must not exist on failure"
+        );
     }
 
     #[test]
@@ -729,22 +743,34 @@ mod tests {
         let input_path = dir.path().join("metadata_in.pdf");
         let mut doc = Document::with_version("1.4");
         let cat_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::new()));
-        let pages_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"Type".to_vec(), lopdf::Object::Name(b"Pages".to_vec())),
-            (b"Count".to_vec(), lopdf::Object::Integer(1)),
-            (b"Kids".to_vec(), lopdf::Object::Array(vec![])),
-        ])));
-        let page_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"Type".to_vec(), lopdf::Object::Name(b"Page".to_vec())),
-            (b"Parent".to_vec(), lopdf::Object::Reference(pages_id)),
-            (b"MediaBox".to_vec(), lopdf::Object::Array(vec![
-                lopdf::Object::Integer(0), lopdf::Object::Integer(0),
-                lopdf::Object::Integer(612), lopdf::Object::Integer(792),
-            ])),
-        ])));
+        let pages_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(
+            vec![
+                (b"Type".to_vec(), lopdf::Object::Name(b"Pages".to_vec())),
+                (b"Count".to_vec(), lopdf::Object::Integer(1)),
+                (b"Kids".to_vec(), lopdf::Object::Array(vec![])),
+            ],
+        )));
+        let page_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(
+            vec![
+                (b"Type".to_vec(), lopdf::Object::Name(b"Page".to_vec())),
+                (b"Parent".to_vec(), lopdf::Object::Reference(pages_id)),
+                (
+                    b"MediaBox".to_vec(),
+                    lopdf::Object::Array(vec![
+                        lopdf::Object::Integer(0),
+                        lopdf::Object::Integer(0),
+                        lopdf::Object::Integer(612),
+                        lopdf::Object::Integer(792),
+                    ]),
+                ),
+            ],
+        )));
         if let Some(pages_obj) = doc.objects.get_mut(&pages_id) {
             if let Ok(d) = pages_obj.as_dict_mut() {
-                d.set("Kids", lopdf::Object::Array(vec![lopdf::Object::Reference(page_id)]));
+                d.set(
+                    "Kids",
+                    lopdf::Object::Array(vec![lopdf::Object::Reference(page_id)]),
+                );
             }
         }
         if let Some(cat) = doc.objects.get_mut(&cat_id) {
@@ -753,10 +779,18 @@ mod tests {
                 d.set("Pages", lopdf::Object::Reference(pages_id));
             }
         }
-        let info_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"Title".to_vec(), lopdf::Object::String(b"Secret Title".to_vec(), lopdf::StringFormat::Literal)),
-            (b"Author".to_vec(), lopdf::Object::String(b"Secret Author".to_vec(), lopdf::StringFormat::Literal)),
-        ])));
+        let info_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::from_iter(
+            vec![
+                (
+                    b"Title".to_vec(),
+                    lopdf::Object::String(b"Secret Title".to_vec(), lopdf::StringFormat::Literal),
+                ),
+                (
+                    b"Author".to_vec(),
+                    lopdf::Object::String(b"Secret Author".to_vec(), lopdf::StringFormat::Literal),
+                ),
+            ],
+        )));
         doc.trailer.set(b"Root", lopdf::Object::Reference(cat_id));
         doc.trailer.set(b"Info", lopdf::Object::Reference(info_id));
         doc.save(&input_path).unwrap();
@@ -767,7 +801,10 @@ mod tests {
 
         let clean_doc = Document::load(&output).expect("load sanitized pdf");
         assert_eq!(clean_doc.get_pages().len(), 1);
-        assert!(clean_doc.trailer.get(b"Info").is_err(), "Info dictionary must be removed");
+        assert!(
+            clean_doc.trailer.get(b"Info").is_err(),
+            "Info dictionary must be removed"
+        );
     }
 
     #[test]
@@ -793,7 +830,10 @@ mod tests {
             .unwrap()
             .as_i64()
             .unwrap();
-        assert_eq!(rotate, 270, "Negative 90 deg rotation must normalize to 270");
+        assert_eq!(
+            rotate, 270,
+            "Negative 90 deg rotation must normalize to 270"
+        );
     }
 
     #[test]
@@ -810,7 +850,11 @@ mod tests {
         .unwrap();
 
         let doc = Document::load(&output).unwrap();
-        assert_eq!(doc.get_pages().len(), 2, "3-page doc after deleting page 1 (with duplicate in request) must have 2 pages");
+        assert_eq!(
+            doc.get_pages().len(),
+            2,
+            "3-page doc after deleting page 1 (with duplicate in request) must have 2 pages"
+        );
     }
 
     #[test]
@@ -827,13 +871,21 @@ mod tests {
         .unwrap();
 
         let doc = Document::load(&output).unwrap();
-        assert_eq!(doc.get_pages().len(), 1, "Extracting page 2 with duplicates must yield 1 page");
+        assert_eq!(
+            doc.get_pages().len(),
+            1,
+            "Extracting page 2 with duplicates must yield 1 page"
+        );
     }
 
     #[test]
     fn test_single_annotation_contents_normalization() {
         let dir = TempDir::new().unwrap();
-        let input = write_fixture(dir.path(), "rotated_contents.pdf", ROTATED_CONTENTS_ARRAY_FIXTURE);
+        let input = write_fixture(
+            dir.path(),
+            "rotated_contents.pdf",
+            ROTATED_CONTENTS_ARRAY_FIXTURE,
+        );
         let output = prepare_output(dir.path(), "annotated_normalized.pdf");
 
         add_text_to_page(AddTextRequest {
@@ -863,10 +915,17 @@ mod tests {
         };
 
         for item in arr {
-            let ref_id: ObjectId = item.as_reference().expect("Each item in Contents must be a Reference");
-            let target_obj = doc.get_object(ref_id).expect("Referenced object must exist");
-            assert!(matches!(target_obj, Object::Stream(_)), "Each Contents entry must reference a Stream, not an Array: {:?}", target_obj);
+            let ref_id: ObjectId = item
+                .as_reference()
+                .expect("Each item in Contents must be a Reference");
+            let target_obj = doc
+                .get_object(ref_id)
+                .expect("Referenced object must exist");
+            assert!(
+                matches!(target_obj, Object::Stream(_)),
+                "Each Contents entry must reference a Stream, not an Array: {:?}",
+                target_obj
+            );
         }
     }
 }
-

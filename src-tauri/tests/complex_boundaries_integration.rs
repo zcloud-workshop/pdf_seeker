@@ -1,8 +1,3 @@
-use std::fs;
-use std::path::Path;
-use std::sync::Arc;
-use std::thread;
-use tempfile::TempDir;
 use pdf_seeker_lib::commands::annotate::{
     add_page_numbers, add_text_watermark, AddPageNumbersRequest, WatermarkRequest,
 };
@@ -14,6 +9,11 @@ use pdf_seeker_lib::commands::organize::{
     RotatePdfRequest, SplitPdfRequest,
 };
 use pdf_seeker_lib::pdf::io::load_doc;
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use std::thread;
+use tempfile::TempDir;
 
 const SINGLE_PAGE_FIXTURE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -172,7 +172,10 @@ fn test_extreme_and_out_of_bounds_pages() {
         output_path: out2.clone(),
         pages_to_delete: vec![99],
     });
-    assert!(res.is_err(), "Deleting out-of-bounds page should return error");
+    assert!(
+        res.is_err(),
+        "Deleting out-of-bounds page should return error"
+    );
     assert!(!Path::new(&out2).exists());
 
     // 3. Delete with empty page list
@@ -250,7 +253,11 @@ fn test_adversarial_and_malformed_input_robustness() {
 
     // Merge with corrupted file must fail cleanly
     let out_merge = prepare_output(temp.path(), "corrupt_merge.pdf");
-    assert!(merge_pdfs(vec![corrupt_path.clone(), valid_path.clone()], out_merge.clone()).is_err());
+    assert!(merge_pdfs(
+        vec![corrupt_path.clone(), valid_path.clone()],
+        out_merge.clone()
+    )
+    .is_err());
     assert!(!Path::new(&out_merge).exists());
 
     // Rotate corrupted file must fail
@@ -327,7 +334,10 @@ fn test_special_characters_and_cjk_injection() {
         angle: 45.0,
         color: "#FF0000".to_string(),
     });
-    assert!(res.is_ok(), "Watermark with escaped characters should succeed");
+    assert!(
+        res.is_ok(),
+        "Watermark with escaped characters should succeed"
+    );
     let doc_esc = load_doc(&out_escape).unwrap();
     assert_eq!(doc_esc.get_pages().len(), 2);
 

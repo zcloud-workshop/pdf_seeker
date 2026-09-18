@@ -126,13 +126,8 @@ pub fn write_transactional(
     let mut guard = TempFileGuard::new(temporary.clone());
 
     // Step 1: Save to temporary file
-    doc.save(&temporary).map_err(|e| {
-        AppError::Pdf(format!(
-            "Save temporary '{}': {}",
-            temporary.display(),
-            e
-        ))
-    })?;
+    doc.save(&temporary)
+        .map_err(|e| AppError::Pdf(format!("Save temporary '{}': {}", temporary.display(), e)))?;
 
     // Step 2: Reopen and validate
     let reopened = Document::load(&temporary).map_err(|e| {
@@ -176,9 +171,7 @@ pub fn write_transactional(
     // Success — defuse the cleanup guard
     guard.defuse();
 
-    let output_size = std::fs::metadata(output)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let output_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
 
     Ok(WriteResult {
         output_size,
@@ -209,9 +202,12 @@ fn count_page_tree_leaves(
         .get_object(node_id)
         .map_err(|e| AppError::Pdf(format!("Page tree node {:?} not found: {}", node_id, e)))?;
 
-    let dict = obj
-        .as_dict()
-        .map_err(|e| AppError::Pdf(format!("Page tree node {:?} is not a dictionary: {}", node_id, e)))?;
+    let dict = obj.as_dict().map_err(|e| {
+        AppError::Pdf(format!(
+            "Page tree node {:?} is not a dictionary: {}",
+            node_id, e
+        ))
+    })?;
 
     let node_type = dict.get(b"Type").and_then(|o| o.as_name()).unwrap_or(b"");
 
@@ -420,7 +416,10 @@ mod tests {
         };
         let result = write_transactional(&mut doc, output.to_str().unwrap(), &policy);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Page count mismatch"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Page count mismatch"));
         // Temp file should have been cleaned up
         assert!(!output.exists());
     }
@@ -455,11 +454,7 @@ mod tests {
         let temp_files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains("pdf-seeker")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains("pdf-seeker"))
             .collect();
         assert!(temp_files.is_empty(), "Temp files should be cleaned up");
     }
@@ -519,19 +514,20 @@ mod tests {
 
             let mut page_refs = Vec::new();
             for _ in 0..8 {
-                let page_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                    (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
-                    (b"Parent".to_vec(), Object::Reference(inter_id)),
-                    (
-                        b"MediaBox".to_vec(),
-                        Object::Array(vec![
-                            Object::Integer(0),
-                            Object::Integer(0),
-                            Object::Integer(612),
-                            Object::Integer(792),
-                        ]),
-                    ),
-                ])));
+                let page_id =
+                    doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+                        (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
+                        (b"Parent".to_vec(), Object::Reference(inter_id)),
+                        (
+                            b"MediaBox".to_vec(),
+                            Object::Array(vec![
+                                Object::Integer(0),
+                                Object::Integer(0),
+                                Object::Integer(612),
+                                Object::Integer(792),
+                            ]),
+                        ),
+                    ])));
                 page_refs.push(Object::Reference(page_id));
             }
 
@@ -552,7 +548,10 @@ mod tests {
 
         // Validate directly:
         let validation_result = validate_page_tree(&doc);
-        assert!(validation_result.is_ok(), "Hierarchical page tree should be valid");
+        assert!(
+            validation_result.is_ok(),
+            "Hierarchical page tree should be valid"
+        );
 
         // Transactional write with check_page_tree = true
         let dir = TempDir::new().unwrap();
@@ -594,4 +593,3 @@ mod tests {
             .contains("Page tree inconsistent"));
     }
 }
-

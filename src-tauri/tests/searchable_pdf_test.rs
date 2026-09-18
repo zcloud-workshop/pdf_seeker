@@ -26,29 +26,18 @@ fn prepare_output(dir: &Path, name: &str) -> String {
 
 #[test]
 fn test_create_searchable_pdf_injects_invisible_text() {
-
     let temp = TempDir::new().unwrap();
     let input = write_fixture(temp.path(), "input.pdf", SINGLE_PAGE_FIXTURE);
     let output = prepare_output(temp.path(), "searchable.pdf");
 
     let ocr_box1 = OcrTextBox {
-        points: vec![
-            [50.0, 100.0],
-            [250.0, 100.0],
-            [250.0, 130.0],
-            [50.0, 130.0],
-        ],
+        points: vec![[50.0, 100.0], [250.0, 100.0], [250.0, 130.0], [50.0, 130.0]],
         text: "Searchable OCR Header".to_string(),
         confidence: 0.98,
     };
 
     let ocr_box2 = OcrTextBox {
-        points: vec![
-            [50.0, 150.0],
-            [300.0, 150.0],
-            [300.0, 180.0],
-            [50.0, 180.0],
-        ],
+        points: vec![[50.0, 150.0], [300.0, 150.0], [300.0, 180.0], [50.0, 180.0]],
         text: "机密扫描文档 2026".to_string(),
         confidence: 0.95,
     };
@@ -104,7 +93,10 @@ fn test_searchable_pdf_in_place_overwrite_rejected() {
     };
 
     let res = create_searchable_pdf(req);
-    assert!(res.is_err(), "Identical input and output path must be rejected");
+    assert!(
+        res.is_err(),
+        "Identical input and output path must be rejected"
+    );
 }
 
 #[test]

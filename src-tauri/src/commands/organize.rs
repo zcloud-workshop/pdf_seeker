@@ -281,7 +281,9 @@ pub fn delete_pages(req: DeletePagesRequest) -> AppResult<()> {
         }
     }
     if unique_pages.len() >= total {
-        return Err(AppError::Pdf("Cannot delete all pages of a document".into()));
+        return Err(AppError::Pdf(
+            "Cannot delete all pages of a document".into(),
+        ));
     }
     let expected = total.saturating_sub(unique_pages.len());
 
@@ -378,9 +380,7 @@ pub fn extract_pages_pdf(req: ExtractPagesRequest) -> AppResult<()> {
         }
     }
 
-    let pages_to_delete: Vec<u32> = (1..=total)
-        .filter(|p| !unique_pages.contains(p))
-        .collect();
+    let pages_to_delete: Vec<u32> = (1..=total).filter(|p| !unique_pages.contains(p)).collect();
     if !pages_to_delete.is_empty() {
         doc.delete_pages(&pages_to_delete);
     }
@@ -524,4 +524,3 @@ pub fn insert_pages(req: InsertPagesRequest) -> AppResult<()> {
     io::write_transactional(&mut target, &req.output_path, &policy)?;
     Ok(())
 }
-

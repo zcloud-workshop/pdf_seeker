@@ -1043,4 +1043,3 @@ pub fn ocr_detect_tables(
         .collect();
     crate::pdf::text_postprocess::detect_tables(&bboxes)
 }
-

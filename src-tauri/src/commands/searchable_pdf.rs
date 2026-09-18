@@ -2,7 +2,9 @@ use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::ocr::OcrTextBox;
-use crate::commands::pdf_content::{append_content_stream, ensure_resource_entry, get_or_create_resources};
+use crate::commands::pdf_content::{
+    append_content_stream, ensure_resource_entry, get_or_create_resources,
+};
 use crate::commands::validation::{validate_output_path, validate_path};
 use crate::error::{AppError, AppResult};
 use crate::pdf::io::{self, ensure_distinct_output, ValidationPolicy};
@@ -44,7 +46,6 @@ fn text_to_utf16be_hex(text: &str) -> String {
     hex.push('>');
     hex
 }
-
 
 fn extract_num(obj: &Object, default: f64) -> f64 {
     match obj {
@@ -134,7 +135,13 @@ end\n";
 
         // Ensure page resources has font reference
         let (needs_res_update, res_id) = get_or_create_resources(&mut doc, &page_id)?;
-        ensure_resource_entry(&mut doc, res_id, "Font", b"F_OCR", Object::Reference(font_id))?;
+        ensure_resource_entry(
+            &mut doc,
+            res_id,
+            "Font",
+            b"F_OCR",
+            Object::Reference(font_id),
+        )?;
         if needs_res_update {
             if let Ok(p_obj) = doc.get_object_mut(page_id) {
                 if let Object::Dictionary(ref mut p_dict) = p_obj {
@@ -180,7 +187,8 @@ end\n";
         stream_data.push_str("Q\n");
 
         if page_box_count > 0 {
-            let content_obj_id = doc.add_object(Stream::new(dictionary! {}, stream_data.into_bytes()));
+            let content_obj_id =
+                doc.add_object(Stream::new(dictionary! {}, stream_data.into_bytes()));
             append_content_stream(&mut doc, &page_id, content_obj_id)?;
             total_boxes_injected += page_box_count;
             total_pages_processed += 1;
