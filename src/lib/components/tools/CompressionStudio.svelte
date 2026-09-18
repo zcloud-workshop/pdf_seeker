@@ -34,6 +34,7 @@
     $currentFileName || ($currentFilePath ? $currentFilePath.replace(/\\/g, "/").split("/").pop() || "document.pdf" : "")
   );
   let fileSizeBytes = $state<number>(0);
+  let imageCount = $state<number | null>(null);
   let selectedPreset = $state<CompressionPresetInfo["id"]>("balanced");
 
   let isCompressing = $state(false);
@@ -49,13 +50,14 @@
   let currentPreset = $derived(COMPRESSION_PRESETS[selectedPreset]);
   let estimated = $derived(
     fileSizeBytes > 0
-      ? estimateSavings(fileSizeBytes, selectedPreset)
+      ? estimateSavings(fileSizeBytes, selectedPreset, imageCount ?? undefined)
       : {
           minSaving: 0,
           maxSaving: 0,
           minFinal: 0,
           maxFinal: 0,
           ratioRange: `${currentPreset.estimatedSavingMin}% ~ ${currentPreset.estimatedSavingMax}%`,
+          isVectorTextOnly: false,
         }
   );
 
@@ -63,8 +65,10 @@
     try {
       const info = await invoke<any>("get_pdf_info", { path });
       fileSizeBytes = info.fileSize ?? info.file_size ?? 0;
+      imageCount = info.imageCount ?? info.image_count ?? 0;
     } catch (_) {
       fileSizeBytes = 0;
+      imageCount = null;
     }
   }
 
@@ -132,7 +136,8 @@
         selectedPreset,
         (percent) => {
           compressionProgress = percent;
-        }
+        },
+        imageCount ?? undefined
       );
 
       result = res;
@@ -250,6 +255,20 @@
               {formatBytes(estimated.minFinal)} ~ {formatBytes(estimated.maxFinal)}
             </div>
           </div>
+        </div>
+
+        {#if estimated.isVectorTextOnly}
+          <div class="flex items-start gap-2 p-2.5 rounded-lg bg-blue-500/10 border border-blue-500/20 text-xs text-blue-700 dark:text-blue-300">
+            <Sparkles size={14} class="shrink-0 mt-0.5 text-blue-500" />
+            <div>
+              <span class="font-semibold">原生矢量文字排版：</span>
+              <span>检测到当前文档无位图图片，内容已高度流压缩。系统将进行无损结构精简，保护字型矢量高清度，避免粗暴图片化导致字迹模糊与体积反弹。</span>
+            </div>
+          </div>
+        {/if}
+
+        <div class="text-[10px] text-muted-foreground/70 px-0.5">
+          * 容量换算标准：软件内部按 1024 进制 (KiB)，操作系统访达通常按 1000 进制 (KB) 显示
         </div>
 
         <div class="flex items-center justify-between pt-1">

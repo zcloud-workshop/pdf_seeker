@@ -28,6 +28,7 @@ pub struct PdfInfoResult {
     pub mod_date: Option<String>,
     pub pdf_version: Option<String>,
     pub page_size: Option<String>,
+    pub image_count: u32,
 }
 
 fn extract_info_string(d: &Document, key: &[u8]) -> Option<String> {
@@ -184,6 +185,19 @@ pub fn get_pdf_info(path: String) -> AppResult<PdfInfoResult> {
                 }
             });
 
+            let image_count = d
+                .objects
+                .values()
+                .filter(|obj| {
+                    if let Ok(dict) = obj.as_dict() {
+                        if let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name()) {
+                            return subtype == b"Image";
+                        }
+                    }
+                    false
+                })
+                .count() as u32;
+
             Ok(PdfInfoResult {
                 is_encrypted,
                 pages,
@@ -198,6 +212,7 @@ pub fn get_pdf_info(path: String) -> AppResult<PdfInfoResult> {
                 mod_date,
                 pdf_version,
                 page_size,
+                image_count,
             })
         }
         Err(e) => {
@@ -217,6 +232,7 @@ pub fn get_pdf_info(path: String) -> AppResult<PdfInfoResult> {
                 mod_date: None,
                 pdf_version: None,
                 page_size: None,
+                image_count: 0,
             })
         }
     }

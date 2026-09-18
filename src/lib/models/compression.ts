@@ -76,10 +76,41 @@ export const COMPRESSION_PRESETS: Record<CompressionPresetInfo["id"], Compressio
   },
 };
 
+export interface EstimatedSavings {
+  minSaved: number;
+  maxSaved: number;
+  minFinal: number;
+  maxFinal: number;
+  ratioRange: string;
+  isVectorTextOnly?: boolean;
+}
+
 /**
- * Calculate expected saving range in bytes
+ * Calculate expected saving range in bytes.
+ * If imageCount is explicitly 0, applies realistic vector/text structural optimization estimates.
  */
-export function estimateSavings(originalBytes: number, presetId: CompressionPresetInfo["id"]) {
+export function estimateSavings(
+  originalBytes: number,
+  presetId: CompressionPresetInfo["id"],
+  imageCount?: number
+): EstimatedSavings {
+  if (imageCount === 0) {
+    // Pure vector text document: already zlib-compressed, only structural/dead-object optimization applies
+    const minSaved = Math.max(1, Math.round((originalBytes * 1) / 100));
+    const maxSaved = Math.max(minSaved, Math.round((originalBytes * 4) / 100));
+    const minFinal = Math.max(1, originalBytes - maxSaved);
+    const maxFinal = Math.max(1, originalBytes - minSaved);
+
+    return {
+      minSaved,
+      maxSaved,
+      minFinal,
+      maxFinal,
+      ratioRange: "1% ~ 4% (原生矢量精简)",
+      isVectorTextOnly: true,
+    };
+  }
+
   const preset = COMPRESSION_PRESETS[presetId] || COMPRESSION_PRESETS.balanced;
   const minSaved = Math.round((originalBytes * preset.estimatedSavingMin) / 100);
   const maxSaved = Math.round((originalBytes * preset.estimatedSavingMax) / 100);
@@ -92,6 +123,7 @@ export function estimateSavings(originalBytes: number, presetId: CompressionPres
     minFinal,
     maxFinal,
     ratioRange: `${preset.estimatedSavingMin}% ~ ${preset.estimatedSavingMax}%`,
+    isVectorTextOnly: false,
   };
 }
 

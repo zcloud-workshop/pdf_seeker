@@ -40,9 +40,36 @@ export async function executeSmartPdfCompression(
   inputPath: string,
   outputPath: string,
   preset: string = "balanced",
-  onProgress?: (progressPercent: number, current: number, total: number) => void
+  onProgress?: (progressPercent: number, current: number, total: number) => void,
+  imageCount?: number
 ): Promise<CompressionExecutionResult> {
   const profile = PRESET_PROFILES[preset] || PRESET_PROFILES.balanced;
+
+  // If document is pure vector/text (0 images), rasterization would bloat file size and blur text.
+  // Directly execute high-performance backend lossless structural compression.
+  if (imageCount === 0) {
+    if (onProgress) onProgress(50, 1, 1);
+    const res = await invoke<{
+      original_size?: number;
+      originalSize?: number;
+      compressed_size?: number;
+      compressedSize?: number;
+      ratio?: number;
+    }>("compress_pdf", {
+      inputPath,
+      outputPath,
+    });
+    if (onProgress) onProgress(100, 1, 1);
+    const orig = res.original_size ?? res.originalSize ?? 0;
+    const comp = res.compressed_size ?? res.compressedSize ?? orig;
+    const ratio = res.ratio ?? (orig > 0 ? ((orig - comp) / orig) * 100 : 0);
+    return {
+      originalSize: orig,
+      compressedSize: comp,
+      ratio,
+      outputPath,
+    };
+  }
 
   let originalBytes: Uint8Array;
   try {

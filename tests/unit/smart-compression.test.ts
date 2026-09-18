@@ -45,4 +45,21 @@ describe("Smart PDF Compression Engine", () => {
     expect(PRESET_PROFILES.grayscale.grayscale).toBe(true);
     expect(PRESET_PROFILES.balanced.grayscale).toBe(false);
   });
+
+  it("adjusts estimates dynamically when document is pure vector text without images", () => {
+    // 301,683 bytes pure vector document (like user test file)
+    const originalBytes = 301683;
+    const vectorEstimate = estimateSavings(originalBytes, "balanced", 0);
+
+    expect(vectorEstimate.isVectorTextOnly).toBe(true);
+    expect(vectorEstimate.ratioRange).toContain("原生矢量精简");
+    // Should predict around 1% ~ 4% saving (around 289KB ~ 298KB), not an unrealistic 88KB!
+    expect(vectorEstimate.minFinal).toBeGreaterThan(280000);
+    expect(vectorEstimate.maxFinal).toBeLessThanOrEqual(originalBytes);
+
+    // Standard document with bitmap images
+    const bitmapEstimate = estimateSavings(originalBytes, "balanced", 5);
+    expect(bitmapEstimate.isVectorTextOnly).toBe(false);
+    expect(bitmapEstimate.ratioRange).toContain("25% ~ 45%");
+  });
 });

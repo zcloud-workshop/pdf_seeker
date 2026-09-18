@@ -41,6 +41,11 @@ fn test_user_document_full_functional_pipeline() {
     println!("Document Title: {:?}", info.title);
     println!("Total Pages: {}", total_pages);
     println!("File Size: {} bytes", info.file_size);
+    println!("Image Count: {} (Vector document)", info.image_count);
+    assert_eq!(
+        info.image_count, 0,
+        "User test file is pure vector text with 0 bitmap images"
+    );
     assert!(total_pages > 0, "Document must have at least 1 page");
 
     // Test text extraction
