@@ -8,6 +8,7 @@
     totalPages,
     zoomLevel,
     isDark,
+    toggleTheme,
     editHistory,
     selectedEditId,
     signPlacement,
@@ -726,13 +727,6 @@
     ocrResults.set({});
   }
 
-  function toggleTheme() {
-    const next = !$isDark;
-    isDark.set(next);
-    if (typeof document !== "undefined") {
-      document.documentElement.classList.toggle("dark", next);
-    }
-  }
 
   function handleTabChange(filePath: string) {
     editHistory.set({ operations: [], currentIndex: -1 });

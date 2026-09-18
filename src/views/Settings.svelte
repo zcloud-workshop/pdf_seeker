@@ -3,6 +3,7 @@
   import { t, setLocale } from "@/i18n/index.svelte.ts";
   import { Button, Input, Label, Separator } from "@/components/ui";
   import { invoke } from "@tauri-apps/api/core";
+  import { setTheme, type ThemePreference } from "@/stores";
   import type { AppConfig, OcrModelSet, OcrSuggestedModel } from "@/types";
   import { Download, CheckCircle2, XCircle, Loader2, RefreshCw, Zap, FolderCog, ExternalLink } from "lucide-svelte";
   import { open as openPath } from "@tauri-apps/plugin-shell";
@@ -270,6 +271,7 @@
           <Label>{t("settings.theme")}</Label>
           <select
             bind:value={theme}
+            onchange={() => setTheme(theme as ThemePreference)}
             class="flex h-10 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
           >
             <option value="system">{t("settings.themeSystem")}</option>

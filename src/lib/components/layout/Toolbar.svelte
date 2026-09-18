@@ -20,6 +20,7 @@
     currentFileName,
     currentView,
     isDark,
+    toggleTheme,
     isFullscreen,
     sidebarCollapsed,
   } from "@/stores";
@@ -66,11 +67,6 @@
     }
   }
 
-  function toggleTheme() {
-    const next = !$isDark;
-    isDark.set(next);
-    document.documentElement.classList.toggle("dark", next);
-  }
 
   function toggleFullscreen() {
     if (document.fullscreenElement) {

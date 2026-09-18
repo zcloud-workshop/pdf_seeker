@@ -16,7 +16,14 @@ export const currentPage = writable<number>(1);
 
 export const totalPages = writable<number>(0);
 
-export const isDark = writable<boolean>(false);
+export {
+  isDark,
+  themePreference,
+  initTheme,
+  setTheme,
+  toggleTheme,
+  type ThemePreference,
+} from "./theme";
 
 export const isFullscreen = writable<boolean>(false);
 

@@ -1,7 +1,7 @@
 <script lang="ts">
   import "@/i18n/index.svelte.ts";
   import { Sidebar, Toolbar } from "@/components/layout";
-  import { currentView, currentFilePath } from "@/stores";
+  import { currentView, currentFilePath, initTheme } from "@/stores";
   import Home from "$views/Home.svelte";
   import Editor from "$views/Editor.svelte";
   import Tools from "$views/Tools.svelte";
@@ -23,6 +23,7 @@
   let showOcrSetup = $state(false);
 
   onMount(async () => {
+    await initTheme();
     try {
       const configured: boolean = await invoke("ocr_check_configured");
       if (!configured) {
