@@ -42,7 +42,7 @@ pub enum S3AuthMode {
     Env,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct S3Config {
     pub auth_mode: S3AuthMode,
     pub endpoint: String,
@@ -55,6 +55,27 @@ pub struct S3Config {
     pub root_prefix: Option<String>,
     pub max_versions: Option<usize>,
     pub version_ttl_days: Option<u64>,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("auth_mode", &self.auth_mode)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"[REDACTED]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("force_path_style", &self.force_path_style)
+            .field("root_prefix", &self.root_prefix)
+            .field("max_versions", &self.max_versions)
+            .field("version_ttl_days", &self.version_ttl_days)
+            .finish()
+    }
 }
 
 impl Default for AppConfig {
@@ -128,4 +149,87 @@ pub fn save_config_with_handle(handle: &tauri::AppHandle, config: &AppConfig) ->
 pub fn init(handle: &tauri::AppHandle) -> AppResult<()> {
     load_config_with_handle(handle)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_is_offline() {
+        let cfg = AppConfig::default();
+        assert!(
+            cfg.s3.is_none(),
+            "Default config must not configure remote storage (offline-first)"
+        );
+        assert_eq!(cfg.general.language, "zh");
+        assert_eq!(cfg.general.theme, "system");
+    }
+
+    #[test]
+    fn test_config_roundtrip_toml() {
+        let mut cfg = AppConfig::default();
+        cfg.general.default_export_dir = Some("/path/to/export".to_string());
+        cfg.s3 = Some(S3Config {
+            auth_mode: S3AuthMode::Static,
+            endpoint: "https://s3.example.com".to_string(),
+            region: "us-west-2".to_string(),
+            bucket: "my-bucket".to_string(),
+            access_key: "AKIA_TEST_KEY".to_string(),
+            secret_key: "SUPER_SECRET_VALUE".to_string(),
+            session_token: Some("TOKEN_SECRET".to_string()),
+            force_path_style: true,
+            root_prefix: Some("documents".to_string()),
+            max_versions: Some(10),
+            version_ttl_days: Some(30),
+        });
+
+        let toml_str = toml::to_string_pretty(&cfg).expect("Failed to serialize toml");
+        let restored: AppConfig = toml::from_str(&toml_str).expect("Failed to deserialize toml");
+
+        assert_eq!(
+            restored.general.default_export_dir,
+            Some("/path/to/export".to_string())
+        );
+        let s3 = restored.s3.expect("s3 config must be preserved");
+        assert_eq!(s3.bucket, "my-bucket");
+        assert_eq!(s3.access_key, "AKIA_TEST_KEY");
+        assert_eq!(s3.secret_key, "SUPER_SECRET_VALUE");
+        assert_eq!(s3.session_token, Some("TOKEN_SECRET".to_string()));
+    }
+
+    #[test]
+    fn test_s3_credentials_never_printed_in_debug() {
+        let s3 = S3Config {
+            auth_mode: S3AuthMode::Static,
+            endpoint: "https://s3.example.com".to_string(),
+            region: "us-west-2".to_string(),
+            bucket: "my-bucket".to_string(),
+            access_key: "AKIA_VISIBLE".to_string(),
+            secret_key: "TOP_SECRET_NEVER_LOG".to_string(),
+            session_token: Some("CONFIDENTIAL_SESSION_TOKEN".to_string()),
+            force_path_style: true,
+            root_prefix: None,
+            max_versions: None,
+            version_ttl_days: None,
+        };
+
+        let debug_str = format!("{:?}", s3);
+        assert!(
+            !debug_str.contains("TOP_SECRET_NEVER_LOG"),
+            "Secret key must be redacted"
+        );
+        assert!(
+            !debug_str.contains("CONFIDENTIAL_SESSION_TOKEN"),
+            "Session token must be redacted"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Redacted placeholder must be present"
+        );
+        assert!(
+            debug_str.contains("AKIA_VISIBLE"),
+            "Access key id may remain visible"
+        );
+    }
 }
