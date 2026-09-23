@@ -80,6 +80,7 @@
     "merge": "Merge",
     "split": "Split",
     "rotate": "Rotate",
+    "reorder": "Reorder Pages",
     "deletePages": "Delete Pages",
     "extractPages": "Extract Pages",
     "compress": "Compress",
