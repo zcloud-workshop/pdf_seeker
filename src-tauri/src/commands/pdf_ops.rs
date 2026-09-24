@@ -1326,6 +1326,142 @@ pub fn crop_pages(req: CropPagesRequest) -> AppResult<()> {
     save_doc(&mut doc, &req.output_path)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddAnnotationRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub page: u32,
+    pub annot_type: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub color: String,
+    pub opacity: f64,
+    pub content: String,
+}
+
+/// Add a real PDF annotation (/Annots entry) to a page:
+/// highlight | underline (with generated /AP appearance) or note (/Text,
+/// rendered with the viewer's standard sticky-note icon).
+#[tauri::command]
+pub fn add_annotation(req: AddAnnotationRequest) -> AppResult<()> {
+    let mut doc = load_doc(&req.input_path)?;
+    let pages = doc.get_pages();
+    let page_id = *pages.get(&req.page)
+        .ok_or(format!("Page {} not found", req.page))?;
+
+    let hex = req.color.trim_start_matches('#');
+    let r = u8::from_str_radix(&hex.get(0..2).unwrap_or("ff"), 16).unwrap_or(255) as f64 / 255.0;
+    let g = u8::from_str_radix(&hex.get(2..4).unwrap_or("ff"), 16).unwrap_or(255) as f64 / 255.0;
+    let b = u8::from_str_radix(&hex.get(4..6).unwrap_or("00"), 16).unwrap_or(0) as f64 / 255.0;
+
+    let (subtype, ap_id) = match req.annot_type.as_str() {
+        "highlight" => {
+            let gs_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+                (b"Type".to_vec(), Object::Name(b"ExtGState".to_vec())),
+                (b"ca".to_vec(), Object::Real(req.opacity.min(1.0).max(0.0) as f32)),
+            ])));
+            let content = format!(
+                "q /GS0 gs {r:.3} {g:.3} {b:.3} rg 0 0 {w:.1} {h:.1} re f Q",
+                r = r, g = g, b = b, w = req.width, h = req.height
+            );
+            let res = lopdf::Dictionary::from_iter(vec![(
+                b"ExtGState".to_vec(),
+                Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                    b"GS0".to_vec(),
+                    Object::Reference(gs_id),
+                )])),
+            )]);
+            let ap_dict = lopdf::Dictionary::from_iter(vec![
+                (b"BBox".to_vec(), Object::Array(vec![
+                    Object::Integer(0), Object::Integer(0),
+                    Object::Real(req.width as f32), Object::Real(req.height as f32),
+                ])),
+                (b"Resources".to_vec(), Object::Dictionary(res)),
+            ]);
+            let id = doc.add_object(Object::Stream(lopdf::Stream::new(ap_dict, content.into_bytes())));
+            (b"Highlight".to_vec(), Some(id))
+        }
+        "underline" => {
+            let content = format!(
+                "q {r:.3} {g:.3} {b:.3} RG 1.5 w 0 1 m {w:.1} 1 l S Q",
+                r = r, g = g, b = b, w = req.width
+            );
+            let ap_dict = lopdf::Dictionary::from_iter(vec![
+                (b"BBox".to_vec(), Object::Array(vec![
+                    Object::Integer(0), Object::Integer(0),
+                    Object::Real(req.width as f32), Object::Real(req.height.max(3.0) as f32),
+                ])),
+                (b"Resources".to_vec(), Object::Dictionary(lopdf::Dictionary::new())),
+            ]);
+            let id = doc.add_object(Object::Stream(lopdf::Stream::new(ap_dict, content.into_bytes())));
+            (b"Underline".to_vec(), Some(id))
+        }
+        "note" => {
+            // /Text annotation: no /AP — the viewer draws its standard icon
+            (b"Text".to_vec(), None)
+        }
+        other => return Err(format!("Unknown annotation type: {}", other)),
+    };
+
+    let mut annot = lopdf::Dictionary::from_iter(vec![
+        (b"Type".to_vec(), Object::Name(b"Annot".to_vec())),
+        (b"Subtype".to_vec(), Object::Name(subtype)),
+        (b"Rect".to_vec(), Object::Array(vec![
+            Object::Real(req.x as f32),
+            Object::Real(req.y as f32),
+            Object::Real((req.x + req.width) as f32),
+            Object::Real((req.y + req.height) as f32),
+        ])),
+        (b"C".to_vec(), Object::Array(vec![
+            Object::Real(r as f32), Object::Real(g as f32), Object::Real(b as f32),
+        ])),
+        (b"F".to_vec(), Object::Integer(4)),
+        (b"T".to_vec(), Object::String(b"PDF Seeker".to_vec(), lopdf::StringFormat::Literal)),
+    ]);
+    if !req.content.is_empty() {
+        annot.set(b"Contents", Object::String(req.content.clone().into_bytes(), lopdf::StringFormat::Literal));
+    }
+    if let Some(id) = ap_id {
+        annot.set(b"AP", Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+            b"N".to_vec(),
+            Object::Reference(id),
+        )])));
+    }
+
+    let annot_id = doc.add_object(Object::Dictionary(annot));
+
+    // Append to the page /Annots array (create or extend, inline or referenced)
+    let existing_annots: Option<Object> = {
+        let page = doc.get_object(page_id).map_err(|e| format!("Page error: {}", e))?;
+        let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+        match page_dict.get(b"Annots") {
+            Ok(Object::Reference(r)) => doc.get_object(*r)
+                .map_err(|e| format!("Annots error: {}", e))?
+                .as_array()
+                .map(|a| Object::Array(a.clone()))
+                .ok(),
+            Ok(o) => o.as_array().map(|a| Object::Array(a.clone())).ok(),
+            Err(_) => None,
+        }
+    };
+
+    let mut new_annots = match existing_annots {
+        Some(Object::Array(a)) => a,
+        _ => Vec::new(),
+    };
+    new_annots.push(Object::Reference(annot_id));
+
+    let page_obj = doc.objects.get_mut(&page_id).unwrap();
+    if let Ok(dict) = page_obj.as_dict_mut() {
+        dict.set("Annots", Object::Array(new_annots));
+    }
+
+    save_doc(&mut doc, &req.output_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1546,6 +1682,124 @@ mod tests {
             y: 10.0,
             width: 0.0,
             height: 10.0,
+        });
+        assert!(result.is_err());
+    }
+
+    /// Resolve the page /Annots array of the first page
+    fn get_first_page_annots(doc: &Document) -> Vec<Object> {
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let dict = doc.get_object(page_id).unwrap().as_dict().unwrap();
+        match dict.get(b"Annots").unwrap() {
+            Object::Reference(r) => doc.get_object(*r).unwrap().as_array().unwrap().clone(),
+            Object::Array(a) => a.clone(),
+            o => panic!("Unexpected Annots: {:?}", o),
+        }
+    }
+
+    #[test]
+    fn test_add_highlight_annotation() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "ann.pdf", 1);
+        let out = dir.path().join("ann_out.pdf");
+        let out_str = out.to_string_lossy().to_string();
+
+        add_annotation(AddAnnotationRequest {
+            input_path: src,
+            output_path: out_str.clone(),
+            page: 1,
+            annot_type: "highlight".into(),
+            x: 100.0,
+            y: 200.0,
+            width: 300.0,
+            height: 24.0,
+            color: "#ffff00".into(),
+            opacity: 0.4,
+            content: String::new(),
+        })
+        .unwrap();
+
+        let doc = Document::load(&out_str).unwrap();
+        let annots = get_first_page_annots(&doc);
+        assert_eq!(annots.len(), 1);
+        let annot_ref = annots[0].as_reference().unwrap();
+        let annot = doc.get_object(annot_ref).unwrap().as_dict().unwrap();
+        assert_eq!(annot.get(b"Subtype").unwrap().as_name().unwrap(), b"Highlight");
+        let rect = annot.get(b"Rect").unwrap().as_array().unwrap();
+        let vals: Vec<f64> = rect.iter().map(|o| obj_as_f64(o).unwrap()).collect();
+        assert!((vals[0] - 100.0).abs() < 0.1);
+        assert!((vals[3] - 224.0).abs() < 0.1);
+        // AP appearance stream present
+        assert!(annot.get(b"AP").is_ok());
+    }
+
+    #[test]
+    fn test_add_note_annotation_and_underline() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "ann2.pdf", 1);
+        let out = dir.path().join("ann2_out.pdf");
+        let out_str = out.to_string_lossy().to_string();
+
+        add_annotation(AddAnnotationRequest {
+            input_path: src.clone(),
+            output_path: out_str.clone(),
+            page: 1,
+            annot_type: "note".into(),
+            x: 72.0,
+            y: 700.0,
+            width: 24.0,
+            height: 24.0,
+            color: "#ffd54f".into(),
+            opacity: 1.0,
+            content: "Check this".into(),
+        })
+        .unwrap();
+        add_annotation(AddAnnotationRequest {
+            input_path: out_str.clone(),
+            output_path: out_str.clone(),
+            page: 1,
+            annot_type: "underline".into(),
+            x: 72.0,
+            y: 660.0,
+            width: 200.0,
+            height: 12.0,
+            color: "#ff0000".into(),
+            opacity: 1.0,
+            content: String::new(),
+        })
+        .unwrap();
+
+        let doc = Document::load(&out_str).unwrap();
+        let annots = get_first_page_annots(&doc);
+        assert_eq!(annots.len(), 2);
+
+        let note = doc.get_object(annots[0].as_reference().unwrap()).unwrap().as_dict().unwrap();
+        assert_eq!(note.get(b"Subtype").unwrap().as_name().unwrap(), b"Text");
+        match note.get(b"Contents").unwrap() {
+            Object::String(bytes, _) => assert_eq!(bytes, b"Check this"),
+            o => panic!("Unexpected Contents: {:?}", o),
+        }
+
+        let ul = doc.get_object(annots[1].as_reference().unwrap()).unwrap().as_dict().unwrap();
+        assert_eq!(ul.get(b"Subtype").unwrap().as_name().unwrap(), b"Underline");
+    }
+
+    #[test]
+    fn test_add_annotation_bad_type_fails() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "ann3.pdf", 1);
+        let result = add_annotation(AddAnnotationRequest {
+            input_path: src,
+            output_path: dir.path().join("x.pdf").to_string_lossy().to_string(),
+            page: 1,
+            annot_type: "circle".into(),
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            color: "#000000".into(),
+            opacity: 1.0,
+            content: String::new(),
         });
         assert!(result.is_err());
     }

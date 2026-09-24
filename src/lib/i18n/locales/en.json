@@ -94,6 +94,7 @@
     "editRect": "Rectangle",
     "editHighlight": "Highlight",
     "crop": "Crop Pages",
+    "annotate": "Annotate",
     "extractTable": "Extract Table",
     "preview": "Preview",
     "openPdf": "Open PDF",

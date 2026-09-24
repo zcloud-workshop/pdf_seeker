@@ -34,6 +34,7 @@
     Undo2 as Icon_Undo2,
     Redo2 as Icon_Redo2,
     Crop as Icon_Crop,
+    StickyNote as Icon_StickyNote,
   } from "lucide-svelte";
   import { loadPdf, renderPageToCanvas, type PdfDocumentProxy } from "@/pdf-engine";
   import { tick } from "svelte";
@@ -42,7 +43,7 @@
     | "merge" | "split" | "rotate" | "reorder" | "delete" | "extractPages"
     | "compress" | "watermark" | "img2pdf" | "pdf2img"
     | "pdf2text" | "sign" | "ocr" | "table"
-    | "editText" | "editRect" | "editHighlight" | "crop";
+    | "editText" | "editRect" | "editHighlight" | "crop" | "annotate";
 
   let activeTool: ToolId | null = $state(null);
   let busy = $state(false);
@@ -68,7 +69,7 @@
   let thumbStripContainer = $state<HTMLDivElement | undefined>(undefined);
 
   function isEditingTool(id: ToolId | null): boolean {
-    return !!id && ["editText", "editRect", "editHighlight", "crop", "sign", "watermark"].includes(id);
+    return !!id && ["editText", "editRect", "editHighlight", "crop", "annotate", "sign", "watermark"].includes(id);
   }
 
   function setPreviewPage(p: number) {
@@ -78,6 +79,7 @@
       case "editRect": editRectPage = p; break;
       case "editHighlight": editHlPage = p; break;
       case "crop": cropPage = p; break;
+      case "annotate": annotPage = p; break;
       case "sign": signPage = p; break;
       case "table": tablePage = p; break;
     }
@@ -108,6 +110,7 @@
     { id: "editRect", icon: Icon_Square, labelKey: "tools.editRect", ready: true, hasPreview: true },
     { id: "editHighlight", icon: Icon_Highlighter, labelKey: "tools.editHighlight", ready: true, hasPreview: true },
     { id: "crop", icon: Icon_Crop, labelKey: "tools.crop", ready: true, hasPreview: true },
+    { id: "annotate", icon: Icon_StickyNote, labelKey: "tools.annotate", ready: true, hasPreview: true },
     { id: "table", icon: Icon_Table, labelKey: "tools.extractTable", ready: true, hasPreview: true },
   ];
 
@@ -257,6 +260,41 @@
       ctx.restore();
     }
 
+    // --- Annotation overlay ---
+    if (activeTool === "annotate" && annotW > 0 && annotH > 0) {
+      const cx = toX(annotX);
+      const cy = toY(annotY + annotH);
+      const cw = annotW * scale;
+      const ch = annotH * scale;
+      if (annotType === "highlight") {
+        ctx.globalAlpha = annotOpacity;
+        ctx.fillStyle = annotColor;
+        ctx.fillRect(cx, cy, cw, ch);
+        ctx.globalAlpha = 1.0;
+      } else if (annotType === "underline") {
+        ctx.strokeStyle = annotColor;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy + ch - 1);
+        ctx.lineTo(cx + cw, cy + ch - 1);
+        ctx.stroke();
+      } else {
+        // Sticky note icon: filled square with folded corner
+        ctx.fillStyle = annotColor;
+        ctx.fillRect(cx, cy, cw, ch);
+        ctx.strokeStyle = "rgba(0,0,0,0.4)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(cx, cy, cw, ch);
+        ctx.beginPath();
+        ctx.moveTo(cx + cw * 0.65, cy);
+        ctx.lineTo(cx + cw, cy + ch * 0.35);
+        ctx.lineTo(cx + cw * 0.65, cy + ch * 0.35);
+        ctx.closePath();
+        ctx.fillStyle = "rgba(0,0,0,0.15)";
+        ctx.fill();
+      }
+    }
+
     // --- Watermark overlay ---
     if (activeTool === "watermark" && watermarkText.trim()) {
       const centerX = vp.width / 2;
@@ -294,6 +332,7 @@
     void editRectBorder; void editRectFill; void editRectHasFill; void editRectBorderW;
     void editHlPage; void editHlX; void editHlY; void editHlW; void editHlH; void editHlColor; void editHlOpacity;
     void cropPage; void cropX; void cropY; void cropW; void cropH;
+    void annotPage; void annotType; void annotX; void annotY; void annotW; void annotH; void annotColor; void annotOpacity;
     void watermarkText; void watermarkFontSize; void watermarkAngle; void watermarkOpacity; void watermarkColor;
     void signImagePath; void signPage; void signX; void signY; void signWidth; void signHeight;
     void previewPage;
@@ -381,6 +420,25 @@
           cropY = pdfBottom;
           cropW = pdfRight - pdfX;
           cropH = pdfTop - pdfBottom;
+        }
+        break;
+      case "annotate":
+        if (annotType === "note") {
+          // Sticky note: fixed-size icon placed at the click point
+          annotX = toPdfX(ds.startX);
+          annotY = toPdfY(ds.startY) - 24;
+          annotW = 24;
+          annotH = 24;
+        } else if (annotType === "underline") {
+          annotX = pdfX;
+          annotY = isClick ? pdfBottom - 12 : pdfBottom;
+          annotW = isClick ? 200 : pdfRight - pdfX;
+          annotH = isClick ? 12 : Math.max(6, pdfTop - pdfBottom);
+        } else {
+          annotX = pdfX;
+          annotY = isClick ? pdfBottom - 20 : pdfBottom;
+          annotW = isClick ? 200 : pdfRight - pdfX;
+          annotH = isClick ? 20 : pdfTop - pdfBottom;
         }
         break;
       case "sign":
@@ -1310,6 +1368,38 @@
     );
   }
 
+  // ==================== Edit: Annotations ====================
+
+  let annotType = $state<"highlight" | "underline" | "note">("highlight");
+  let annotPage = $state(1);
+  let annotX = $state(100);
+  let annotY = $state(100);
+  let annotW = $state(200);
+  let annotH = $state(20);
+  let annotColor = $state("#ffd54f");
+  let annotOpacity = $state(0.4);
+  let annotText = $state("");
+
+  async function executeAnnotate() {
+    if (!$currentFilePath) return;
+    if (annotW <= 0 || annotH <= 0) return;
+    await applyEditInPlace(
+      "add_annotation",
+      {
+        page: annotPage,
+        annotType,
+        x: annotX,
+        y: annotY,
+        width: annotW,
+        height: annotH,
+        color: annotColor,
+        opacity: annotOpacity,
+        content: annotType === "note" ? annotText : "",
+      },
+      `${annotType === "note" ? "Sticky note" : annotType === "underline" ? "Underline" : "Highlight"} annotation added to page ${annotPage} (Ctrl/Cmd+Z to undo)`,
+    );
+  }
+
   // ==================== Navigation ====================
 
   async function openFileForTool() {
@@ -1369,6 +1459,7 @@
     if (activeTool === "editRect" && pageNum === editRectPage) return `${base} border-blue-500`;
     if (activeTool === "editHighlight" && pageNum === editHlPage) return `${base} border-blue-500`;
     if (activeTool === "crop" && pageNum === cropPage) return `${base} border-blue-500`;
+    if (activeTool === "annotate" && pageNum === annotPage) return `${base} border-blue-500`;
     if (activeTool === "sign" && pageNum === signPage) return `${base} border-blue-500`;
     if (activeTool === "table" && pageNum === tablePage) return `${base} border-blue-500`;
     return `${base} border-transparent`;
@@ -1379,6 +1470,7 @@
     activeTool === "editRect" ? editRectPage :
     activeTool === "editHighlight" ? editHlPage :
     activeTool === "crop" ? cropPage :
+    activeTool === "annotate" ? annotPage :
     activeTool === "sign" ? signPage :
     1
   );
@@ -2436,6 +2528,66 @@
               </div>
               <Button onclick={executeCrop} disabled={busy || cropW <= 0 || cropH <= 0}>
                 {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Crop size={14} class="mr-1.5" />{cropAllPages ? "Crop All Pages" : "Crop Page"}{/if}
+              </Button>
+            {/if}
+          </div>
+        {/if}
+
+        {#if activeTool === "annotate"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" onclick={openFileForTool}>
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+              </div>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                Add annotation to <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong> — real PDF annotations, visible in any reader.
+              </p>
+              <div class="flex gap-2">
+                {#each [["highlight", "Highlight"], ["underline", "Underline"], ["note", "Sticky Note"]] as [tp, label]}
+                  <button
+                    class="px-3 py-1.5 rounded-md border text-sm transition-colors {annotType === tp ? 'bg-primary text-primary-foreground border-primary' : 'border-border hover:bg-accent'}"
+                    onclick={() => {
+                      annotType = tp as typeof annotType;
+                      if (tp === "note") { annotW = 24; annotH = 24; }
+                    }}
+                  >{label}</button>
+                {/each}
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={annotPage} onchange={(e) => (annotPage = parseInt((e.target as HTMLInputElement).value) || 1)} /></div>
+                {#if annotType === "highlight"}
+                  <div class="space-y-1"><Label>Opacity (0-1)</Label><Input type="number" step="0.05" min="0" max="1" value={annotOpacity} onchange={(e) => (annotOpacity = parseFloat((e.target as HTMLInputElement).value) || 0.4)} /></div>
+                {/if}
+                <div class="space-y-1"><Label>X</Label><Input type="number" value={annotX} onchange={(e) => (annotX = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Y</Label><Input type="number" value={annotY} onchange={(e) => (annotY = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Width</Label><Input type="number" value={annotW} onchange={(e) => (annotW = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Height</Label><Input type="number" value={annotH} onchange={(e) => (annotH = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+              </div>
+              <div class="space-y-1">
+                <Label>Color</Label>
+                <div class="flex items-center gap-2">
+                  <input type="color" bind:value={annotColor} class="w-8 h-8 rounded cursor-pointer" />
+                  <Input value={annotColor} onchange={(e) => (annotColor = (e.target as HTMLInputElement).value)} class="w-24" />
+                </div>
+              </div>
+              {#if annotType === "note"}
+                <div class="space-y-1">
+                  <Label>Note text</Label>
+                  <textarea
+                    bind:value={annotText}
+                    rows="3"
+                    class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    placeholder="Text shown when the note is opened"
+                  ></textarea>
+                </div>
+              {/if}
+              <Button onclick={executeAnnotate} disabled={busy || annotW <= 0 || annotH <= 0}>
+                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_StickyNote size={14} class="mr-1.5" />Add Annotation}{/if}
               </Button>
             {/if}
           </div>
