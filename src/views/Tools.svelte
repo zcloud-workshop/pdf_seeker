@@ -35,6 +35,7 @@
     Redo2 as Icon_Redo2,
     Crop as Icon_Crop,
     StickyNote as Icon_StickyNote,
+    ClipboardList as Icon_ClipboardList,
   } from "lucide-svelte";
   import { loadPdf, renderPageToCanvas, type PdfDocumentProxy } from "@/pdf-engine";
   import { tick } from "svelte";
@@ -43,7 +44,7 @@
     | "merge" | "split" | "rotate" | "reorder" | "delete" | "extractPages"
     | "compress" | "watermark" | "img2pdf" | "pdf2img"
     | "pdf2text" | "sign" | "ocr" | "table"
-    | "editText" | "editRect" | "editHighlight" | "crop" | "annotate";
+    | "editText" | "editRect" | "editHighlight" | "crop" | "annotate" | "form";
 
   let activeTool: ToolId | null = $state(null);
   let busy = $state(false);
@@ -111,6 +112,7 @@
     { id: "editHighlight", icon: Icon_Highlighter, labelKey: "tools.editHighlight", ready: true, hasPreview: true },
     { id: "crop", icon: Icon_Crop, labelKey: "tools.crop", ready: true, hasPreview: true },
     { id: "annotate", icon: Icon_StickyNote, labelKey: "tools.annotate", ready: true, hasPreview: true },
+    { id: "form", icon: Icon_ClipboardList, labelKey: "tools.form", ready: true, hasPreview: false },
     { id: "table", icon: Icon_Table, labelKey: "tools.extractTable", ready: true, hasPreview: true },
   ];
 
@@ -1400,6 +1402,75 @@
     );
   }
 
+  // ==================== Form Filling ====================
+
+  type FormFieldInfo = {
+    name: string;
+    fieldType: string;
+    value: string;
+    options: string[];
+    pageIndex: number;
+  };
+  let formFields = $state<FormFieldInfo[]>([]);
+  let formValues = $state<Record<string, string>>({});
+  let formLoaded = $state(false);
+
+  async function loadFormFields() {
+    const path = $currentFilePath;
+    if (!path) return;
+    busy = true;
+    resultMsg = "";
+    try {
+      const fields = await invoke<FormFieldInfo[]>("get_form_fields", { path });
+      formFields = fields;
+      const initial: Record<string, string> = {};
+      for (const f of fields) {
+        if (f.fieldType === "checkbox") {
+          initial[f.name] = f.value === "Yes" || f.value === "true" ? "true" : "false";
+        } else {
+          initial[f.name] = f.value ?? "";
+        }
+      }
+      formValues = initial;
+      formLoaded = true;
+      resultMsg = `Loaded ${fields.length} form field(s)`;
+      resultOk = true;
+    } catch (e) {
+      formFields = [];
+      formLoaded = true;
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function executeFillForm() {
+    const path = $currentFilePath;
+    if (!path) return;
+    busy = true;
+    resultMsg = "";
+    try {
+      const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
+      if (!out) return;
+      const outPath = out as string;
+      // Skip untouched text fields (empty) so existing values are preserved
+      const values = formFields
+        .map((f) => ({ name: f.name, value: formValues[f.name] ?? "" }))
+        .filter((v) => v.value !== "");
+      await invoke("fill_form", {
+        req: { inputPath: path, outputPath: outPath, values },
+      });
+      resultMsg = `Form filled → ${outPath.split(/[\\/]/).pop()}`;
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      busy = false;
+    }
+  }
+
   // ==================== Navigation ====================
 
   async function openFileForTool() {
@@ -2589,6 +2660,74 @@
               <Button onclick={executeAnnotate} disabled={busy || annotW <= 0 || annotH <= 0}>
                 {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_StickyNote size={14} class="mr-1.5" />Add Annotation}{/if}
               </Button>
+            {/if}
+          </div>
+        {/if}
+
+        {#if activeTool === "form"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" onclick={openFileForTool}>
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+              </div>
+            {:else if !formLoaded}
+              <p class="text-sm text-muted-foreground">
+                Read AcroForm fields from <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong>
+              </p>
+              <Button onclick={loadFormFields} disabled={busy}>
+                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_ClipboardList size={14} class="mr-1.5" />Load Form Fields}{/if}
+              </Button>
+            {:else if formFields.length === 0}
+              <p class="text-sm text-muted-foreground">No fillable form fields found in this PDF.</p>
+              <Button variant="outline" size="sm" onclick={loadFormFields} disabled={busy}>Reload</Button>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                {formFields.length} field(s) — fill and save as a new file:
+              </p>
+              <div class="space-y-3 max-h-96 overflow-auto pr-1">
+                {#each formFields as f (f.name)}
+                  {#if f.fieldType === "text"}
+                    <div class="space-y-1">
+                      <Label>{f.name}</Label>
+                      <Input bind:value={formValues[f.name]} placeholder={f.name} />
+                    </div>
+                  {:else if f.fieldType === "checkbox"}
+                    <label class="flex items-center gap-2 text-sm cursor-pointer">
+                      <input
+                        type="checkbox"
+                        class="accent-blue-500"
+                        checked={formValues[f.name] === "true"}
+                        onchange={(e) => (formValues[f.name] = (e.target as HTMLInputElement).checked ? "true" : "false")}
+                      />
+                      {f.name}
+                    </label>
+                  {:else if f.fieldType === "radio" || f.fieldType === "choice"}
+                    <div class="space-y-1">
+                      <Label>{f.name}</Label>
+                      <select
+                        bind:value={formValues[f.name]}
+                        class="flex w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      >
+                        {#each f.options as opt (opt)}
+                          <option value={opt}>{opt}</option>
+                        {/each}
+                      </select>
+                    </div>
+                  {:else}
+                    <p class="text-xs text-muted-foreground">{f.name} ({f.fieldType}) — not fillable</p>
+                  {/if}
+                {/each}
+              </div>
+              <div class="flex gap-2">
+                <Button onclick={executeFillForm} disabled={busy}>
+                  {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Save size={14} class="mr-1.5" />Fill &amp; Save As}{/if}
+                </Button>
+                <Button variant="outline" size="sm" onclick={loadFormFields} disabled={busy}>Reload</Button>
+              </div>
             {/if}
           </div>
         {/if}

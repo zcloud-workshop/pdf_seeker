@@ -1462,6 +1462,309 @@ pub fn add_annotation(req: AddAnnotationRequest) -> AppResult<()> {
     save_doc(&mut doc, &req.output_path)
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormField {
+    pub name: String,
+    pub field_type: String,
+    pub value: String,
+    pub options: Vec<String>,
+    pub page_index: u32,
+}
+
+fn object_to_display_string(o: &Object) -> String {
+    match o {
+        Object::String(bytes, _) => String::from_utf8_lossy(bytes).to_string(),
+        Object::Name(n) => String::from_utf8_lossy(n).to_string(),
+        Object::Integer(i) => i.to_string(),
+        Object::Real(r) => r.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn field_type_name(field_dict: &lopdf::Dictionary) -> &'static str {
+    let flags = field_dict.get(b"Ff").ok()
+        .and_then(|o| o.as_i64().ok())
+        .unwrap_or(0);
+    match field_dict.get(b"FT").ok().and_then(|o| o.as_name().ok()) {
+        Some(b"Tx") => "text",
+        Some(b"Btn") => {
+            if flags & 0x8000 != 0 { "radio" }     // bit 16: radio
+            else if flags & 0x10000 != 0 { "button" } // bit 17: pushbutton
+            else { "checkbox" }
+        }
+        Some(b"Ch") => "choice",
+        Some(b"Sig") => "signature",
+        _ => "unknown",
+    }
+}
+
+fn field_options(field_dict: &lopdf::Dictionary) -> Vec<String> {
+    field_dict.get(b"Opt").ok()
+        .and_then(|o| o.as_array().ok())
+        .map(|arr| {
+            arr.iter().filter_map(|opt| {
+                match opt {
+                    // Choice options may be [export_value, label] pairs
+                    Object::Array(pair) => pair.first().map(object_to_display_string),
+                    other => Some(object_to_display_string(other)),
+                }
+            }).collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the Catalog /AcroForm dictionary (following a reference if needed)
+/// and return it plus a marker for how it is attached. Returns the (root_ref,
+/// acroform_dict) pair.
+fn get_acroform(doc: &Document) -> Option<(ObjectId, lopdf::Dictionary)> {
+    let root_ref = doc.trailer.get(b"Root").ok()?.as_reference().ok()?;
+    let root = doc.get_object(root_ref).ok()?.as_dict().ok()?;
+    match root.get(b"AcroForm").ok()? {
+        Object::Reference(r) => {
+            let d = doc.get_object(*r).ok()?.as_dict().ok()?.clone();
+            Some((root_ref, d))
+        }
+        Object::Dictionary(d) => Some((root_ref, d.clone())),
+        _ => None,
+    }
+}
+
+/// Walk /Fields recursively. Terminal fields carry /FT (or have only widget
+/// kids); intermediate nodes have /T + /Kids of sub-fields and get a
+/// "parent.child" name prefix.
+fn walk_fields(
+    doc: &Document,
+    entries: &[Object],
+    prefix: &str,
+    page_lookup: &std::collections::HashMap<ObjectId, u32>,
+    out: &mut Vec<FormField>,
+) {
+    for entry in entries {
+        let dict = match entry {
+            Object::Reference(r) => match doc.get_object(*r) {
+                Ok(Object::Dictionary(d)) => d,
+                _ => continue,
+            },
+            Object::Dictionary(d) => d,
+            _ => continue,
+        };
+
+        let own_name = dict.get(b"T").ok()
+            .map(object_to_display_string)
+            .unwrap_or_default();
+        let qualified = if prefix.is_empty() { own_name.clone() } else { format!("{}.{}", prefix, own_name) };
+
+        // Sub-fields: kids that themselves have /T
+        let has_field_kids = dict.get(b"Kids").ok()
+            .and_then(|o| o.as_array().ok())
+            .map(|kids| kids.iter().any(|k| {
+                let kd = match k {
+                    Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_dict().ok()),
+                    Object::Dictionary(d) => Some(d),
+                    _ => None,
+                };
+                kd.map(|d| d.get(b"T").is_ok()).unwrap_or(false)
+            }))
+            .unwrap_or(false);
+
+        if has_field_kids {
+            let kids = dict.get(b"Kids").ok().and_then(|o| o.as_array().ok()).cloned().unwrap_or_default();
+            walk_fields(doc, &kids, &qualified, page_lookup, out);
+            continue;
+        }
+
+        if dict.get(b"FT").is_err() {
+            continue; // not a terminal field
+        }
+
+        let page_index = match dict.get(b"P").ok().and_then(|o| o.as_reference().ok()) {
+            Some(p) => page_lookup.get(&p).copied().unwrap_or(0),
+            None => 0,
+        };
+
+        out.push(FormField {
+            name: qualified,
+            field_type: field_type_name(dict).to_string(),
+            value: dict.get(b"V").ok().map(object_to_display_string).unwrap_or_default(),
+            options: field_options(dict),
+            page_index,
+        });
+    }
+}
+
+#[tauri::command]
+pub fn get_form_fields(path: String) -> AppResult<Vec<FormField>> {
+    let doc = load_doc(&path)?;
+    let (_, acroform) = get_acroform(&doc)
+        .ok_or("This PDF has no AcroForm (no fillable form fields)")?;
+
+    let mut page_lookup = std::collections::HashMap::new();
+    for (num, id) in doc.get_pages() {
+        page_lookup.insert(id, num);
+    }
+
+    let entries = acroform.get(b"Fields").ok()
+        .and_then(|o| o.as_array().ok())
+        .cloned()
+        .ok_or("AcroForm has no /Fields array")?;
+
+    let mut fields = Vec::new();
+    walk_fields(&doc, &entries, "", &page_lookup, &mut fields);
+    if fields.is_empty() {
+        return Err("No form fields found".into());
+    }
+    Ok(fields)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormFieldValue {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FillFormRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub values: Vec<FormFieldValue>,
+}
+
+/// Locate terminal field dictionaries by fully-qualified name.
+/// Returns (field object id, field type) pairs; only referenced fields can be
+/// modified in place.
+fn locate_terminal_fields(
+    doc: &Document,
+    entries: &[Object],
+    prefix: &str,
+    out: &mut Vec<(String, Option<ObjectId>, String)>,
+) {
+    for entry in entries {
+        let (obj_id, dict) = match entry {
+            Object::Reference(r) => match doc.get_object(*r) {
+                Ok(Object::Dictionary(d)) => (Some(*r), d),
+                _ => continue,
+            },
+            Object::Dictionary(d) => (None, d),
+            _ => continue,
+        };
+
+        let own_name = dict.get(b"T").ok().map(object_to_display_string).unwrap_or_default();
+        let qualified = if prefix.is_empty() { own_name.clone() } else { format!("{}.{}", prefix, own_name) };
+
+        let has_field_kids = dict.get(b"Kids").ok()
+            .and_then(|o| o.as_array().ok())
+            .map(|kids| kids.iter().any(|k| {
+                let kd = match k {
+                    Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_dict().ok()),
+                    Object::Dictionary(d) => Some(d),
+                    _ => None,
+                };
+                kd.map(|d| d.get(b"T").is_ok()).unwrap_or(false)
+            }))
+            .unwrap_or(false);
+
+        if has_field_kids {
+            let kids = dict.get(b"Kids").ok().and_then(|o| o.as_array().ok()).cloned().unwrap_or_default();
+            locate_terminal_fields(doc, &kids, &qualified, out);
+        } else if dict.get(b"FT").is_ok() {
+            out.push((qualified, obj_id, field_type_name(dict).to_string()));
+        }
+    }
+}
+
+#[tauri::command]
+pub fn fill_form(req: FillFormRequest) -> AppResult<()> {
+    let mut doc = load_doc(&req.input_path)?;
+    let (root_ref, _) = get_acroform(&doc)
+        .ok_or("This PDF has no AcroForm (no fillable form fields)")?;
+
+    let entries = {
+        let root = doc.get_object(root_ref).map_err(|e| format!("Catalog error: {}", e))?;
+        let acroform = match root.as_dict().map_err(|e| format!("Catalog error: {}", e))?.get(b"AcroForm") {
+            Ok(Object::Reference(r)) => doc.get_object(*r)
+                .map_err(|e| format!("AcroForm error: {}", e))?
+                .as_dict()
+                .map_err(|e| format!("AcroForm error: {}", e))?
+                .get(b"Fields").ok()
+                .and_then(|o| o.as_array().ok())
+                .cloned()
+                .ok_or("AcroForm has no /Fields array")?,
+            Ok(_) => return Err("Unsupported inline AcroForm".into()),
+            Err(_) => return Err("AcroForm has no /Fields array".into()),
+        };
+        acroform
+    };
+
+    let mut located = Vec::new();
+    locate_terminal_fields(&doc, &entries, "", &mut located);
+
+    let truthy = |v: &str| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on" | "checked");
+
+    let mut applied = 0;
+    for value in &req.values {
+        let (_, obj_id, ftype) = match located.iter().find(|(name, _, _)| *name == value.name) {
+            Some(l) => l,
+            None => return Err(format!("Form field '{}' not found", value.name)),
+        };
+        let obj_id = obj_id.ok_or(format!("Form field '{}' is not a reference and cannot be filled", value.name))?;
+
+        let field_obj = doc.objects.get_mut(&obj_id).unwrap();
+        let dict = field_obj.as_dict_mut().map_err(|e| format!("Field dict error: {}", e))?;
+        match ftype.as_str() {
+            "text" | "choice" => {
+                dict.set(b"V", Object::String(value.value.clone().into_bytes(), lopdf::StringFormat::Literal));
+            }
+            "checkbox" => {
+                let state = if truthy(&value.value) { b"Yes".to_vec() } else { b"Off".to_vec() };
+                dict.set(b"V", Object::Name(state.clone()));
+                dict.set(b"AS", Object::Name(state));
+            }
+            "radio" => {
+                dict.set(b"V", Object::Name(value.value.clone().into_bytes()));
+                dict.set(b"AS", Object::Name(value.value.clone().into_bytes()));
+            }
+            other => return Err(format!("Field '{}' of type '{}' cannot be filled", value.name, other)),
+        }
+        applied += 1;
+    }
+
+    if applied == 0 {
+        return Err("No values to fill".into());
+    }
+
+    // Ask viewers to rebuild field appearances for the new values.
+    // Two-phase: read how AcroForm is attached, then mutate without overlap.
+    let acroform_ref = {
+        let root_obj = doc.objects.get(&root_ref).unwrap();
+        root_obj.as_dict().unwrap().get(b"AcroForm").ok()
+            .and_then(|o| o.as_reference().ok())
+    };
+    match acroform_ref {
+        Some(r) => {
+            let acro_obj = doc.objects.get_mut(&r).unwrap();
+            if let Ok(acro) = acro_obj.as_dict_mut() {
+                acro.set(b"NeedAppearances", Object::Boolean(true));
+            }
+        }
+        None => {
+            // Inline AcroForm dictionary on the catalog
+            let root_obj = doc.objects.get_mut(&root_ref).unwrap();
+            if let Ok(root_dict) = root_obj.as_dict_mut() {
+                if let Ok(acro) = root_dict.get_mut(b"AcroForm") {
+                    if let Ok(acro_dict) = acro.as_dict_mut() {
+                        acro_dict.set(b"NeedAppearances", Object::Boolean(true));
+                    }
+                }
+            }
+        }
+    }
+
+    save_doc(&mut doc, &req.output_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1802,5 +2105,155 @@ mod tests {
             content: String::new(),
         });
         assert!(result.is_err());
+    }
+
+    /// Create a 1-page PDF with an AcroForm containing a text field, a
+    /// checkbox and a radio group
+    fn create_form_test_pdf(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        let mut doc = Document::with_version("1.4");
+
+        let catalog_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
+        let pages_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
+            (b"Count".to_vec(), Object::Integer(1)),
+            (b"Kids".to_vec(), Object::Array(vec![])),
+        ])));
+        if let Some(cat) = doc.objects.get_mut(&catalog_id) {
+            if let Ok(d) = cat.as_dict_mut() {
+                d.set("Type", Object::Name(b"Catalog".to_vec()));
+                d.set("Pages", Object::Reference(pages_id));
+            }
+        }
+        let page_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
+            (b"Parent".to_vec(), Object::Reference(pages_id)),
+            (b"MediaBox".to_vec(), Object::Array(vec![
+                Object::Integer(0), Object::Integer(0),
+                Object::Integer(612), Object::Integer(792),
+            ])),
+        ])));
+        if let Some(pages_obj) = doc.objects.get_mut(&pages_id) {
+            if let Ok(d) = pages_obj.as_dict_mut() {
+                d.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+            }
+        }
+        doc.trailer.set(b"Root", Object::Reference(catalog_id));
+
+        let text_field_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"FT".to_vec(), Object::Name(b"Tx".to_vec())),
+            (b"T".to_vec(), Object::String(b"fullname".to_vec(), lopdf::StringFormat::Literal)),
+            (b"V".to_vec(), Object::String(b"old value".to_vec(), lopdf::StringFormat::Literal)),
+            (b"P".to_vec(), Object::Reference(page_id)),
+        ])));
+        let checkbox_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"FT".to_vec(), Object::Name(b"Btn".to_vec())),
+            (b"T".to_vec(), Object::String(b"subscribe".to_vec(), lopdf::StringFormat::Literal)),
+            (b"V".to_vec(), Object::Name(b"Off".to_vec())),
+            (b"AS".to_vec(), Object::Name(b"Off".to_vec())),
+            (b"P".to_vec(), Object::Reference(page_id)),
+        ])));
+        let radio_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"FT".to_vec(), Object::Name(b"Btn".to_vec())),
+            (b"Ff".to_vec(), Object::Integer(0x8000)), // radio flag
+            (b"T".to_vec(), Object::String(b"color".to_vec(), lopdf::StringFormat::Literal)),
+            (b"V".to_vec(), Object::Name(b"red".to_vec())),
+            (b"Opt".to_vec(), Object::Array(vec![
+                Object::String(b"red".to_vec(), lopdf::StringFormat::Literal),
+                Object::String(b"green".to_vec(), lopdf::StringFormat::Literal),
+            ])),
+            (b"P".to_vec(), Object::Reference(page_id)),
+        ])));
+
+        let acroform_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Fields".to_vec(), Object::Array(vec![
+                Object::Reference(text_field_id),
+                Object::Reference(checkbox_id),
+                Object::Reference(radio_id),
+            ])),
+        ])));
+        if let Some(cat) = doc.objects.get_mut(&catalog_id) {
+            if let Ok(d) = cat.as_dict_mut() {
+                d.set("AcroForm", Object::Reference(acroform_id));
+            }
+        }
+
+        doc.save(&path).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn test_get_form_fields() {
+        let dir = TempDir::new().unwrap();
+        let src = create_form_test_pdf(dir.path(), "form.pdf");
+
+        let fields = get_form_fields(src).unwrap();
+        assert_eq!(fields.len(), 3);
+
+        let text = fields.iter().find(|f| f.name == "fullname").unwrap();
+        assert_eq!(text.field_type, "text");
+        assert_eq!(text.value, "old value");
+        assert_eq!(text.page_index, 1);
+
+        let check = fields.iter().find(|f| f.name == "subscribe").unwrap();
+        assert_eq!(check.field_type, "checkbox");
+        assert_eq!(check.value, "Off");
+
+        let radio = fields.iter().find(|f| f.name == "color").unwrap();
+        assert_eq!(radio.field_type, "radio");
+        assert_eq!(radio.value, "red");
+        assert_eq!(radio.options, vec!["red".to_string(), "green".to_string()]);
+    }
+
+    #[test]
+    fn test_fill_form() {
+        let dir = TempDir::new().unwrap();
+        let src = create_form_test_pdf(dir.path(), "form_fill.pdf");
+        let out = dir.path().join("form_filled.pdf");
+        let out_str = out.to_string_lossy().to_string();
+
+        fill_form(FillFormRequest {
+            input_path: src,
+            output_path: out_str.clone(),
+            values: vec![
+                FormFieldValue { name: "fullname".into(), value: "Ada Lovelace".into() },
+                FormFieldValue { name: "subscribe".into(), value: "true".into() },
+                FormFieldValue { name: "color".into(), value: "green".into() },
+            ],
+        })
+        .unwrap();
+
+        // Verify via get_form_fields roundtrip
+        let fields = get_form_fields(out_str.clone()).unwrap();
+        assert_eq!(fields.iter().find(|f| f.name == "fullname").unwrap().value, "Ada Lovelace");
+        assert_eq!(fields.iter().find(|f| f.name == "subscribe").unwrap().value, "Yes");
+        assert_eq!(fields.iter().find(|f| f.name == "color").unwrap().value, "green");
+
+        // NeedAppearances set on the AcroForm
+        let doc = Document::load(&out_str).unwrap();
+        let root_ref = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let root = doc.get_object(root_ref).unwrap().as_dict().unwrap();
+        let acro_ref = root.get(b"AcroForm").unwrap().as_reference().unwrap();
+        let acro = doc.get_object(acro_ref).unwrap().as_dict().unwrap();
+        assert!(matches!(acro.get(b"NeedAppearances"), Ok(Object::Boolean(true))));
+    }
+
+    #[test]
+    fn test_fill_form_no_form_fails() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "noform.pdf", 1);
+        let result = fill_form(FillFormRequest {
+            input_path: src,
+            output_path: dir.path().join("nope.pdf").to_string_lossy().to_string(),
+            values: vec![FormFieldValue { name: "x".into(), value: "y".into() }],
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_form_fields_no_form_fails() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "noform2.pdf", 1);
+        assert!(get_form_fields(src).is_err());
     }
 }

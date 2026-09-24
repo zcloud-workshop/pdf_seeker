@@ -43,6 +43,8 @@ pub fn run() {
             commands::pdf_ops::add_highlight,
             commands::pdf_ops::crop_pages,
             commands::pdf_ops::add_annotation,
+            commands::pdf_ops::get_form_fields,
+            commands::pdf_ops::fill_form,
             commands::fs_utils::list_dir_files,
             commands::s3_ops::s3_test_connection,
             commands::s3_ops::s3_list_files,
