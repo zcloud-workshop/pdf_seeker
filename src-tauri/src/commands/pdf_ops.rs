@@ -232,6 +232,14 @@ fn get_page_size(page_dict: &lopdf::Dictionary) -> (f64, f64) {
         .unwrap_or((612.0, 792.0))
 }
 
+fn obj_as_f64(o: &Object) -> Option<f64> {
+    match o {
+        Object::Integer(i) => Some(*i as f64),
+        Object::Real(r) => Some(*r as f64),
+        _ => None,
+    }
+}
+
 #[tauri::command]
 pub fn merge_pdfs(paths: Vec<String>, output_path: String) -> AppResult<()> {
     if paths.is_empty() {
@@ -1251,6 +1259,680 @@ pub fn add_highlight(req: AddHighlightRequest) -> AppResult<()> {
     save_doc(&mut doc, &req.output_path)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CropPagesRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub pages: Vec<u32>,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Crop the given pages to the rectangle (x, y, width, height) in PDF points
+/// (origin at the lower-left corner). The rectangle is clamped to the page
+/// MediaBox; the CropBox is overwritten for the selected pages only.
+#[tauri::command]
+pub fn crop_pages(req: CropPagesRequest) -> AppResult<()> {
+    if req.pages.is_empty() {
+        return Err("No pages selected".into());
+    }
+    if req.width <= 0.0 || req.height <= 0.0 {
+        return Err("Crop area must be non-empty".into());
+    }
+
+    let mut doc = load_doc(&req.input_path)?;
+    let all_pages = doc.get_pages();
+
+    for &page_num in &req.pages {
+        let page_id = all_pages.get(&page_num)
+            .ok_or(format!("Page {} not found", page_num))?;
+
+        // MediaBox of the page (page-level value; fall back to the default
+        // used by get_page_size when inherited)
+        let media = {
+            let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
+            let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+            page_dict.get(b"MediaBox").ok()
+                .and_then(|mb| mb.as_array().ok())
+                .map(|arr| {
+                    let g = |i: usize, d: f64| arr.get(i).and_then(obj_as_f64).unwrap_or(d);
+                    (g(0, 0.0), g(1, 0.0), g(2, 612.0), g(3, 792.0))
+                })
+                .unwrap_or((0.0, 0.0, 612.0, 792.0))
+        };
+
+        // Clamp the requested rectangle to the MediaBox intersection
+        let cx0 = req.x.max(media.0);
+        let cy0 = req.y.max(media.1);
+        let cx1 = (req.x + req.width).min(media.2);
+        let cy1 = (req.y + req.height).min(media.3);
+        if cx1 - cx0 <= 0.0 || cy1 - cy0 <= 0.0 {
+            return Err(format!("Crop area for page {} is outside the MediaBox", page_num));
+        }
+
+        let page_obj = doc.objects.get_mut(page_id).unwrap();
+        let dict = page_obj.as_dict_mut().map_err(|e| format!("Page dict error: {}", e))?;
+        dict.set("CropBox", Object::Array(vec![
+            Object::Real(cx0 as f32),
+            Object::Real(cy0 as f32),
+            Object::Real(cx1 as f32),
+            Object::Real(cy1 as f32),
+        ]));
+    }
+
+    save_doc(&mut doc, &req.output_path)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddAnnotationRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub page: u32,
+    pub annot_type: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub color: String,
+    pub opacity: f64,
+    pub content: String,
+}
+
+/// Add a real PDF annotation (/Annots entry) to a page:
+/// highlight | underline (with generated /AP appearance) or note (/Text,
+/// rendered with the viewer's standard sticky-note icon).
+#[tauri::command]
+pub fn add_annotation(req: AddAnnotationRequest) -> AppResult<()> {
+    let mut doc = load_doc(&req.input_path)?;
+    let pages = doc.get_pages();
+    let page_id = *pages.get(&req.page)
+        .ok_or(format!("Page {} not found", req.page))?;
+
+    let hex = req.color.trim_start_matches('#');
+    let r = u8::from_str_radix(&hex.get(0..2).unwrap_or("ff"), 16).unwrap_or(255) as f64 / 255.0;
+    let g = u8::from_str_radix(&hex.get(2..4).unwrap_or("ff"), 16).unwrap_or(255) as f64 / 255.0;
+    let b = u8::from_str_radix(&hex.get(4..6).unwrap_or("00"), 16).unwrap_or(0) as f64 / 255.0;
+
+    let (subtype, ap_id) = match req.annot_type.as_str() {
+        "highlight" => {
+            let gs_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+                (b"Type".to_vec(), Object::Name(b"ExtGState".to_vec())),
+                (b"ca".to_vec(), Object::Real(req.opacity.min(1.0).max(0.0) as f32)),
+            ])));
+            let content = format!(
+                "q /GS0 gs {r:.3} {g:.3} {b:.3} rg 0 0 {w:.1} {h:.1} re f Q",
+                r = r, g = g, b = b, w = req.width, h = req.height
+            );
+            let res = lopdf::Dictionary::from_iter(vec![(
+                b"ExtGState".to_vec(),
+                Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                    b"GS0".to_vec(),
+                    Object::Reference(gs_id),
+                )])),
+            )]);
+            let ap_dict = lopdf::Dictionary::from_iter(vec![
+                (b"BBox".to_vec(), Object::Array(vec![
+                    Object::Integer(0), Object::Integer(0),
+                    Object::Real(req.width as f32), Object::Real(req.height as f32),
+                ])),
+                (b"Resources".to_vec(), Object::Dictionary(res)),
+            ]);
+            let id = doc.add_object(Object::Stream(lopdf::Stream::new(ap_dict, content.into_bytes())));
+            (b"Highlight".to_vec(), Some(id))
+        }
+        "underline" => {
+            let content = format!(
+                "q {r:.3} {g:.3} {b:.3} RG 1.5 w 0 1 m {w:.1} 1 l S Q",
+                r = r, g = g, b = b, w = req.width
+            );
+            let ap_dict = lopdf::Dictionary::from_iter(vec![
+                (b"BBox".to_vec(), Object::Array(vec![
+                    Object::Integer(0), Object::Integer(0),
+                    Object::Real(req.width as f32), Object::Real(req.height.max(3.0) as f32),
+                ])),
+                (b"Resources".to_vec(), Object::Dictionary(lopdf::Dictionary::new())),
+            ]);
+            let id = doc.add_object(Object::Stream(lopdf::Stream::new(ap_dict, content.into_bytes())));
+            (b"Underline".to_vec(), Some(id))
+        }
+        "note" => {
+            // /Text annotation: no /AP — the viewer draws its standard icon
+            (b"Text".to_vec(), None)
+        }
+        other => return Err(format!("Unknown annotation type: {}", other)),
+    };
+
+    let mut annot = lopdf::Dictionary::from_iter(vec![
+        (b"Type".to_vec(), Object::Name(b"Annot".to_vec())),
+        (b"Subtype".to_vec(), Object::Name(subtype)),
+        (b"Rect".to_vec(), Object::Array(vec![
+            Object::Real(req.x as f32),
+            Object::Real(req.y as f32),
+            Object::Real((req.x + req.width) as f32),
+            Object::Real((req.y + req.height) as f32),
+        ])),
+        (b"C".to_vec(), Object::Array(vec![
+            Object::Real(r as f32), Object::Real(g as f32), Object::Real(b as f32),
+        ])),
+        (b"F".to_vec(), Object::Integer(4)),
+        (b"T".to_vec(), Object::String(b"PDF Seeker".to_vec(), lopdf::StringFormat::Literal)),
+    ]);
+    if !req.content.is_empty() {
+        annot.set(b"Contents", Object::String(req.content.clone().into_bytes(), lopdf::StringFormat::Literal));
+    }
+    if let Some(id) = ap_id {
+        annot.set(b"AP", Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+            b"N".to_vec(),
+            Object::Reference(id),
+        )])));
+    }
+
+    let annot_id = doc.add_object(Object::Dictionary(annot));
+
+    // Append to the page /Annots array (create or extend, inline or referenced)
+    let existing_annots: Option<Object> = {
+        let page = doc.get_object(page_id).map_err(|e| format!("Page error: {}", e))?;
+        let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+        match page_dict.get(b"Annots") {
+            Ok(Object::Reference(r)) => doc.get_object(*r)
+                .map_err(|e| format!("Annots error: {}", e))?
+                .as_array()
+                .map(|a| Object::Array(a.clone()))
+                .ok(),
+            Ok(o) => o.as_array().map(|a| Object::Array(a.clone())).ok(),
+            Err(_) => None,
+        }
+    };
+
+    let mut new_annots = match existing_annots {
+        Some(Object::Array(a)) => a,
+        _ => Vec::new(),
+    };
+    new_annots.push(Object::Reference(annot_id));
+
+    let page_obj = doc.objects.get_mut(&page_id).unwrap();
+    if let Ok(dict) = page_obj.as_dict_mut() {
+        dict.set("Annots", Object::Array(new_annots));
+    }
+
+    save_doc(&mut doc, &req.output_path)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormField {
+    pub name: String,
+    pub field_type: String,
+    pub value: String,
+    pub options: Vec<String>,
+    pub page_index: u32,
+}
+
+fn object_to_display_string(o: &Object) -> String {
+    match o {
+        Object::String(bytes, _) => String::from_utf8_lossy(bytes).to_string(),
+        Object::Name(n) => String::from_utf8_lossy(n).to_string(),
+        Object::Integer(i) => i.to_string(),
+        Object::Real(r) => r.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn field_type_name(field_dict: &lopdf::Dictionary) -> &'static str {
+    let flags = field_dict.get(b"Ff").ok()
+        .and_then(|o| o.as_i64().ok())
+        .unwrap_or(0);
+    match field_dict.get(b"FT").ok().and_then(|o| o.as_name().ok()) {
+        Some(b"Tx") => "text",
+        Some(b"Btn") => {
+            if flags & 0x8000 != 0 { "radio" }     // bit 16: radio
+            else if flags & 0x10000 != 0 { "button" } // bit 17: pushbutton
+            else { "checkbox" }
+        }
+        Some(b"Ch") => "choice",
+        Some(b"Sig") => "signature",
+        _ => "unknown",
+    }
+}
+
+fn field_options(field_dict: &lopdf::Dictionary) -> Vec<String> {
+    field_dict.get(b"Opt").ok()
+        .and_then(|o| o.as_array().ok())
+        .map(|arr| {
+            arr.iter().filter_map(|opt| {
+                match opt {
+                    // Choice options may be [export_value, label] pairs
+                    Object::Array(pair) => pair.first().map(object_to_display_string),
+                    other => Some(object_to_display_string(other)),
+                }
+            }).collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the Catalog /AcroForm dictionary (following a reference if needed)
+/// and return it plus a marker for how it is attached. Returns the (root_ref,
+/// acroform_dict) pair.
+fn get_acroform(doc: &Document) -> Option<(ObjectId, lopdf::Dictionary)> {
+    let root_ref = doc.trailer.get(b"Root").ok()?.as_reference().ok()?;
+    let root = doc.get_object(root_ref).ok()?.as_dict().ok()?;
+    match root.get(b"AcroForm").ok()? {
+        Object::Reference(r) => {
+            let d = doc.get_object(*r).ok()?.as_dict().ok()?.clone();
+            Some((root_ref, d))
+        }
+        Object::Dictionary(d) => Some((root_ref, d.clone())),
+        _ => None,
+    }
+}
+
+/// Walk /Fields recursively. Terminal fields carry /FT (or have only widget
+/// kids); intermediate nodes have /T + /Kids of sub-fields and get a
+/// "parent.child" name prefix.
+fn walk_fields(
+    doc: &Document,
+    entries: &[Object],
+    prefix: &str,
+    page_lookup: &std::collections::HashMap<ObjectId, u32>,
+    out: &mut Vec<FormField>,
+) {
+    for entry in entries {
+        let dict = match entry {
+            Object::Reference(r) => match doc.get_object(*r) {
+                Ok(Object::Dictionary(d)) => d,
+                _ => continue,
+            },
+            Object::Dictionary(d) => d,
+            _ => continue,
+        };
+
+        let own_name = dict.get(b"T").ok()
+            .map(object_to_display_string)
+            .unwrap_or_default();
+        let qualified = if prefix.is_empty() { own_name.clone() } else { format!("{}.{}", prefix, own_name) };
+
+        // Sub-fields: kids that themselves have /T
+        let has_field_kids = dict.get(b"Kids").ok()
+            .and_then(|o| o.as_array().ok())
+            .map(|kids| kids.iter().any(|k| {
+                let kd = match k {
+                    Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_dict().ok()),
+                    Object::Dictionary(d) => Some(d),
+                    _ => None,
+                };
+                kd.map(|d| d.get(b"T").is_ok()).unwrap_or(false)
+            }))
+            .unwrap_or(false);
+
+        if has_field_kids {
+            let kids = dict.get(b"Kids").ok().and_then(|o| o.as_array().ok()).cloned().unwrap_or_default();
+            walk_fields(doc, &kids, &qualified, page_lookup, out);
+            continue;
+        }
+
+        if dict.get(b"FT").is_err() {
+            continue; // not a terminal field
+        }
+
+        let page_index = match dict.get(b"P").ok().and_then(|o| o.as_reference().ok()) {
+            Some(p) => page_lookup.get(&p).copied().unwrap_or(0),
+            None => 0,
+        };
+
+        out.push(FormField {
+            name: qualified,
+            field_type: field_type_name(dict).to_string(),
+            value: dict.get(b"V").ok().map(object_to_display_string).unwrap_or_default(),
+            options: field_options(dict),
+            page_index,
+        });
+    }
+}
+
+#[tauri::command]
+pub fn get_form_fields(path: String) -> AppResult<Vec<FormField>> {
+    let doc = load_doc(&path)?;
+    let (_, acroform) = get_acroform(&doc)
+        .ok_or("This PDF has no AcroForm (no fillable form fields)")?;
+
+    let mut page_lookup = std::collections::HashMap::new();
+    for (num, id) in doc.get_pages() {
+        page_lookup.insert(id, num);
+    }
+
+    let entries = acroform.get(b"Fields").ok()
+        .and_then(|o| o.as_array().ok())
+        .cloned()
+        .ok_or("AcroForm has no /Fields array")?;
+
+    let mut fields = Vec::new();
+    walk_fields(&doc, &entries, "", &page_lookup, &mut fields);
+    if fields.is_empty() {
+        return Err("No form fields found".into());
+    }
+    Ok(fields)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormFieldValue {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FillFormRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub values: Vec<FormFieldValue>,
+}
+
+/// Locate terminal field dictionaries by fully-qualified name.
+/// Returns (field object id, field type) pairs; only referenced fields can be
+/// modified in place.
+fn locate_terminal_fields(
+    doc: &Document,
+    entries: &[Object],
+    prefix: &str,
+    out: &mut Vec<(String, Option<ObjectId>, String)>,
+) {
+    for entry in entries {
+        let (obj_id, dict) = match entry {
+            Object::Reference(r) => match doc.get_object(*r) {
+                Ok(Object::Dictionary(d)) => (Some(*r), d),
+                _ => continue,
+            },
+            Object::Dictionary(d) => (None, d),
+            _ => continue,
+        };
+
+        let own_name = dict.get(b"T").ok().map(object_to_display_string).unwrap_or_default();
+        let qualified = if prefix.is_empty() { own_name.clone() } else { format!("{}.{}", prefix, own_name) };
+
+        let has_field_kids = dict.get(b"Kids").ok()
+            .and_then(|o| o.as_array().ok())
+            .map(|kids| kids.iter().any(|k| {
+                let kd = match k {
+                    Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_dict().ok()),
+                    Object::Dictionary(d) => Some(d),
+                    _ => None,
+                };
+                kd.map(|d| d.get(b"T").is_ok()).unwrap_or(false)
+            }))
+            .unwrap_or(false);
+
+        if has_field_kids {
+            let kids = dict.get(b"Kids").ok().and_then(|o| o.as_array().ok()).cloned().unwrap_or_default();
+            locate_terminal_fields(doc, &kids, &qualified, out);
+        } else if dict.get(b"FT").is_ok() {
+            out.push((qualified, obj_id, field_type_name(dict).to_string()));
+        }
+    }
+}
+
+#[tauri::command]
+pub fn fill_form(req: FillFormRequest) -> AppResult<()> {
+    let mut doc = load_doc(&req.input_path)?;
+    let (root_ref, _) = get_acroform(&doc)
+        .ok_or("This PDF has no AcroForm (no fillable form fields)")?;
+
+    let entries = {
+        let root = doc.get_object(root_ref).map_err(|e| format!("Catalog error: {}", e))?;
+        let acroform = match root.as_dict().map_err(|e| format!("Catalog error: {}", e))?.get(b"AcroForm") {
+            Ok(Object::Reference(r)) => doc.get_object(*r)
+                .map_err(|e| format!("AcroForm error: {}", e))?
+                .as_dict()
+                .map_err(|e| format!("AcroForm error: {}", e))?
+                .get(b"Fields").ok()
+                .and_then(|o| o.as_array().ok())
+                .cloned()
+                .ok_or("AcroForm has no /Fields array")?,
+            Ok(_) => return Err("Unsupported inline AcroForm".into()),
+            Err(_) => return Err("AcroForm has no /Fields array".into()),
+        };
+        acroform
+    };
+
+    let mut located = Vec::new();
+    locate_terminal_fields(&doc, &entries, "", &mut located);
+
+    let truthy = |v: &str| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on" | "checked");
+
+    let mut applied = 0;
+    for value in &req.values {
+        let (_, obj_id, ftype) = match located.iter().find(|(name, _, _)| *name == value.name) {
+            Some(l) => l,
+            None => return Err(format!("Form field '{}' not found", value.name)),
+        };
+        let obj_id = obj_id.ok_or(format!("Form field '{}' is not a reference and cannot be filled", value.name))?;
+
+        let field_obj = doc.objects.get_mut(&obj_id).unwrap();
+        let dict = field_obj.as_dict_mut().map_err(|e| format!("Field dict error: {}", e))?;
+        match ftype.as_str() {
+            "text" | "choice" => {
+                dict.set(b"V", Object::String(value.value.clone().into_bytes(), lopdf::StringFormat::Literal));
+            }
+            "checkbox" => {
+                let state = if truthy(&value.value) { b"Yes".to_vec() } else { b"Off".to_vec() };
+                dict.set(b"V", Object::Name(state.clone()));
+                dict.set(b"AS", Object::Name(state));
+            }
+            "radio" => {
+                dict.set(b"V", Object::Name(value.value.clone().into_bytes()));
+                dict.set(b"AS", Object::Name(value.value.clone().into_bytes()));
+            }
+            other => return Err(format!("Field '{}' of type '{}' cannot be filled", value.name, other)),
+        }
+        applied += 1;
+    }
+
+    if applied == 0 {
+        return Err("No values to fill".into());
+    }
+
+    // Ask viewers to rebuild field appearances for the new values.
+    // Two-phase: read how AcroForm is attached, then mutate without overlap.
+    let acroform_ref = {
+        let root_obj = doc.objects.get(&root_ref).unwrap();
+        root_obj.as_dict().unwrap().get(b"AcroForm").ok()
+            .and_then(|o| o.as_reference().ok())
+    };
+    match acroform_ref {
+        Some(r) => {
+            let acro_obj = doc.objects.get_mut(&r).unwrap();
+            if let Ok(acro) = acro_obj.as_dict_mut() {
+                acro.set(b"NeedAppearances", Object::Boolean(true));
+            }
+        }
+        None => {
+            // Inline AcroForm dictionary on the catalog
+            let root_obj = doc.objects.get_mut(&root_ref).unwrap();
+            if let Ok(root_dict) = root_obj.as_dict_mut() {
+                if let Ok(acro) = root_dict.get_mut(b"AcroForm") {
+                    if let Ok(acro_dict) = acro.as_dict_mut() {
+                        acro_dict.set(b"NeedAppearances", Object::Boolean(true));
+                    }
+                }
+            }
+        }
+    }
+
+    save_doc(&mut doc, &req.output_path)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextReplacement {
+    pub page: u32,
+    pub cover_x: f64,
+    pub cover_y: f64,
+    pub cover_width: f64,
+    pub cover_height: f64,
+    pub baseline_y: f64,
+    pub font_size: f64,
+    pub new_text: String,
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceTextRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub replacements: Vec<TextReplacement>,
+}
+
+/// Overlay-style text replacement: cover each original match with a white
+/// rectangle and draw the replacement text at the original baseline. All
+/// replacements on one page share a single appended content stream, so one
+/// undo step reverts the whole operation.
+#[tauri::command]
+pub fn replace_text(req: ReplaceTextRequest) -> AppResult<()> {
+    if req.replacements.is_empty() {
+        return Err("No replacements given".into());
+    }
+
+    let mut doc = load_doc(&req.input_path)?;
+    let all_pages = doc.get_pages();
+
+    // Group by page so each page gets a single appended stream
+    let mut by_page: std::collections::BTreeMap<u32, Vec<&TextReplacement>> = std::collections::BTreeMap::new();
+    for rep in &req.replacements {
+        if rep.cover_width <= 0.0 || rep.cover_height <= 0.0 {
+            return Err("Replacement cover area must be non-empty".into());
+        }
+        if rep.font_size <= 0.0 {
+            return Err("Replacement font size must be positive".into());
+        }
+        if !all_pages.contains_key(&rep.page) {
+            return Err(format!("Page {} not found", rep.page));
+        }
+        by_page.entry(rep.page).or_default().push(rep);
+    }
+
+    for (page_num, reps) in by_page {
+        let page_id = *all_pages.get(&page_num).unwrap();
+
+        // Cover rects: white fill
+        let mut content = String::from("q\n1 1 1 rg\n");
+        for rep in &reps {
+            content.push_str(&format!(
+                "{:.1} {:.1} {:.1} {:.1} re f\n",
+                rep.cover_x, rep.cover_y, rep.cover_width, rep.cover_height
+            ));
+        }
+        content.push_str("Q\n");
+
+        // Replacement texts at original baselines (absolute Tm positioning)
+        content.push_str("BT\n");
+        for rep in &reps {
+            let (r, g, b) = match &rep.color {
+                Some(hex) => {
+                    let h = hex.trim_start_matches('#');
+                    let cr = u8::from_str_radix(&h.get(0..2).unwrap_or("00"), 16).unwrap_or(0) as f64 / 255.0;
+                    let cg = u8::from_str_radix(&h.get(2..4).unwrap_or("00"), 16).unwrap_or(0) as f64 / 255.0;
+                    let cb = u8::from_str_radix(&h.get(4..6).unwrap_or("00"), 16).unwrap_or(0) as f64 / 255.0;
+                    (cr, cg, cb)
+                }
+                None => (0.0, 0.0, 0.0),
+            };
+            content.push_str(&format!(
+                "/F1 {:.1} Tf {:.3} {:.3} {:.3} rg 1 0 0 1 {:.1} {:.1} Tm ({}) Tj\n",
+                rep.font_size, r, g, b,
+                rep.cover_x, rep.baseline_y,
+                escape_pdf_string(&rep.new_text)
+            ));
+        }
+        content.push_str("ET");
+
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            content.into_bytes(),
+        )));
+
+        // Font resource (same pattern as add_text_to_page)
+        let font_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"Font".to_vec())),
+            (b"Subtype".to_vec(), Object::Name(b"Type1".to_vec())),
+            (b"BaseFont".to_vec(), Object::Name(b"Helvetica".to_vec())),
+            (b"Encoding".to_vec(), Object::Name(b"WinAnsiEncoding".to_vec())),
+        ])));
+
+        let res_ref = {
+            let page = doc.get_object(page_id).map_err(|e| format!("Page error: {}", e))?;
+            let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+            match page_dict.get(b"Resources") {
+                Err(_) => {
+                    let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
+                    (res_id, true)
+                }
+                Ok(res_obj) => {
+                    if let Ok(r) = res_obj.as_reference() { (r, false) }
+                    else {
+                        let res_id = doc.add_object(res_obj.clone());
+                        (res_id, true)
+                    }
+                }
+            }
+        };
+
+        if let Some(res_obj) = doc.objects.get_mut(&res_ref.0) {
+            if let Ok(res_dict) = res_obj.as_dict_mut() {
+                if res_dict.get(b"Font").is_err() {
+                    res_dict.set("Font", Object::Dictionary(lopdf::Dictionary::new()));
+                }
+                if let Ok(font_d) = res_dict.get_mut(b"Font") {
+                    if let Ok(fd) = font_d.as_dict_mut() {
+                        fd.set("F1", Object::Reference(font_id));
+                    }
+                }
+            }
+        }
+        if res_ref.1 {
+            if let Some(page_obj) = doc.objects.get_mut(&page_id) {
+                if let Ok(dict) = page_obj.as_dict_mut() {
+                    dict.set("Resources", Object::Reference(res_ref.0));
+                }
+            }
+        }
+
+        // Append to page Contents
+        let has_contents_ref: Option<ObjectId> = {
+            let page_obj = doc.objects.get(&page_id).unwrap();
+            let dict = page_obj.as_dict().unwrap();
+            match dict.get(b"Contents") {
+                Ok(c) => {
+                    if let Ok(r) = c.as_reference() { Some(r) }
+                    else if let Ok(arr) = c.as_array() { Some(doc.add_object(Object::Array(arr.clone()))) }
+                    else { None }
+                }
+                Err(_) => None,
+            }
+        };
+        let new_contents_ref = match has_contents_ref {
+            Some(existing_ref) => {
+                let arr = Object::Array(vec![
+                    Object::Reference(existing_ref),
+                    Object::Reference(content_id),
+                ]);
+                doc.add_object(arr)
+            }
+            None => content_id,
+        };
+        let page_obj = doc.objects.get_mut(&page_id).unwrap();
+        if let Ok(dict) = page_obj.as_dict_mut() {
+            dict.set("Contents", Object::Reference(new_contents_ref));
+        }
+    }
+
+    save_doc(&mut doc, &req.output_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1406,5 +2088,421 @@ mod tests {
             }
             Err(_) => {} // Also acceptable
         }
+    }
+
+    #[test]
+    fn test_crop_pages() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "c.pdf", 2);
+        let out = dir.path().join("cropped.pdf");
+        let out_str = out.to_string_lossy().to_string();
+
+        crop_pages(CropPagesRequest {
+            input_path: src,
+            output_path: out_str.clone(),
+            pages: vec![1],
+            x: 50.0,
+            y: 100.0,
+            width: 400.0,
+            height: 500.0,
+        })
+        .unwrap();
+
+        let doc = Document::load(&out_str).unwrap();
+        let pages = doc.get_pages();
+
+        // Page 1 has the new CropBox
+        let id1 = *pages.get(&1).unwrap();
+        let dict1 = doc.get_object(id1).unwrap().as_dict().unwrap();
+        let cb = dict1.get(b"CropBox").unwrap().as_array().unwrap();
+        let vals: Vec<f64> = cb.iter().map(|o| obj_as_f64(o).unwrap()).collect();
+        assert!((vals[0] - 50.0).abs() < 0.1, "x0 = {}", vals[0]);
+        assert!((vals[1] - 100.0).abs() < 0.1, "y0 = {}", vals[1]);
+        assert!((vals[2] - 450.0).abs() < 0.1, "x1 = {}", vals[2]);
+        assert!((vals[3] - 600.0).abs() < 0.1, "y1 = {}", vals[3]);
+
+        // Page 2 is untouched
+        let id2 = *pages.get(&2).unwrap();
+        let dict2 = doc.get_object(id2).unwrap().as_dict().unwrap();
+        assert!(dict2.get(b"CropBox").is_err());
+    }
+
+    #[test]
+    fn test_crop_outside_mediabox_fails() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "co.pdf", 1);
+
+        // Rect completely outside the 612x792 MediaBox
+        let result = crop_pages(CropPagesRequest {
+            input_path: src,
+            output_path: dir.path().join("nope.pdf").to_string_lossy().to_string(),
+            pages: vec![1],
+            x: 700.0,
+            y: 800.0,
+            width: 100.0,
+            height: 100.0,
+        });
+        assert!(result.is_err());
+
+        // Zero-size crop also fails
+        let result = crop_pages(CropPagesRequest {
+            input_path: create_test_pdf(dir.path(), "cz.pdf", 1),
+            output_path: dir.path().join("nope2.pdf").to_string_lossy().to_string(),
+            pages: vec![1],
+            x: 10.0,
+            y: 10.0,
+            width: 0.0,
+            height: 10.0,
+        });
+        assert!(result.is_err());
+    }
+
+    /// Resolve the page /Annots array of the first page
+    fn get_first_page_annots(doc: &Document) -> Vec<Object> {
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let dict = doc.get_object(page_id).unwrap().as_dict().unwrap();
+        match dict.get(b"Annots").unwrap() {
+            Object::Reference(r) => doc.get_object(*r).unwrap().as_array().unwrap().clone(),
+            Object::Array(a) => a.clone(),
+            o => panic!("Unexpected Annots: {:?}", o),
+        }
+    }
+
+    #[test]
+    fn test_add_highlight_annotation() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "ann.pdf", 1);
+        let out = dir.path().join("ann_out.pdf");
+        let out_str = out.to_string_lossy().to_string();
+
+        add_annotation(AddAnnotationRequest {
+            input_path: src,
+            output_path: out_str.clone(),
+            page: 1,
+            annot_type: "highlight".into(),
+            x: 100.0,
+            y: 200.0,
+            width: 300.0,
+            height: 24.0,
+            color: "#ffff00".into(),
+            opacity: 0.4,
+            content: String::new(),
+        })
+        .unwrap();
+
+        let doc = Document::load(&out_str).unwrap();
+        let annots = get_first_page_annots(&doc);
+        assert_eq!(annots.len(), 1);
+        let annot_ref = annots[0].as_reference().unwrap();
+        let annot = doc.get_object(annot_ref).unwrap().as_dict().unwrap();
+        assert_eq!(annot.get(b"Subtype").unwrap().as_name().unwrap(), b"Highlight");
+        let rect = annot.get(b"Rect").unwrap().as_array().unwrap();
+        let vals: Vec<f64> = rect.iter().map(|o| obj_as_f64(o).unwrap()).collect();
+        assert!((vals[0] - 100.0).abs() < 0.1);
+        assert!((vals[3] - 224.0).abs() < 0.1);
+        // AP appearance stream present
+        assert!(annot.get(b"AP").is_ok());
+    }
+
+    #[test]
+    fn test_add_note_annotation_and_underline() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "ann2.pdf", 1);
+        let out = dir.path().join("ann2_out.pdf");
+        let out_str = out.to_string_lossy().to_string();
+
+        add_annotation(AddAnnotationRequest {
+            input_path: src.clone(),
+            output_path: out_str.clone(),
+            page: 1,
+            annot_type: "note".into(),
+            x: 72.0,
+            y: 700.0,
+            width: 24.0,
+            height: 24.0,
+            color: "#ffd54f".into(),
+            opacity: 1.0,
+            content: "Check this".into(),
+        })
+        .unwrap();
+        add_annotation(AddAnnotationRequest {
+            input_path: out_str.clone(),
+            output_path: out_str.clone(),
+            page: 1,
+            annot_type: "underline".into(),
+            x: 72.0,
+            y: 660.0,
+            width: 200.0,
+            height: 12.0,
+            color: "#ff0000".into(),
+            opacity: 1.0,
+            content: String::new(),
+        })
+        .unwrap();
+
+        let doc = Document::load(&out_str).unwrap();
+        let annots = get_first_page_annots(&doc);
+        assert_eq!(annots.len(), 2);
+
+        let note = doc.get_object(annots[0].as_reference().unwrap()).unwrap().as_dict().unwrap();
+        assert_eq!(note.get(b"Subtype").unwrap().as_name().unwrap(), b"Text");
+        match note.get(b"Contents").unwrap() {
+            Object::String(bytes, _) => assert_eq!(bytes, b"Check this"),
+            o => panic!("Unexpected Contents: {:?}", o),
+        }
+
+        let ul = doc.get_object(annots[1].as_reference().unwrap()).unwrap().as_dict().unwrap();
+        assert_eq!(ul.get(b"Subtype").unwrap().as_name().unwrap(), b"Underline");
+    }
+
+    #[test]
+    fn test_add_annotation_bad_type_fails() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "ann3.pdf", 1);
+        let result = add_annotation(AddAnnotationRequest {
+            input_path: src,
+            output_path: dir.path().join("x.pdf").to_string_lossy().to_string(),
+            page: 1,
+            annot_type: "circle".into(),
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            color: "#000000".into(),
+            opacity: 1.0,
+            content: String::new(),
+        });
+        assert!(result.is_err());
+    }
+
+    /// Create a 1-page PDF with an AcroForm containing a text field, a
+    /// checkbox and a radio group
+    fn create_form_test_pdf(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        let mut doc = Document::with_version("1.4");
+
+        let catalog_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
+        let pages_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
+            (b"Count".to_vec(), Object::Integer(1)),
+            (b"Kids".to_vec(), Object::Array(vec![])),
+        ])));
+        if let Some(cat) = doc.objects.get_mut(&catalog_id) {
+            if let Ok(d) = cat.as_dict_mut() {
+                d.set("Type", Object::Name(b"Catalog".to_vec()));
+                d.set("Pages", Object::Reference(pages_id));
+            }
+        }
+        let page_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
+            (b"Parent".to_vec(), Object::Reference(pages_id)),
+            (b"MediaBox".to_vec(), Object::Array(vec![
+                Object::Integer(0), Object::Integer(0),
+                Object::Integer(612), Object::Integer(792),
+            ])),
+        ])));
+        if let Some(pages_obj) = doc.objects.get_mut(&pages_id) {
+            if let Ok(d) = pages_obj.as_dict_mut() {
+                d.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+            }
+        }
+        doc.trailer.set(b"Root", Object::Reference(catalog_id));
+
+        let text_field_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"FT".to_vec(), Object::Name(b"Tx".to_vec())),
+            (b"T".to_vec(), Object::String(b"fullname".to_vec(), lopdf::StringFormat::Literal)),
+            (b"V".to_vec(), Object::String(b"old value".to_vec(), lopdf::StringFormat::Literal)),
+            (b"P".to_vec(), Object::Reference(page_id)),
+        ])));
+        let checkbox_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"FT".to_vec(), Object::Name(b"Btn".to_vec())),
+            (b"T".to_vec(), Object::String(b"subscribe".to_vec(), lopdf::StringFormat::Literal)),
+            (b"V".to_vec(), Object::Name(b"Off".to_vec())),
+            (b"AS".to_vec(), Object::Name(b"Off".to_vec())),
+            (b"P".to_vec(), Object::Reference(page_id)),
+        ])));
+        let radio_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"FT".to_vec(), Object::Name(b"Btn".to_vec())),
+            (b"Ff".to_vec(), Object::Integer(0x8000)), // radio flag
+            (b"T".to_vec(), Object::String(b"color".to_vec(), lopdf::StringFormat::Literal)),
+            (b"V".to_vec(), Object::Name(b"red".to_vec())),
+            (b"Opt".to_vec(), Object::Array(vec![
+                Object::String(b"red".to_vec(), lopdf::StringFormat::Literal),
+                Object::String(b"green".to_vec(), lopdf::StringFormat::Literal),
+            ])),
+            (b"P".to_vec(), Object::Reference(page_id)),
+        ])));
+
+        let acroform_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Fields".to_vec(), Object::Array(vec![
+                Object::Reference(text_field_id),
+                Object::Reference(checkbox_id),
+                Object::Reference(radio_id),
+            ])),
+        ])));
+        if let Some(cat) = doc.objects.get_mut(&catalog_id) {
+            if let Ok(d) = cat.as_dict_mut() {
+                d.set("AcroForm", Object::Reference(acroform_id));
+            }
+        }
+
+        doc.save(&path).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn test_get_form_fields() {
+        let dir = TempDir::new().unwrap();
+        let src = create_form_test_pdf(dir.path(), "form.pdf");
+
+        let fields = get_form_fields(src).unwrap();
+        assert_eq!(fields.len(), 3);
+
+        let text = fields.iter().find(|f| f.name == "fullname").unwrap();
+        assert_eq!(text.field_type, "text");
+        assert_eq!(text.value, "old value");
+        assert_eq!(text.page_index, 1);
+
+        let check = fields.iter().find(|f| f.name == "subscribe").unwrap();
+        assert_eq!(check.field_type, "checkbox");
+        assert_eq!(check.value, "Off");
+
+        let radio = fields.iter().find(|f| f.name == "color").unwrap();
+        assert_eq!(radio.field_type, "radio");
+        assert_eq!(radio.value, "red");
+        assert_eq!(radio.options, vec!["red".to_string(), "green".to_string()]);
+    }
+
+    #[test]
+    fn test_fill_form() {
+        let dir = TempDir::new().unwrap();
+        let src = create_form_test_pdf(dir.path(), "form_fill.pdf");
+        let out = dir.path().join("form_filled.pdf");
+        let out_str = out.to_string_lossy().to_string();
+
+        fill_form(FillFormRequest {
+            input_path: src,
+            output_path: out_str.clone(),
+            values: vec![
+                FormFieldValue { name: "fullname".into(), value: "Ada Lovelace".into() },
+                FormFieldValue { name: "subscribe".into(), value: "true".into() },
+                FormFieldValue { name: "color".into(), value: "green".into() },
+            ],
+        })
+        .unwrap();
+
+        // Verify via get_form_fields roundtrip
+        let fields = get_form_fields(out_str.clone()).unwrap();
+        assert_eq!(fields.iter().find(|f| f.name == "fullname").unwrap().value, "Ada Lovelace");
+        assert_eq!(fields.iter().find(|f| f.name == "subscribe").unwrap().value, "Yes");
+        assert_eq!(fields.iter().find(|f| f.name == "color").unwrap().value, "green");
+
+        // NeedAppearances set on the AcroForm
+        let doc = Document::load(&out_str).unwrap();
+        let root_ref = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let root = doc.get_object(root_ref).unwrap().as_dict().unwrap();
+        let acro_ref = root.get(b"AcroForm").unwrap().as_reference().unwrap();
+        let acro = doc.get_object(acro_ref).unwrap().as_dict().unwrap();
+        assert!(matches!(acro.get(b"NeedAppearances"), Ok(Object::Boolean(true))));
+    }
+
+    #[test]
+    fn test_fill_form_no_form_fails() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "noform.pdf", 1);
+        let result = fill_form(FillFormRequest {
+            input_path: src,
+            output_path: dir.path().join("nope.pdf").to_string_lossy().to_string(),
+            values: vec![FormFieldValue { name: "x".into(), value: "y".into() }],
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_form_fields_no_form_fails() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "noform2.pdf", 1);
+        assert!(get_form_fields(src).is_err());
+    }
+
+    #[test]
+    fn test_replace_text() {
+        let dir = TempDir::new().unwrap();
+        // Base PDF with a text run at a known position
+        let base = create_test_pdf(dir.path(), "rt_base.pdf", 1);
+        add_text_to_page(AddTextRequest {
+            input_path: base,
+            output_path: dir.path().join("rt_src.pdf").to_string_lossy().to_string(),
+            page: 1,
+            x: 72.0,
+            y: 700.0,
+            text: "Hello World".into(),
+            font_size: 12.0,
+            color: "#000000".into(),
+        })
+        .unwrap();
+        let src = dir.path().join("rt_src.pdf").to_string_lossy().to_string();
+        let out = dir.path().join("rt_out.pdf");
+        let out_str = out.to_string_lossy().to_string();
+
+        replace_text(ReplaceTextRequest {
+            input_path: src,
+            output_path: out_str.clone(),
+            replacements: vec![TextReplacement {
+                page: 1,
+                cover_x: 70.0,
+                cover_y: 697.0,
+                cover_width: 90.0,
+                cover_height: 15.0,
+                baseline_y: 700.0,
+                font_size: 12.0,
+                new_text: "Bye PDF".into(),
+                color: None,
+            }],
+        })
+        .unwrap();
+
+        // The output loads and the appended content stream contains the
+        // cover rect plus the replacement text
+        let doc = Document::load(&out_str).unwrap();
+        assert_eq!(doc.get_pages().len(), 1);
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let contents = doc.get_object(page_id).unwrap().as_dict().unwrap()
+            .get(b"Contents").unwrap().clone();
+        let stream_ids: Vec<ObjectId> = match contents {
+            Object::Reference(r) => match doc.get_object(r).unwrap() {
+                Object::Array(arr) => arr.iter().filter_map(|o| o.as_reference().ok()).collect(),
+                Object::Stream(_) => vec![r],
+                _ => vec![],
+            },
+            _ => vec![],
+        };
+        let mut found_cover = false;
+        let mut found_text = false;
+        for sid in stream_ids {
+            if let Ok(stream) = doc.get_object(sid).unwrap().as_stream() {
+                // decompressed_content() errors on streams without /Filter;
+                // fall back to the raw content in that case
+                let raw = stream.decompressed_content()
+                    .unwrap_or_else(|_| stream.content.clone());
+                let data = String::from_utf8_lossy(&raw).to_string();
+                if data.contains("re f") { found_cover = true; }
+                if data.contains("(Bye PDF) Tj") { found_text = true; }
+            }
+        }
+        assert!(found_cover, "cover rectangle missing");
+        assert!(found_text, "replacement text missing");
+    }
+
+    #[test]
+    fn test_replace_text_empty_fails() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "rt_empty.pdf", 1);
+        let result = replace_text(ReplaceTextRequest {
+            input_path: src,
+            output_path: dir.path().join("x.pdf").to_string_lossy().to_string(),
+            replacements: vec![],
+        });
+        assert!(result.is_err());
     }
 }

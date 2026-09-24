@@ -33,6 +33,11 @@
     ListOrdered as Icon_ListOrdered,
     Undo2 as Icon_Undo2,
     Redo2 as Icon_Redo2,
+    Crop as Icon_Crop,
+    StickyNote as Icon_StickyNote,
+    ClipboardList as Icon_ClipboardList,
+    Replace as Icon_Replace,
+    ShieldCheck as Icon_ShieldCheck,
   } from "lucide-svelte";
   import { loadPdf, renderPageToCanvas, type PdfDocumentProxy } from "@/pdf-engine";
   import { tick } from "svelte";
@@ -41,7 +46,8 @@
     | "merge" | "split" | "rotate" | "reorder" | "delete" | "extractPages"
     | "compress" | "watermark" | "img2pdf" | "pdf2img"
     | "pdf2text" | "sign" | "ocr" | "table"
-    | "editText" | "editRect" | "editHighlight";
+    | "editText" | "editRect" | "editHighlight" | "crop" | "annotate" | "form"
+    | "replaceText" | "security";
 
   let activeTool: ToolId | null = $state(null);
   let busy = $state(false);
@@ -67,7 +73,7 @@
   let thumbStripContainer = $state<HTMLDivElement | undefined>(undefined);
 
   function isEditingTool(id: ToolId | null): boolean {
-    return !!id && ["editText", "editRect", "editHighlight", "sign", "watermark"].includes(id);
+    return !!id && ["editText", "editRect", "editHighlight", "crop", "annotate", "sign", "watermark"].includes(id);
   }
 
   function setPreviewPage(p: number) {
@@ -76,6 +82,8 @@
       case "editText": editTextPage = p; break;
       case "editRect": editRectPage = p; break;
       case "editHighlight": editHlPage = p; break;
+      case "crop": cropPage = p; break;
+      case "annotate": annotPage = p; break;
       case "sign": signPage = p; break;
       case "table": tablePage = p; break;
     }
@@ -105,6 +113,11 @@
     { id: "editText", icon: Icon_Pencil, labelKey: "tools.editText", ready: true, hasPreview: true },
     { id: "editRect", icon: Icon_Square, labelKey: "tools.editRect", ready: true, hasPreview: true },
     { id: "editHighlight", icon: Icon_Highlighter, labelKey: "tools.editHighlight", ready: true, hasPreview: true },
+    { id: "crop", icon: Icon_Crop, labelKey: "tools.crop", ready: true, hasPreview: true },
+    { id: "annotate", icon: Icon_StickyNote, labelKey: "tools.annotate", ready: true, hasPreview: true },
+    { id: "form", icon: Icon_ClipboardList, labelKey: "tools.form", ready: true, hasPreview: false },
+    { id: "replaceText", icon: Icon_Replace, labelKey: "tools.replaceText", ready: true, hasPreview: false },
+    { id: "security", icon: Icon_ShieldCheck, labelKey: "tools.security", ready: true, hasPreview: false },
     { id: "table", icon: Icon_Table, labelKey: "tools.extractTable", ready: true, hasPreview: true },
   ];
 
@@ -235,6 +248,60 @@
       ctx.globalAlpha = 1.0;
     }
 
+    // --- Crop overlay: dim outside the crop area ---
+    if (activeTool === "crop" && cropW > 0 && cropH > 0) {
+      const cx = toX(cropX);
+      const cy = toY(cropY + cropH);
+      const cw = cropW * scale;
+      const ch = cropH * scale;
+      ctx.save();
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      ctx.fillRect(0, 0, vp.width, cy);
+      ctx.fillRect(0, cy + ch, vp.width, vp.height - cy - ch);
+      ctx.fillRect(0, cy, cx, ch);
+      ctx.fillRect(cx + cw, cy, vp.width - cx - cw, ch);
+      ctx.strokeStyle = "#3b82f6";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(cx, cy, cw, ch);
+      ctx.restore();
+    }
+
+    // --- Annotation overlay ---
+    if (activeTool === "annotate" && annotW > 0 && annotH > 0) {
+      const cx = toX(annotX);
+      const cy = toY(annotY + annotH);
+      const cw = annotW * scale;
+      const ch = annotH * scale;
+      if (annotType === "highlight") {
+        ctx.globalAlpha = annotOpacity;
+        ctx.fillStyle = annotColor;
+        ctx.fillRect(cx, cy, cw, ch);
+        ctx.globalAlpha = 1.0;
+      } else if (annotType === "underline") {
+        ctx.strokeStyle = annotColor;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy + ch - 1);
+        ctx.lineTo(cx + cw, cy + ch - 1);
+        ctx.stroke();
+      } else {
+        // Sticky note icon: filled square with folded corner
+        ctx.fillStyle = annotColor;
+        ctx.fillRect(cx, cy, cw, ch);
+        ctx.strokeStyle = "rgba(0,0,0,0.4)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(cx, cy, cw, ch);
+        ctx.beginPath();
+        ctx.moveTo(cx + cw * 0.65, cy);
+        ctx.lineTo(cx + cw, cy + ch * 0.35);
+        ctx.lineTo(cx + cw * 0.65, cy + ch * 0.35);
+        ctx.closePath();
+        ctx.fillStyle = "rgba(0,0,0,0.15)";
+        ctx.fill();
+      }
+    }
+
     // --- Watermark overlay ---
     if (activeTool === "watermark" && watermarkText.trim()) {
       const centerX = vp.width / 2;
@@ -271,6 +338,8 @@
     void editRectPage; void editRectX; void editRectY; void editRectW; void editRectH;
     void editRectBorder; void editRectFill; void editRectHasFill; void editRectBorderW;
     void editHlPage; void editHlX; void editHlY; void editHlW; void editHlH; void editHlColor; void editHlOpacity;
+    void cropPage; void cropX; void cropY; void cropW; void cropH;
+    void annotPage; void annotType; void annotX; void annotY; void annotW; void annotH; void annotColor; void annotOpacity;
     void watermarkText; void watermarkFontSize; void watermarkAngle; void watermarkOpacity; void watermarkColor;
     void signImagePath; void signPage; void signX; void signY; void signWidth; void signHeight;
     void previewPage;
@@ -350,6 +419,34 @@
         editHlY = isClick ? pdfBottom - 20 : pdfBottom;
         editHlW = isClick ? 200 : pdfRight - pdfX;
         editHlH = isClick ? 20 : pdfTop - pdfBottom;
+        break;
+      case "crop":
+        // Crop needs an actual drag; a plain click keeps the current rect
+        if (!isClick) {
+          cropX = pdfX;
+          cropY = pdfBottom;
+          cropW = pdfRight - pdfX;
+          cropH = pdfTop - pdfBottom;
+        }
+        break;
+      case "annotate":
+        if (annotType === "note") {
+          // Sticky note: fixed-size icon placed at the click point
+          annotX = toPdfX(ds.startX);
+          annotY = toPdfY(ds.startY) - 24;
+          annotW = 24;
+          annotH = 24;
+        } else if (annotType === "underline") {
+          annotX = pdfX;
+          annotY = isClick ? pdfBottom - 12 : pdfBottom;
+          annotW = isClick ? 200 : pdfRight - pdfX;
+          annotH = isClick ? 12 : Math.max(6, pdfTop - pdfBottom);
+        } else {
+          annotX = pdfX;
+          annotY = isClick ? pdfBottom - 20 : pdfBottom;
+          annotW = isClick ? 200 : pdfRight - pdfX;
+          annotH = isClick ? 20 : pdfTop - pdfBottom;
+        }
         break;
       case "sign":
         signX = pdfX;
@@ -1256,6 +1353,309 @@
     );
   }
 
+  // ==================== Edit: Crop ====================
+
+  let cropPage = $state(1);
+  let cropX = $state(0);
+  let cropY = $state(0);
+  let cropW = $state(0);
+  let cropH = $state(0);
+  let cropAllPages = $state(false);
+
+  async function executeCrop() {
+    if (!$currentFilePath) return;
+    if (cropW <= 0 || cropH <= 0) return;
+    const pages = cropAllPages
+      ? Array.from({ length: previewPageCount }, (_, i) => i + 1)
+      : [cropPage];
+    await applyEditInPlace(
+      "crop_pages",
+      { pages, x: cropX, y: cropY, width: cropW, height: cropH },
+      `Cropped ${cropAllPages ? "all pages" : `page ${cropPage}`} (in place — Ctrl/Cmd+Z to undo)`,
+    );
+  }
+
+  // ==================== Edit: Annotations ====================
+
+  let annotType = $state<"highlight" | "underline" | "note">("highlight");
+  let annotPage = $state(1);
+  let annotX = $state(100);
+  let annotY = $state(100);
+  let annotW = $state(200);
+  let annotH = $state(20);
+  let annotColor = $state("#ffd54f");
+  let annotOpacity = $state(0.4);
+  let annotText = $state("");
+
+  async function executeAnnotate() {
+    if (!$currentFilePath) return;
+    if (annotW <= 0 || annotH <= 0) return;
+    await applyEditInPlace(
+      "add_annotation",
+      {
+        page: annotPage,
+        annotType,
+        x: annotX,
+        y: annotY,
+        width: annotW,
+        height: annotH,
+        color: annotColor,
+        opacity: annotOpacity,
+        content: annotType === "note" ? annotText : "",
+      },
+      `${annotType === "note" ? "Sticky note" : annotType === "underline" ? "Underline" : "Highlight"} annotation added to page ${annotPage} (Ctrl/Cmd+Z to undo)`,
+    );
+  }
+
+  // ==================== Form Filling ====================
+
+  type FormFieldInfo = {
+    name: string;
+    fieldType: string;
+    value: string;
+    options: string[];
+    pageIndex: number;
+  };
+  let formFields = $state<FormFieldInfo[]>([]);
+  let formValues = $state<Record<string, string>>({});
+  let formLoaded = $state(false);
+
+  async function loadFormFields() {
+    const path = $currentFilePath;
+    if (!path) return;
+    busy = true;
+    resultMsg = "";
+    try {
+      const fields = await invoke<FormFieldInfo[]>("get_form_fields", { path });
+      formFields = fields;
+      const initial: Record<string, string> = {};
+      for (const f of fields) {
+        if (f.fieldType === "checkbox") {
+          initial[f.name] = f.value === "Yes" || f.value === "true" ? "true" : "false";
+        } else {
+          initial[f.name] = f.value ?? "";
+        }
+      }
+      formValues = initial;
+      formLoaded = true;
+      resultMsg = `Loaded ${fields.length} form field(s)`;
+      resultOk = true;
+    } catch (e) {
+      formFields = [];
+      formLoaded = true;
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function executeFillForm() {
+    const path = $currentFilePath;
+    if (!path) return;
+    busy = true;
+    resultMsg = "";
+    try {
+      const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
+      if (!out) return;
+      const outPath = out as string;
+      // Skip untouched text fields (empty) so existing values are preserved
+      const values = formFields
+        .map((f) => ({ name: f.name, value: formValues[f.name] ?? "" }))
+        .filter((v) => v.value !== "");
+      await invoke("fill_form", {
+        req: { inputPath: path, outputPath: outPath, values },
+      });
+      resultMsg = `Form filled → ${outPath.split(/[\\/]/).pop()}`;
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      busy = false;
+    }
+  }
+
+  // ==================== Replace Text (overlay style) ====================
+
+  type TextMatch = {
+    page: number;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    baselineY: number;
+    fontSize: number;
+    text: string;
+    selected: boolean;
+  };
+  let replaceQuery = $state("");
+  let replaceWith = $state("");
+  let replaceMatches = $state<TextMatch[]>([]);
+  let replaceSearching = $state(false);
+
+  async function findReplaceMatches() {
+    const path = $currentFilePath;
+    const query = replaceQuery.trim();
+    if (!path || !query) return;
+    replaceSearching = true;
+    resultMsg = "";
+    try {
+      const data = await readFile(path);
+      const doc = await loadPdf(new Uint8Array(data));
+      const q = query.toLowerCase();
+      const matches: TextMatch[] = [];
+
+      for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        const content = await page.getTextContent();
+
+        // Build page text + per-char positions (PDF coords, y-axis up)
+        let pageText = "";
+        const chars: Array<{ x: number; xEnd: number; baselineY: number; fontSize: number }> = [];
+        for (const item of content.items as Array<Record<string, unknown>>) {
+          const str = typeof item.str === "string" ? (item.str as string) : "";
+          if (!str) continue;
+          const tr = item.transform as number[];
+          const fontSize = Math.hypot(tr[1], tr[3]) || Math.abs(tr[3]) || 10;
+          if (Math.abs(tr[1]) > 0.001) {
+            // Rotated text: placeholder chars keep indices aligned with pageText
+            for (const _ of str) {
+              pageText += "\u0000";
+              chars.push({ x: NaN, xEnd: NaN, baselineY: NaN, fontSize });
+            }
+            continue;
+          }
+          const width = typeof item.width === "number" ? (item.width as number) : str.length * fontSize * 0.5;
+          const per = str.length ? width / str.length : 0;
+          for (let k = 0; k < str.length; k++) {
+            chars.push({ x: tr[4] + k * per, xEnd: tr[4] + (k + 1) * per, baselineY: tr[5], fontSize });
+            pageText += str[k];
+          }
+        }
+
+        const lower = pageText.toLowerCase();
+        let pos = 0;
+        while ((pos = lower.indexOf(q, pos)) !== -1) {
+          const seg = chars.slice(pos, pos + query.length);
+          if (seg.length === query.length && seg.every((c) => Number.isFinite(c.x))) {
+            const minX = Math.min(...seg.map((c) => c.x));
+            const maxX = Math.max(...seg.map((c) => c.xEnd));
+            const first = seg[0];
+            const bottom = first.baselineY - first.fontSize * 0.25;
+            const top = first.baselineY + first.fontSize * 1.0;
+            matches.push({
+              page: i,
+              x: minX - 1,
+              y: bottom,
+              width: maxX - minX + 2,
+              height: top - bottom,
+              baselineY: first.baselineY,
+              fontSize: first.fontSize,
+              text: pageText.slice(pos, pos + query.length),
+              selected: true,
+            });
+          }
+          pos += query.length;
+        }
+      }
+
+      replaceMatches = matches;
+      resultMsg = matches.length ? `Found ${matches.length} match(es)` : "No matches found";
+      resultOk = matches.length > 0;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      replaceSearching = false;
+    }
+  }
+
+  async function executeReplaceText() {
+    const selected = replaceMatches.filter((m) => m.selected);
+    if (!selected.length) return;
+    await applyEditInPlace(
+      "replace_text",
+      {
+        replacements: selected.map((m) => ({
+          page: m.page,
+          coverX: m.x,
+          coverY: m.y,
+          coverWidth: m.width,
+          coverHeight: m.height,
+          baselineY: m.baselineY,
+          fontSize: m.fontSize,
+          newText: replaceWith,
+        })),
+      },
+      `Replaced ${selected.length} occurrence(s) (Ctrl/Cmd+Z to undo)`,
+    );
+  }
+
+  // ==================== Security: Encrypt / Decrypt ====================
+
+  let securityMode = $state<"encrypt" | "decrypt">("encrypt");
+  let secOwnerPassword = $state("");
+  let secUserPassword = $state("");
+  let secAllowPrinting = $state(true);
+  let secAllowModifying = $state(true);
+  let secAllowCopying = $state(true);
+  let secAllowAnnotating = $state(true);
+  let decryptPassword = $state("");
+
+  async function executeEncryptPdf() {
+    const path = $currentFilePath;
+    if (!path || !secOwnerPassword) return;
+    busy = true;
+    resultMsg = "";
+    try {
+      const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
+      if (!out) return;
+      const outPath = out as string;
+      await invoke("encrypt_pdf", {
+        req: {
+          inputPath: path,
+          outputPath: outPath,
+          ownerPassword: secOwnerPassword,
+          userPassword: secUserPassword || null,
+          allowPrinting: secAllowPrinting,
+          allowModifying: secAllowModifying,
+          allowCopying: secAllowCopying,
+          allowAnnotating: secAllowAnnotating,
+        },
+      });
+      resultMsg = `Encrypted → ${outPath.split(/[\\/]/).pop()}`;
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function executeDecryptPdf() {
+    const path = $currentFilePath;
+    if (!path) return;
+    busy = true;
+    resultMsg = "";
+    try {
+      const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
+      if (!out) return;
+      const outPath = out as string;
+      await invoke("decrypt_pdf", {
+        req: { inputPath: path, outputPath: outPath, password: decryptPassword || null },
+      });
+      resultMsg = `Decrypted → ${outPath.split(/[\\/]/).pop()}`;
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      busy = false;
+    }
+  }
+
   // ==================== Navigation ====================
 
   async function openFileForTool() {
@@ -1314,6 +1714,8 @@
     if (activeTool === "editText" && pageNum === editTextPage) return `${base} border-blue-500`;
     if (activeTool === "editRect" && pageNum === editRectPage) return `${base} border-blue-500`;
     if (activeTool === "editHighlight" && pageNum === editHlPage) return `${base} border-blue-500`;
+    if (activeTool === "crop" && pageNum === cropPage) return `${base} border-blue-500`;
+    if (activeTool === "annotate" && pageNum === annotPage) return `${base} border-blue-500`;
     if (activeTool === "sign" && pageNum === signPage) return `${base} border-blue-500`;
     if (activeTool === "table" && pageNum === tablePage) return `${base} border-blue-500`;
     return `${base} border-transparent`;
@@ -1323,6 +1725,8 @@
     activeTool === "editText" ? editTextPage :
     activeTool === "editRect" ? editRectPage :
     activeTool === "editHighlight" ? editHlPage :
+    activeTool === "crop" ? cropPage :
+    activeTool === "annotate" ? annotPage :
     activeTool === "sign" ? signPage :
     1
   );
@@ -2346,6 +2750,281 @@
               <Button onclick={executeEditHighlight} disabled={busy}>
                 {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Save size={14} class="mr-1.5" />Add Highlight}{/if}
               </Button>
+            {/if}
+          </div>
+        {/if}
+
+        {#if activeTool === "crop"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" onclick={openFileForTool}>
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+              </div>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                Drag on the preview to select the area to keep:
+                <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong>
+              </p>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={cropPage} onchange={(e) => (cropPage = parseInt((e.target as HTMLInputElement).value) || 1)} /></div>
+                <div class="space-y-1 flex items-end">
+                  <label class="flex items-center gap-2 text-sm cursor-pointer">
+                    <input type="checkbox" bind:checked={cropAllPages} class="accent-blue-500" />
+                    Apply to all pages
+                  </label>
+                </div>
+                <div class="space-y-1"><Label>X</Label><Input type="number" value={cropX} onchange={(e) => (cropX = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Y</Label><Input type="number" value={cropY} onchange={(e) => (cropY = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Width</Label><Input type="number" value={cropW} onchange={(e) => (cropW = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Height</Label><Input type="number" value={cropH} onchange={(e) => (cropH = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+              </div>
+              <Button onclick={executeCrop} disabled={busy || cropW <= 0 || cropH <= 0}>
+                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Crop size={14} class="mr-1.5" />{cropAllPages ? "Crop All Pages" : "Crop Page"}{/if}
+              </Button>
+            {/if}
+          </div>
+        {/if}
+
+        {#if activeTool === "annotate"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" onclick={openFileForTool}>
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+              </div>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                Add annotation to <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong> — real PDF annotations, visible in any reader.
+              </p>
+              <div class="flex gap-2">
+                {#each [["highlight", "Highlight"], ["underline", "Underline"], ["note", "Sticky Note"]] as [tp, label]}
+                  <button
+                    class="px-3 py-1.5 rounded-md border text-sm transition-colors {annotType === tp ? 'bg-primary text-primary-foreground border-primary' : 'border-border hover:bg-accent'}"
+                    onclick={() => {
+                      annotType = tp as typeof annotType;
+                      if (tp === "note") { annotW = 24; annotH = 24; }
+                    }}
+                  >{label}</button>
+                {/each}
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={annotPage} onchange={(e) => (annotPage = parseInt((e.target as HTMLInputElement).value) || 1)} /></div>
+                {#if annotType === "highlight"}
+                  <div class="space-y-1"><Label>Opacity (0-1)</Label><Input type="number" step="0.05" min="0" max="1" value={annotOpacity} onchange={(e) => (annotOpacity = parseFloat((e.target as HTMLInputElement).value) || 0.4)} /></div>
+                {/if}
+                <div class="space-y-1"><Label>X</Label><Input type="number" value={annotX} onchange={(e) => (annotX = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Y</Label><Input type="number" value={annotY} onchange={(e) => (annotY = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Width</Label><Input type="number" value={annotW} onchange={(e) => (annotW = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Height</Label><Input type="number" value={annotH} onchange={(e) => (annotH = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+              </div>
+              <div class="space-y-1">
+                <Label>Color</Label>
+                <div class="flex items-center gap-2">
+                  <input type="color" bind:value={annotColor} class="w-8 h-8 rounded cursor-pointer" />
+                  <Input value={annotColor} onchange={(e) => (annotColor = (e.target as HTMLInputElement).value)} class="w-24" />
+                </div>
+              </div>
+              {#if annotType === "note"}
+                <div class="space-y-1">
+                  <Label>Note text</Label>
+                  <textarea
+                    bind:value={annotText}
+                    rows="3"
+                    class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    placeholder="Text shown when the note is opened"
+                  ></textarea>
+                </div>
+              {/if}
+              <Button onclick={executeAnnotate} disabled={busy || annotW <= 0 || annotH <= 0}>
+                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_StickyNote size={14} class="mr-1.5" />Add Annotation}{/if}
+              </Button>
+            {/if}
+          </div>
+        {/if}
+
+        {#if activeTool === "form"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" onclick={openFileForTool}>
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+              </div>
+            {:else if !formLoaded}
+              <p class="text-sm text-muted-foreground">
+                Read AcroForm fields from <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong>
+              </p>
+              <Button onclick={loadFormFields} disabled={busy}>
+                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_ClipboardList size={14} class="mr-1.5" />Load Form Fields}{/if}
+              </Button>
+            {:else if formFields.length === 0}
+              <p class="text-sm text-muted-foreground">No fillable form fields found in this PDF.</p>
+              <Button variant="outline" size="sm" onclick={loadFormFields} disabled={busy}>Reload</Button>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                {formFields.length} field(s) — fill and save as a new file:
+              </p>
+              <div class="space-y-3 max-h-96 overflow-auto pr-1">
+                {#each formFields as f (f.name)}
+                  {#if f.fieldType === "text"}
+                    <div class="space-y-1">
+                      <Label>{f.name}</Label>
+                      <Input bind:value={formValues[f.name]} placeholder={f.name} />
+                    </div>
+                  {:else if f.fieldType === "checkbox"}
+                    <label class="flex items-center gap-2 text-sm cursor-pointer">
+                      <input
+                        type="checkbox"
+                        class="accent-blue-500"
+                        checked={formValues[f.name] === "true"}
+                        onchange={(e) => (formValues[f.name] = (e.target as HTMLInputElement).checked ? "true" : "false")}
+                      />
+                      {f.name}
+                    </label>
+                  {:else if f.fieldType === "radio" || f.fieldType === "choice"}
+                    <div class="space-y-1">
+                      <Label>{f.name}</Label>
+                      <select
+                        bind:value={formValues[f.name]}
+                        class="flex w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      >
+                        {#each f.options as opt (opt)}
+                          <option value={opt}>{opt}</option>
+                        {/each}
+                      </select>
+                    </div>
+                  {:else}
+                    <p class="text-xs text-muted-foreground">{f.name} ({f.fieldType}) — not fillable</p>
+                  {/if}
+                {/each}
+              </div>
+              <div class="flex gap-2">
+                <Button onclick={executeFillForm} disabled={busy}>
+                  {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Save size={14} class="mr-1.5" />Fill &amp; Save As}{/if}
+                </Button>
+                <Button variant="outline" size="sm" onclick={loadFormFields} disabled={busy}>Reload</Button>
+              </div>
+            {/if}
+          </div>
+        {/if}
+
+        {#if activeTool === "replaceText"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" onclick={openFileForTool}>
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+              </div>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                Overlay replacement in <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong> — original text is covered and new text drawn at the same position.
+              </p>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="space-y-1"><Label>Find</Label><Input bind:value={replaceQuery} placeholder="text to find" /></div>
+                <div class="space-y-1"><Label>Replace with</Label><Input bind:value={replaceWith} placeholder="replacement text" /></div>
+              </div>
+              <Button onclick={findReplaceMatches} disabled={busy || replaceSearching || !replaceQuery.trim()}>
+                {#if replaceSearching}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Replace size={14} class="mr-1.5" />Find Matches}{/if}
+              </Button>
+              {#if replaceMatches.length > 0}
+                <div class="flex items-center justify-between">
+                  <span class="text-sm text-muted-foreground">{replaceMatches.filter((m) => m.selected).length} / {replaceMatches.length} selected</span>
+                  <div class="flex gap-2">
+                    <button class="text-xs underline text-muted-foreground hover:text-foreground"
+                      onclick={() => (replaceMatches = replaceMatches.map((m) => ({ ...m, selected: true })))}
+                    >Select all</button>
+                    <button class="text-xs underline text-muted-foreground hover:text-foreground"
+                      onclick={() => (replaceMatches = replaceMatches.map((m) => ({ ...m, selected: false })))}
+                    >Clear</button>
+                  </div>
+                </div>
+                <div class="space-y-1.5 max-h-72 overflow-auto pr-1">
+                  {#each replaceMatches as m, idx (idx)}
+                    <label class="flex items-center gap-2 text-sm cursor-pointer p-1.5 rounded hover:bg-accent">
+                      <input
+                        type="checkbox"
+                        class="accent-blue-500"
+                        checked={m.selected}
+                        onchange={(e) => (replaceMatches = replaceMatches.map((mm, i) => i === idx ? { ...mm, selected: (e.target as HTMLInputElement).checked } : mm))}
+                      />
+                      <span class="text-xs text-muted-foreground shrink-0">p.{m.page}</span>
+                      <span class="truncate font-mono">“{m.text}”</span>
+                    </label>
+                  {/each}
+                </div>
+                <Button onclick={executeReplaceText} disabled={busy || replaceMatches.every((m) => !m.selected)}>
+                  {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Replace size={14} class="mr-1.5" />Replace Selected}{/if}
+                </Button>
+              {/if}
+            {/if}
+          </div>
+        {/if}
+
+        {#if activeTool === "security"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" onclick={openFileForTool}>
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+              </div>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong>
+              </p>
+              <div class="flex gap-2">
+                {#each [["encrypt", "Encrypt"], ["decrypt", "Decrypt"]] as [mode, label]}
+                  <button
+                    class="px-3 py-1.5 rounded-md border text-sm transition-colors {securityMode === mode ? 'bg-primary text-primary-foreground border-primary' : 'border-border hover:bg-accent'}"
+                    onclick={() => (securityMode = mode as typeof securityMode)}
+                  >{label}</button>
+                {/each}
+              </div>
+
+              {#if securityMode === "encrypt"}
+                <div class="space-y-1">
+                  <Label>Owner password (required)</Label>
+                  <Input type="password" bind:value={secOwnerPassword} autocomplete="new-password" />
+                </div>
+                <div class="space-y-1">
+                  <Label>User password (optional — needed to open the file)</Label>
+                  <Input type="password" bind:value={secUserPassword} autocomplete="new-password" />
+                </div>
+                <div class="space-y-1.5">
+                  <Label>Permissions</Label>
+                  <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" bind:checked={secAllowPrinting} class="accent-blue-500" />Allow printing</label>
+                  <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" bind:checked={secAllowModifying} class="accent-blue-500" />Allow modifying</label>
+                  <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" bind:checked={secAllowCopying} class="accent-blue-500" />Allow copying text</label>
+                  <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" bind:checked={secAllowAnnotating} class="accent-blue-500" />Allow annotating</label>
+                </div>
+                <p class="text-xs text-muted-foreground">RC4 128-bit standard security handler (PDF V2/R3)</p>
+                <Button onclick={executeEncryptPdf} disabled={busy || !secOwnerPassword}>
+                  {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_ShieldCheck size={14} class="mr-1.5" />Encrypt &amp; Save As}{/if}
+                </Button>
+              {:else}
+                <div class="space-y-1">
+                  <Label>Password (user or owner; leave empty for password-less user access)</Label>
+                  <Input type="password" bind:value={decryptPassword} autocomplete="off" />
+                </div>
+                <p class="text-xs text-muted-foreground">Only RC4-encrypted PDFs (V2/R3) are supported</p>
+                <Button onclick={executeDecryptPdf} disabled={busy}>
+                  {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_ShieldCheck size={14} class="mr-1.5" />Decrypt &amp; Save As}{/if}
+                </Button>
+              {/if}
             {/if}
           </div>
         {/if}
