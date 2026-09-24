@@ -46,6 +46,8 @@ pub fn run() {
             commands::pdf_ops::get_form_fields,
             commands::pdf_ops::fill_form,
             commands::pdf_ops::replace_text,
+            commands::security::encrypt_pdf,
+            commands::security::decrypt_pdf,
             commands::fs_utils::list_dir_files,
             commands::s3_ops::s3_test_connection,
             commands::s3_ops::s3_list_files,

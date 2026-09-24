@@ -37,6 +37,7 @@
     StickyNote as Icon_StickyNote,
     ClipboardList as Icon_ClipboardList,
     Replace as Icon_Replace,
+    ShieldCheck as Icon_ShieldCheck,
   } from "lucide-svelte";
   import { loadPdf, renderPageToCanvas, type PdfDocumentProxy } from "@/pdf-engine";
   import { tick } from "svelte";
@@ -46,7 +47,7 @@
     | "compress" | "watermark" | "img2pdf" | "pdf2img"
     | "pdf2text" | "sign" | "ocr" | "table"
     | "editText" | "editRect" | "editHighlight" | "crop" | "annotate" | "form"
-    | "replaceText";
+    | "replaceText" | "security";
 
   let activeTool: ToolId | null = $state(null);
   let busy = $state(false);
@@ -116,6 +117,7 @@
     { id: "annotate", icon: Icon_StickyNote, labelKey: "tools.annotate", ready: true, hasPreview: true },
     { id: "form", icon: Icon_ClipboardList, labelKey: "tools.form", ready: true, hasPreview: false },
     { id: "replaceText", icon: Icon_Replace, labelKey: "tools.replaceText", ready: true, hasPreview: false },
+    { id: "security", icon: Icon_ShieldCheck, labelKey: "tools.security", ready: true, hasPreview: false },
     { id: "table", icon: Icon_Table, labelKey: "tools.extractTable", ready: true, hasPreview: true },
   ];
 
@@ -1590,6 +1592,70 @@
     );
   }
 
+  // ==================== Security: Encrypt / Decrypt ====================
+
+  let securityMode = $state<"encrypt" | "decrypt">("encrypt");
+  let secOwnerPassword = $state("");
+  let secUserPassword = $state("");
+  let secAllowPrinting = $state(true);
+  let secAllowModifying = $state(true);
+  let secAllowCopying = $state(true);
+  let secAllowAnnotating = $state(true);
+  let decryptPassword = $state("");
+
+  async function executeEncryptPdf() {
+    const path = $currentFilePath;
+    if (!path || !secOwnerPassword) return;
+    busy = true;
+    resultMsg = "";
+    try {
+      const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
+      if (!out) return;
+      const outPath = out as string;
+      await invoke("encrypt_pdf", {
+        req: {
+          inputPath: path,
+          outputPath: outPath,
+          ownerPassword: secOwnerPassword,
+          userPassword: secUserPassword || null,
+          allowPrinting: secAllowPrinting,
+          allowModifying: secAllowModifying,
+          allowCopying: secAllowCopying,
+          allowAnnotating: secAllowAnnotating,
+        },
+      });
+      resultMsg = `Encrypted → ${outPath.split(/[\\/]/).pop()}`;
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function executeDecryptPdf() {
+    const path = $currentFilePath;
+    if (!path) return;
+    busy = true;
+    resultMsg = "";
+    try {
+      const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
+      if (!out) return;
+      const outPath = out as string;
+      await invoke("decrypt_pdf", {
+        req: { inputPath: path, outputPath: outPath, password: decryptPassword || null },
+      });
+      resultMsg = `Decrypted → ${outPath.split(/[\\/]/).pop()}`;
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      busy = false;
+    }
+  }
+
   // ==================== Navigation ====================
 
   async function openFileForTool() {
@@ -2900,6 +2966,63 @@
                 </div>
                 <Button onclick={executeReplaceText} disabled={busy || replaceMatches.every((m) => !m.selected)}>
                   {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Replace size={14} class="mr-1.5" />Replace Selected}{/if}
+                </Button>
+              {/if}
+            {/if}
+          </div>
+        {/if}
+
+        {#if activeTool === "security"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" onclick={openFileForTool}>
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+              </div>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong>
+              </p>
+              <div class="flex gap-2">
+                {#each [["encrypt", "Encrypt"], ["decrypt", "Decrypt"]] as [mode, label]}
+                  <button
+                    class="px-3 py-1.5 rounded-md border text-sm transition-colors {securityMode === mode ? 'bg-primary text-primary-foreground border-primary' : 'border-border hover:bg-accent'}"
+                    onclick={() => (securityMode = mode as typeof securityMode)}
+                  >{label}</button>
+                {/each}
+              </div>
+
+              {#if securityMode === "encrypt"}
+                <div class="space-y-1">
+                  <Label>Owner password (required)</Label>
+                  <Input type="password" bind:value={secOwnerPassword} autocomplete="new-password" />
+                </div>
+                <div class="space-y-1">
+                  <Label>User password (optional — needed to open the file)</Label>
+                  <Input type="password" bind:value={secUserPassword} autocomplete="new-password" />
+                </div>
+                <div class="space-y-1.5">
+                  <Label>Permissions</Label>
+                  <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" bind:checked={secAllowPrinting} class="accent-blue-500" />Allow printing</label>
+                  <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" bind:checked={secAllowModifying} class="accent-blue-500" />Allow modifying</label>
+                  <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" bind:checked={secAllowCopying} class="accent-blue-500" />Allow copying text</label>
+                  <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" bind:checked={secAllowAnnotating} class="accent-blue-500" />Allow annotating</label>
+                </div>
+                <p class="text-xs text-muted-foreground">RC4 128-bit standard security handler (PDF V2/R3)</p>
+                <Button onclick={executeEncryptPdf} disabled={busy || !secOwnerPassword}>
+                  {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_ShieldCheck size={14} class="mr-1.5" />Encrypt &amp; Save As}{/if}
+                </Button>
+              {:else}
+                <div class="space-y-1">
+                  <Label>Password (user or owner; leave empty for password-less user access)</Label>
+                  <Input type="password" bind:value={decryptPassword} autocomplete="off" />
+                </div>
+                <p class="text-xs text-muted-foreground">Only RC4-encrypted PDFs (V2/R3) are supported</p>
+                <Button onclick={executeDecryptPdf} disabled={busy}>
+                  {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_ShieldCheck size={14} class="mr-1.5" />Decrypt &amp; Save As}{/if}
                 </Button>
               {/if}
             {/if}
