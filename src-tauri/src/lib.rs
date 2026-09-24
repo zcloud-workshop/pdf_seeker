@@ -41,6 +41,7 @@ pub fn run() {
             commands::pdf_ops::add_text_to_page,
             commands::pdf_ops::add_rectangle,
             commands::pdf_ops::add_highlight,
+            commands::pdf_ops::crop_pages,
             commands::fs_utils::list_dir_files,
             commands::s3_ops::s3_test_connection,
             commands::s3_ops::s3_list_files,

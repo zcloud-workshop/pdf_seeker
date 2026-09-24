@@ -232,6 +232,14 @@ fn get_page_size(page_dict: &lopdf::Dictionary) -> (f64, f64) {
         .unwrap_or((612.0, 792.0))
 }
 
+fn obj_as_f64(o: &Object) -> Option<f64> {
+    match o {
+        Object::Integer(i) => Some(*i as f64),
+        Object::Real(r) => Some(*r as f64),
+        _ => None,
+    }
+}
+
 #[tauri::command]
 pub fn merge_pdfs(paths: Vec<String>, output_path: String) -> AppResult<()> {
     if paths.is_empty() {
@@ -1251,6 +1259,73 @@ pub fn add_highlight(req: AddHighlightRequest) -> AppResult<()> {
     save_doc(&mut doc, &req.output_path)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CropPagesRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub pages: Vec<u32>,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Crop the given pages to the rectangle (x, y, width, height) in PDF points
+/// (origin at the lower-left corner). The rectangle is clamped to the page
+/// MediaBox; the CropBox is overwritten for the selected pages only.
+#[tauri::command]
+pub fn crop_pages(req: CropPagesRequest) -> AppResult<()> {
+    if req.pages.is_empty() {
+        return Err("No pages selected".into());
+    }
+    if req.width <= 0.0 || req.height <= 0.0 {
+        return Err("Crop area must be non-empty".into());
+    }
+
+    let mut doc = load_doc(&req.input_path)?;
+    let all_pages = doc.get_pages();
+
+    for &page_num in &req.pages {
+        let page_id = all_pages.get(&page_num)
+            .ok_or(format!("Page {} not found", page_num))?;
+
+        // MediaBox of the page (page-level value; fall back to the default
+        // used by get_page_size when inherited)
+        let media = {
+            let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
+            let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+            page_dict.get(b"MediaBox").ok()
+                .and_then(|mb| mb.as_array().ok())
+                .map(|arr| {
+                    let g = |i: usize, d: f64| arr.get(i).and_then(obj_as_f64).unwrap_or(d);
+                    (g(0, 0.0), g(1, 0.0), g(2, 612.0), g(3, 792.0))
+                })
+                .unwrap_or((0.0, 0.0, 612.0, 792.0))
+        };
+
+        // Clamp the requested rectangle to the MediaBox intersection
+        let cx0 = req.x.max(media.0);
+        let cy0 = req.y.max(media.1);
+        let cx1 = (req.x + req.width).min(media.2);
+        let cy1 = (req.y + req.height).min(media.3);
+        if cx1 - cx0 <= 0.0 || cy1 - cy0 <= 0.0 {
+            return Err(format!("Crop area for page {} is outside the MediaBox", page_num));
+        }
+
+        let page_obj = doc.objects.get_mut(page_id).unwrap();
+        let dict = page_obj.as_dict_mut().map_err(|e| format!("Page dict error: {}", e))?;
+        dict.set("CropBox", Object::Array(vec![
+            Object::Real(cx0 as f32),
+            Object::Real(cy0 as f32),
+            Object::Real(cx1 as f32),
+            Object::Real(cy1 as f32),
+        ]));
+    }
+
+    save_doc(&mut doc, &req.output_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1406,5 +1481,72 @@ mod tests {
             }
             Err(_) => {} // Also acceptable
         }
+    }
+
+    #[test]
+    fn test_crop_pages() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "c.pdf", 2);
+        let out = dir.path().join("cropped.pdf");
+        let out_str = out.to_string_lossy().to_string();
+
+        crop_pages(CropPagesRequest {
+            input_path: src,
+            output_path: out_str.clone(),
+            pages: vec![1],
+            x: 50.0,
+            y: 100.0,
+            width: 400.0,
+            height: 500.0,
+        })
+        .unwrap();
+
+        let doc = Document::load(&out_str).unwrap();
+        let pages = doc.get_pages();
+
+        // Page 1 has the new CropBox
+        let id1 = *pages.get(&1).unwrap();
+        let dict1 = doc.get_object(id1).unwrap().as_dict().unwrap();
+        let cb = dict1.get(b"CropBox").unwrap().as_array().unwrap();
+        let vals: Vec<f64> = cb.iter().map(|o| obj_as_f64(o).unwrap()).collect();
+        assert!((vals[0] - 50.0).abs() < 0.1, "x0 = {}", vals[0]);
+        assert!((vals[1] - 100.0).abs() < 0.1, "y0 = {}", vals[1]);
+        assert!((vals[2] - 450.0).abs() < 0.1, "x1 = {}", vals[2]);
+        assert!((vals[3] - 600.0).abs() < 0.1, "y1 = {}", vals[3]);
+
+        // Page 2 is untouched
+        let id2 = *pages.get(&2).unwrap();
+        let dict2 = doc.get_object(id2).unwrap().as_dict().unwrap();
+        assert!(dict2.get(b"CropBox").is_err());
+    }
+
+    #[test]
+    fn test_crop_outside_mediabox_fails() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "co.pdf", 1);
+
+        // Rect completely outside the 612x792 MediaBox
+        let result = crop_pages(CropPagesRequest {
+            input_path: src,
+            output_path: dir.path().join("nope.pdf").to_string_lossy().to_string(),
+            pages: vec![1],
+            x: 700.0,
+            y: 800.0,
+            width: 100.0,
+            height: 100.0,
+        });
+        assert!(result.is_err());
+
+        // Zero-size crop also fails
+        let result = crop_pages(CropPagesRequest {
+            input_path: create_test_pdf(dir.path(), "cz.pdf", 1),
+            output_path: dir.path().join("nope2.pdf").to_string_lossy().to_string(),
+            pages: vec![1],
+            x: 10.0,
+            y: 10.0,
+            width: 0.0,
+            height: 10.0,
+        });
+        assert!(result.is_err());
     }
 }

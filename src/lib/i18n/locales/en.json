@@ -93,6 +93,7 @@
     "editText": "Add Text",
     "editRect": "Rectangle",
     "editHighlight": "Highlight",
+    "crop": "Crop Pages",
     "extractTable": "Extract Table",
     "preview": "Preview",
     "openPdf": "Open PDF",

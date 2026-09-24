@@ -33,6 +33,7 @@
     ListOrdered as Icon_ListOrdered,
     Undo2 as Icon_Undo2,
     Redo2 as Icon_Redo2,
+    Crop as Icon_Crop,
   } from "lucide-svelte";
   import { loadPdf, renderPageToCanvas, type PdfDocumentProxy } from "@/pdf-engine";
   import { tick } from "svelte";
@@ -41,7 +42,7 @@
     | "merge" | "split" | "rotate" | "reorder" | "delete" | "extractPages"
     | "compress" | "watermark" | "img2pdf" | "pdf2img"
     | "pdf2text" | "sign" | "ocr" | "table"
-    | "editText" | "editRect" | "editHighlight";
+    | "editText" | "editRect" | "editHighlight" | "crop";
 
   let activeTool: ToolId | null = $state(null);
   let busy = $state(false);
@@ -67,7 +68,7 @@
   let thumbStripContainer = $state<HTMLDivElement | undefined>(undefined);
 
   function isEditingTool(id: ToolId | null): boolean {
-    return !!id && ["editText", "editRect", "editHighlight", "sign", "watermark"].includes(id);
+    return !!id && ["editText", "editRect", "editHighlight", "crop", "sign", "watermark"].includes(id);
   }
 
   function setPreviewPage(p: number) {
@@ -76,6 +77,7 @@
       case "editText": editTextPage = p; break;
       case "editRect": editRectPage = p; break;
       case "editHighlight": editHlPage = p; break;
+      case "crop": cropPage = p; break;
       case "sign": signPage = p; break;
       case "table": tablePage = p; break;
     }
@@ -105,6 +107,7 @@
     { id: "editText", icon: Icon_Pencil, labelKey: "tools.editText", ready: true, hasPreview: true },
     { id: "editRect", icon: Icon_Square, labelKey: "tools.editRect", ready: true, hasPreview: true },
     { id: "editHighlight", icon: Icon_Highlighter, labelKey: "tools.editHighlight", ready: true, hasPreview: true },
+    { id: "crop", icon: Icon_Crop, labelKey: "tools.crop", ready: true, hasPreview: true },
     { id: "table", icon: Icon_Table, labelKey: "tools.extractTable", ready: true, hasPreview: true },
   ];
 
@@ -235,6 +238,25 @@
       ctx.globalAlpha = 1.0;
     }
 
+    // --- Crop overlay: dim outside the crop area ---
+    if (activeTool === "crop" && cropW > 0 && cropH > 0) {
+      const cx = toX(cropX);
+      const cy = toY(cropY + cropH);
+      const cw = cropW * scale;
+      const ch = cropH * scale;
+      ctx.save();
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      ctx.fillRect(0, 0, vp.width, cy);
+      ctx.fillRect(0, cy + ch, vp.width, vp.height - cy - ch);
+      ctx.fillRect(0, cy, cx, ch);
+      ctx.fillRect(cx + cw, cy, vp.width - cx - cw, ch);
+      ctx.strokeStyle = "#3b82f6";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(cx, cy, cw, ch);
+      ctx.restore();
+    }
+
     // --- Watermark overlay ---
     if (activeTool === "watermark" && watermarkText.trim()) {
       const centerX = vp.width / 2;
@@ -271,6 +293,7 @@
     void editRectPage; void editRectX; void editRectY; void editRectW; void editRectH;
     void editRectBorder; void editRectFill; void editRectHasFill; void editRectBorderW;
     void editHlPage; void editHlX; void editHlY; void editHlW; void editHlH; void editHlColor; void editHlOpacity;
+    void cropPage; void cropX; void cropY; void cropW; void cropH;
     void watermarkText; void watermarkFontSize; void watermarkAngle; void watermarkOpacity; void watermarkColor;
     void signImagePath; void signPage; void signX; void signY; void signWidth; void signHeight;
     void previewPage;
@@ -350,6 +373,15 @@
         editHlY = isClick ? pdfBottom - 20 : pdfBottom;
         editHlW = isClick ? 200 : pdfRight - pdfX;
         editHlH = isClick ? 20 : pdfTop - pdfBottom;
+        break;
+      case "crop":
+        // Crop needs an actual drag; a plain click keeps the current rect
+        if (!isClick) {
+          cropX = pdfX;
+          cropY = pdfBottom;
+          cropW = pdfRight - pdfX;
+          cropH = pdfTop - pdfBottom;
+        }
         break;
       case "sign":
         signX = pdfX;
@@ -1256,6 +1288,28 @@
     );
   }
 
+  // ==================== Edit: Crop ====================
+
+  let cropPage = $state(1);
+  let cropX = $state(0);
+  let cropY = $state(0);
+  let cropW = $state(0);
+  let cropH = $state(0);
+  let cropAllPages = $state(false);
+
+  async function executeCrop() {
+    if (!$currentFilePath) return;
+    if (cropW <= 0 || cropH <= 0) return;
+    const pages = cropAllPages
+      ? Array.from({ length: previewPageCount }, (_, i) => i + 1)
+      : [cropPage];
+    await applyEditInPlace(
+      "crop_pages",
+      { pages, x: cropX, y: cropY, width: cropW, height: cropH },
+      `Cropped ${cropAllPages ? "all pages" : `page ${cropPage}`} (in place — Ctrl/Cmd+Z to undo)`,
+    );
+  }
+
   // ==================== Navigation ====================
 
   async function openFileForTool() {
@@ -1314,6 +1368,7 @@
     if (activeTool === "editText" && pageNum === editTextPage) return `${base} border-blue-500`;
     if (activeTool === "editRect" && pageNum === editRectPage) return `${base} border-blue-500`;
     if (activeTool === "editHighlight" && pageNum === editHlPage) return `${base} border-blue-500`;
+    if (activeTool === "crop" && pageNum === cropPage) return `${base} border-blue-500`;
     if (activeTool === "sign" && pageNum === signPage) return `${base} border-blue-500`;
     if (activeTool === "table" && pageNum === tablePage) return `${base} border-blue-500`;
     return `${base} border-transparent`;
@@ -1323,6 +1378,7 @@
     activeTool === "editText" ? editTextPage :
     activeTool === "editRect" ? editRectPage :
     activeTool === "editHighlight" ? editHlPage :
+    activeTool === "crop" ? cropPage :
     activeTool === "sign" ? signPage :
     1
   );
@@ -2345,6 +2401,41 @@
               </div>
               <Button onclick={executeEditHighlight} disabled={busy}>
                 {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Save size={14} class="mr-1.5" />Add Highlight}{/if}
+              </Button>
+            {/if}
+          </div>
+        {/if}
+
+        {#if activeTool === "crop"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" onclick={openFileForTool}>
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+              </div>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                Drag on the preview to select the area to keep:
+                <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong>
+              </p>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={cropPage} onchange={(e) => (cropPage = parseInt((e.target as HTMLInputElement).value) || 1)} /></div>
+                <div class="space-y-1 flex items-end">
+                  <label class="flex items-center gap-2 text-sm cursor-pointer">
+                    <input type="checkbox" bind:checked={cropAllPages} class="accent-blue-500" />
+                    Apply to all pages
+                  </label>
+                </div>
+                <div class="space-y-1"><Label>X</Label><Input type="number" value={cropX} onchange={(e) => (cropX = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Y</Label><Input type="number" value={cropY} onchange={(e) => (cropY = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Width</Label><Input type="number" value={cropW} onchange={(e) => (cropW = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>Height</Label><Input type="number" value={cropH} onchange={(e) => (cropH = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+              </div>
+              <Button onclick={executeCrop} disabled={busy || cropW <= 0 || cropH <= 0}>
+                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Crop size={14} class="mr-1.5" />{cropAllPages ? "Crop All Pages" : "Crop Page"}{/if}
               </Button>
             {/if}
           </div>
