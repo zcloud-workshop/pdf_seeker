@@ -96,6 +96,7 @@
     "crop": "页面裁剪",
     "annotate": "批注",
     "form": "表单填写",
+    "replaceText": "替换文本",
     "extractTable": "提取表格",
     "preview": "预览",
     "openPdf": "打开 PDF",

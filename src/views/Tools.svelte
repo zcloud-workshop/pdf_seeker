@@ -36,6 +36,7 @@
     Crop as Icon_Crop,
     StickyNote as Icon_StickyNote,
     ClipboardList as Icon_ClipboardList,
+    Replace as Icon_Replace,
   } from "lucide-svelte";
   import { loadPdf, renderPageToCanvas, type PdfDocumentProxy } from "@/pdf-engine";
   import { tick } from "svelte";
@@ -44,7 +45,8 @@
     | "merge" | "split" | "rotate" | "reorder" | "delete" | "extractPages"
     | "compress" | "watermark" | "img2pdf" | "pdf2img"
     | "pdf2text" | "sign" | "ocr" | "table"
-    | "editText" | "editRect" | "editHighlight" | "crop" | "annotate" | "form";
+    | "editText" | "editRect" | "editHighlight" | "crop" | "annotate" | "form"
+    | "replaceText";
 
   let activeTool: ToolId | null = $state(null);
   let busy = $state(false);
@@ -113,6 +115,7 @@
     { id: "crop", icon: Icon_Crop, labelKey: "tools.crop", ready: true, hasPreview: true },
     { id: "annotate", icon: Icon_StickyNote, labelKey: "tools.annotate", ready: true, hasPreview: true },
     { id: "form", icon: Icon_ClipboardList, labelKey: "tools.form", ready: true, hasPreview: false },
+    { id: "replaceText", icon: Icon_Replace, labelKey: "tools.replaceText", ready: true, hasPreview: false },
     { id: "table", icon: Icon_Table, labelKey: "tools.extractTable", ready: true, hasPreview: true },
   ];
 
@@ -1471,6 +1474,122 @@
     }
   }
 
+  // ==================== Replace Text (overlay style) ====================
+
+  type TextMatch = {
+    page: number;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    baselineY: number;
+    fontSize: number;
+    text: string;
+    selected: boolean;
+  };
+  let replaceQuery = $state("");
+  let replaceWith = $state("");
+  let replaceMatches = $state<TextMatch[]>([]);
+  let replaceSearching = $state(false);
+
+  async function findReplaceMatches() {
+    const path = $currentFilePath;
+    const query = replaceQuery.trim();
+    if (!path || !query) return;
+    replaceSearching = true;
+    resultMsg = "";
+    try {
+      const data = await readFile(path);
+      const doc = await loadPdf(new Uint8Array(data));
+      const q = query.toLowerCase();
+      const matches: TextMatch[] = [];
+
+      for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        const content = await page.getTextContent();
+
+        // Build page text + per-char positions (PDF coords, y-axis up)
+        let pageText = "";
+        const chars: Array<{ x: number; xEnd: number; baselineY: number; fontSize: number }> = [];
+        for (const item of content.items as Array<Record<string, unknown>>) {
+          const str = typeof item.str === "string" ? (item.str as string) : "";
+          if (!str) continue;
+          const tr = item.transform as number[];
+          const fontSize = Math.hypot(tr[1], tr[3]) || Math.abs(tr[3]) || 10;
+          if (Math.abs(tr[1]) > 0.001) {
+            // Rotated text: placeholder chars keep indices aligned with pageText
+            for (const _ of str) {
+              pageText += "\u0000";
+              chars.push({ x: NaN, xEnd: NaN, baselineY: NaN, fontSize });
+            }
+            continue;
+          }
+          const width = typeof item.width === "number" ? (item.width as number) : str.length * fontSize * 0.5;
+          const per = str.length ? width / str.length : 0;
+          for (let k = 0; k < str.length; k++) {
+            chars.push({ x: tr[4] + k * per, xEnd: tr[4] + (k + 1) * per, baselineY: tr[5], fontSize });
+            pageText += str[k];
+          }
+        }
+
+        const lower = pageText.toLowerCase();
+        let pos = 0;
+        while ((pos = lower.indexOf(q, pos)) !== -1) {
+          const seg = chars.slice(pos, pos + query.length);
+          if (seg.length === query.length && seg.every((c) => Number.isFinite(c.x))) {
+            const minX = Math.min(...seg.map((c) => c.x));
+            const maxX = Math.max(...seg.map((c) => c.xEnd));
+            const first = seg[0];
+            const bottom = first.baselineY - first.fontSize * 0.25;
+            const top = first.baselineY + first.fontSize * 1.0;
+            matches.push({
+              page: i,
+              x: minX - 1,
+              y: bottom,
+              width: maxX - minX + 2,
+              height: top - bottom,
+              baselineY: first.baselineY,
+              fontSize: first.fontSize,
+              text: pageText.slice(pos, pos + query.length),
+              selected: true,
+            });
+          }
+          pos += query.length;
+        }
+      }
+
+      replaceMatches = matches;
+      resultMsg = matches.length ? `Found ${matches.length} match(es)` : "No matches found";
+      resultOk = matches.length > 0;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      replaceSearching = false;
+    }
+  }
+
+  async function executeReplaceText() {
+    const selected = replaceMatches.filter((m) => m.selected);
+    if (!selected.length) return;
+    await applyEditInPlace(
+      "replace_text",
+      {
+        replacements: selected.map((m) => ({
+          page: m.page,
+          coverX: m.x,
+          coverY: m.y,
+          coverWidth: m.width,
+          coverHeight: m.height,
+          baselineY: m.baselineY,
+          fontSize: m.fontSize,
+          newText: replaceWith,
+        })),
+      },
+      `Replaced ${selected.length} occurrence(s) (Ctrl/Cmd+Z to undo)`,
+    );
+  }
+
   // ==================== Navigation ====================
 
   async function openFileForTool() {
@@ -2728,6 +2847,61 @@
                 </Button>
                 <Button variant="outline" size="sm" onclick={loadFormFields} disabled={busy}>Reload</Button>
               </div>
+            {/if}
+          </div>
+        {/if}
+
+        {#if activeTool === "replaceText"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" onclick={openFileForTool}>
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+              </div>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                Overlay replacement in <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong> — original text is covered and new text drawn at the same position.
+              </p>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="space-y-1"><Label>Find</Label><Input bind:value={replaceQuery} placeholder="text to find" /></div>
+                <div class="space-y-1"><Label>Replace with</Label><Input bind:value={replaceWith} placeholder="replacement text" /></div>
+              </div>
+              <Button onclick={findReplaceMatches} disabled={busy || replaceSearching || !replaceQuery.trim()}>
+                {#if replaceSearching}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Replace size={14} class="mr-1.5" />Find Matches}{/if}
+              </Button>
+              {#if replaceMatches.length > 0}
+                <div class="flex items-center justify-between">
+                  <span class="text-sm text-muted-foreground">{replaceMatches.filter((m) => m.selected).length} / {replaceMatches.length} selected</span>
+                  <div class="flex gap-2">
+                    <button class="text-xs underline text-muted-foreground hover:text-foreground"
+                      onclick={() => (replaceMatches = replaceMatches.map((m) => ({ ...m, selected: true })))}
+                    >Select all</button>
+                    <button class="text-xs underline text-muted-foreground hover:text-foreground"
+                      onclick={() => (replaceMatches = replaceMatches.map((m) => ({ ...m, selected: false })))}
+                    >Clear</button>
+                  </div>
+                </div>
+                <div class="space-y-1.5 max-h-72 overflow-auto pr-1">
+                  {#each replaceMatches as m, idx (idx)}
+                    <label class="flex items-center gap-2 text-sm cursor-pointer p-1.5 rounded hover:bg-accent">
+                      <input
+                        type="checkbox"
+                        class="accent-blue-500"
+                        checked={m.selected}
+                        onchange={(e) => (replaceMatches = replaceMatches.map((mm, i) => i === idx ? { ...mm, selected: (e.target as HTMLInputElement).checked } : mm))}
+                      />
+                      <span class="text-xs text-muted-foreground shrink-0">p.{m.page}</span>
+                      <span class="truncate font-mono">“{m.text}”</span>
+                    </label>
+                  {/each}
+                </div>
+                <Button onclick={executeReplaceText} disabled={busy || replaceMatches.every((m) => !m.selected)}>
+                  {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Replace size={14} class="mr-1.5" />Replace Selected}{/if}
+                </Button>
+              {/if}
             {/if}
           </div>
         {/if}

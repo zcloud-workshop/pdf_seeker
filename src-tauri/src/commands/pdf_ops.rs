@@ -1765,6 +1765,174 @@ pub fn fill_form(req: FillFormRequest) -> AppResult<()> {
     save_doc(&mut doc, &req.output_path)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextReplacement {
+    pub page: u32,
+    pub cover_x: f64,
+    pub cover_y: f64,
+    pub cover_width: f64,
+    pub cover_height: f64,
+    pub baseline_y: f64,
+    pub font_size: f64,
+    pub new_text: String,
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceTextRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub replacements: Vec<TextReplacement>,
+}
+
+/// Overlay-style text replacement: cover each original match with a white
+/// rectangle and draw the replacement text at the original baseline. All
+/// replacements on one page share a single appended content stream, so one
+/// undo step reverts the whole operation.
+#[tauri::command]
+pub fn replace_text(req: ReplaceTextRequest) -> AppResult<()> {
+    if req.replacements.is_empty() {
+        return Err("No replacements given".into());
+    }
+
+    let mut doc = load_doc(&req.input_path)?;
+    let all_pages = doc.get_pages();
+
+    // Group by page so each page gets a single appended stream
+    let mut by_page: std::collections::BTreeMap<u32, Vec<&TextReplacement>> = std::collections::BTreeMap::new();
+    for rep in &req.replacements {
+        if rep.cover_width <= 0.0 || rep.cover_height <= 0.0 {
+            return Err("Replacement cover area must be non-empty".into());
+        }
+        if rep.font_size <= 0.0 {
+            return Err("Replacement font size must be positive".into());
+        }
+        if !all_pages.contains_key(&rep.page) {
+            return Err(format!("Page {} not found", rep.page));
+        }
+        by_page.entry(rep.page).or_default().push(rep);
+    }
+
+    for (page_num, reps) in by_page {
+        let page_id = *all_pages.get(&page_num).unwrap();
+
+        // Cover rects: white fill
+        let mut content = String::from("q\n1 1 1 rg\n");
+        for rep in &reps {
+            content.push_str(&format!(
+                "{:.1} {:.1} {:.1} {:.1} re f\n",
+                rep.cover_x, rep.cover_y, rep.cover_width, rep.cover_height
+            ));
+        }
+        content.push_str("Q\n");
+
+        // Replacement texts at original baselines (absolute Tm positioning)
+        content.push_str("BT\n");
+        for rep in &reps {
+            let (r, g, b) = match &rep.color {
+                Some(hex) => {
+                    let h = hex.trim_start_matches('#');
+                    let cr = u8::from_str_radix(&h.get(0..2).unwrap_or("00"), 16).unwrap_or(0) as f64 / 255.0;
+                    let cg = u8::from_str_radix(&h.get(2..4).unwrap_or("00"), 16).unwrap_or(0) as f64 / 255.0;
+                    let cb = u8::from_str_radix(&h.get(4..6).unwrap_or("00"), 16).unwrap_or(0) as f64 / 255.0;
+                    (cr, cg, cb)
+                }
+                None => (0.0, 0.0, 0.0),
+            };
+            content.push_str(&format!(
+                "/F1 {:.1} Tf {:.3} {:.3} {:.3} rg 1 0 0 1 {:.1} {:.1} Tm ({}) Tj\n",
+                rep.font_size, r, g, b,
+                rep.cover_x, rep.baseline_y,
+                escape_pdf_string(&rep.new_text)
+            ));
+        }
+        content.push_str("ET");
+
+        let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            content.into_bytes(),
+        )));
+
+        // Font resource (same pattern as add_text_to_page)
+        let font_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"Font".to_vec())),
+            (b"Subtype".to_vec(), Object::Name(b"Type1".to_vec())),
+            (b"BaseFont".to_vec(), Object::Name(b"Helvetica".to_vec())),
+            (b"Encoding".to_vec(), Object::Name(b"WinAnsiEncoding".to_vec())),
+        ])));
+
+        let res_ref = {
+            let page = doc.get_object(page_id).map_err(|e| format!("Page error: {}", e))?;
+            let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+            match page_dict.get(b"Resources") {
+                Err(_) => {
+                    let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
+                    (res_id, true)
+                }
+                Ok(res_obj) => {
+                    if let Ok(r) = res_obj.as_reference() { (r, false) }
+                    else {
+                        let res_id = doc.add_object(res_obj.clone());
+                        (res_id, true)
+                    }
+                }
+            }
+        };
+
+        if let Some(res_obj) = doc.objects.get_mut(&res_ref.0) {
+            if let Ok(res_dict) = res_obj.as_dict_mut() {
+                if res_dict.get(b"Font").is_err() {
+                    res_dict.set("Font", Object::Dictionary(lopdf::Dictionary::new()));
+                }
+                if let Ok(font_d) = res_dict.get_mut(b"Font") {
+                    if let Ok(fd) = font_d.as_dict_mut() {
+                        fd.set("F1", Object::Reference(font_id));
+                    }
+                }
+            }
+        }
+        if res_ref.1 {
+            if let Some(page_obj) = doc.objects.get_mut(&page_id) {
+                if let Ok(dict) = page_obj.as_dict_mut() {
+                    dict.set("Resources", Object::Reference(res_ref.0));
+                }
+            }
+        }
+
+        // Append to page Contents
+        let has_contents_ref: Option<ObjectId> = {
+            let page_obj = doc.objects.get(&page_id).unwrap();
+            let dict = page_obj.as_dict().unwrap();
+            match dict.get(b"Contents") {
+                Ok(c) => {
+                    if let Ok(r) = c.as_reference() { Some(r) }
+                    else if let Ok(arr) = c.as_array() { Some(doc.add_object(Object::Array(arr.clone()))) }
+                    else { None }
+                }
+                Err(_) => None,
+            }
+        };
+        let new_contents_ref = match has_contents_ref {
+            Some(existing_ref) => {
+                let arr = Object::Array(vec![
+                    Object::Reference(existing_ref),
+                    Object::Reference(content_id),
+                ]);
+                doc.add_object(arr)
+            }
+            None => content_id,
+        };
+        let page_obj = doc.objects.get_mut(&page_id).unwrap();
+        if let Ok(dict) = page_obj.as_dict_mut() {
+            dict.set("Contents", Object::Reference(new_contents_ref));
+        }
+    }
+
+    save_doc(&mut doc, &req.output_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2255,5 +2423,86 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let src = create_test_pdf(dir.path(), "noform2.pdf", 1);
         assert!(get_form_fields(src).is_err());
+    }
+
+    #[test]
+    fn test_replace_text() {
+        let dir = TempDir::new().unwrap();
+        // Base PDF with a text run at a known position
+        let base = create_test_pdf(dir.path(), "rt_base.pdf", 1);
+        add_text_to_page(AddTextRequest {
+            input_path: base,
+            output_path: dir.path().join("rt_src.pdf").to_string_lossy().to_string(),
+            page: 1,
+            x: 72.0,
+            y: 700.0,
+            text: "Hello World".into(),
+            font_size: 12.0,
+            color: "#000000".into(),
+        })
+        .unwrap();
+        let src = dir.path().join("rt_src.pdf").to_string_lossy().to_string();
+        let out = dir.path().join("rt_out.pdf");
+        let out_str = out.to_string_lossy().to_string();
+
+        replace_text(ReplaceTextRequest {
+            input_path: src,
+            output_path: out_str.clone(),
+            replacements: vec![TextReplacement {
+                page: 1,
+                cover_x: 70.0,
+                cover_y: 697.0,
+                cover_width: 90.0,
+                cover_height: 15.0,
+                baseline_y: 700.0,
+                font_size: 12.0,
+                new_text: "Bye PDF".into(),
+                color: None,
+            }],
+        })
+        .unwrap();
+
+        // The output loads and the appended content stream contains the
+        // cover rect plus the replacement text
+        let doc = Document::load(&out_str).unwrap();
+        assert_eq!(doc.get_pages().len(), 1);
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let contents = doc.get_object(page_id).unwrap().as_dict().unwrap()
+            .get(b"Contents").unwrap().clone();
+        let stream_ids: Vec<ObjectId> = match contents {
+            Object::Reference(r) => match doc.get_object(r).unwrap() {
+                Object::Array(arr) => arr.iter().filter_map(|o| o.as_reference().ok()).collect(),
+                Object::Stream(_) => vec![r],
+                _ => vec![],
+            },
+            _ => vec![],
+        };
+        let mut found_cover = false;
+        let mut found_text = false;
+        for sid in stream_ids {
+            if let Ok(stream) = doc.get_object(sid).unwrap().as_stream() {
+                // decompressed_content() errors on streams without /Filter;
+                // fall back to the raw content in that case
+                let raw = stream.decompressed_content()
+                    .unwrap_or_else(|_| stream.content.clone());
+                let data = String::from_utf8_lossy(&raw).to_string();
+                if data.contains("re f") { found_cover = true; }
+                if data.contains("(Bye PDF) Tj") { found_text = true; }
+            }
+        }
+        assert!(found_cover, "cover rectangle missing");
+        assert!(found_text, "replacement text missing");
+    }
+
+    #[test]
+    fn test_replace_text_empty_fails() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "rt_empty.pdf", 1);
+        let result = replace_text(ReplaceTextRequest {
+            input_path: src,
+            output_path: dir.path().join("x.pdf").to_string_lossy().to_string(),
+            replacements: vec![],
+        });
+        assert!(result.is_err());
     }
 }
