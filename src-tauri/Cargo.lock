@@ -3195,7 +3195,7 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "pdf_seeker"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aws-config",
