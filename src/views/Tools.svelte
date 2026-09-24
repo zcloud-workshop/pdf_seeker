@@ -3,7 +3,7 @@
   import { currentView, currentFilePath, isDark } from "@/stores";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
-  import { readFile, writeTextFile } from "@tauri-apps/plugin-fs";
+  import { readFile, writeTextFile, writeFile } from "@tauri-apps/plugin-fs";
   import { Button, Input, Label } from "@/components/ui";
   import {
     Merge as Icon_Merge,
@@ -30,12 +30,15 @@
     Pencil as Icon_Pencil,
     Square as Icon_Square,
     Highlighter as Icon_Highlighter,
+    ListOrdered as Icon_ListOrdered,
+    Undo2 as Icon_Undo2,
+    Redo2 as Icon_Redo2,
   } from "lucide-svelte";
   import { loadPdf, renderPageToCanvas, type PdfDocumentProxy } from "@/pdf-engine";
   import { tick } from "svelte";
 
   type ToolId =
-    | "merge" | "split" | "rotate" | "delete" | "extractPages"
+    | "merge" | "split" | "rotate" | "reorder" | "delete" | "extractPages"
     | "compress" | "watermark" | "img2pdf" | "pdf2img"
     | "pdf2text" | "sign" | "ocr" | "table"
     | "editText" | "editRect" | "editHighlight";
@@ -74,6 +77,7 @@
       case "editRect": editRectPage = p; break;
       case "editHighlight": editHlPage = p; break;
       case "sign": signPage = p; break;
+      case "table": tablePage = p; break;
     }
   }
 
@@ -88,6 +92,7 @@
     { id: "merge", icon: Icon_Merge, labelKey: "tools.merge", ready: true, hasPreview: false },
     { id: "split", icon: Icon_Scissors, labelKey: "tools.split", ready: true, hasPreview: true },
     { id: "rotate", icon: Icon_RotateCw, labelKey: "tools.rotate", ready: true, hasPreview: true },
+    { id: "reorder", icon: Icon_ListOrdered, labelKey: "tools.reorder", ready: true, hasPreview: true },
     { id: "delete", icon: Icon_Trash2, labelKey: "tools.deletePages", ready: true, hasPreview: true },
     { id: "extractPages", icon: Icon_FileOutput, labelKey: "tools.extractPages", ready: true, hasPreview: true },
     { id: "compress", icon: Icon_Minimize2, labelKey: "tools.compress", ready: true, hasPreview: false },
@@ -100,7 +105,7 @@
     { id: "editText", icon: Icon_Pencil, labelKey: "tools.editText", ready: true, hasPreview: true },
     { id: "editRect", icon: Icon_Square, labelKey: "tools.editRect", ready: true, hasPreview: true },
     { id: "editHighlight", icon: Icon_Highlighter, labelKey: "tools.editHighlight", ready: true, hasPreview: true },
-    { id: "table", icon: Icon_Table, labelKey: "tools.extractTable", ready: false, hasPreview: false },
+    { id: "table", icon: Icon_Table, labelKey: "tools.extractTable", ready: true, hasPreview: true },
   ];
 
   // ==================== Thumbnail preview ====================
@@ -115,6 +120,7 @@
       thumbDoc = doc;
       previewPageCount = doc.numPages;
       deletedPages = new Set();
+      pageOrder = Array.from({ length: doc.numPages }, (_, i) => i + 1);
       pageDims = [];
       for (let i = 1; i <= doc.numPages; i++) {
         const p = await doc.getPage(i);
@@ -145,7 +151,7 @@
       try {
         await renderPageToCanvas(
           thumbDoc,
-          i + 1,
+          pageOrder[i] ?? i + 1,
           canvases[i] as HTMLCanvasElement,
           0.3,
         );
@@ -367,7 +373,29 @@
       const paths = Array.isArray(selected)
         ? selected.map(String)
         : [String(selected)];
-      mergeFiles = [...mergeFiles, ...paths];
+      mergeFiles = [...new Set([...mergeFiles, ...paths])];
+    }
+  }
+
+  async function addMergeFolder() {
+    const selected = await open({ directory: true });
+    if (!selected) return;
+    try {
+      const files = await invoke<string[]>("list_dir_files", {
+        dir: String(selected),
+        extensions: ["pdf"],
+      });
+      if (files.length === 0) {
+        resultMsg = "No PDF files found in the selected folder";
+        resultOk = false;
+        return;
+      }
+      mergeFiles = [...new Set([...mergeFiles, ...files])];
+      resultMsg = `Added ${files.length} PDF(s) from folder`;
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
     }
   }
 
@@ -420,6 +448,77 @@
         req: { inputPath: path, outputPath: outPath, angle: rotateAngle },
       });
       resultMsg = `Rotated ${rotateAngle}° → ${outPath.split(/[\\/]/).pop()}`;
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      busy = false;
+    }
+  }
+
+  // ==================== Reorder Pages ====================
+
+  let pageOrder = $state<number[]>([]);
+  let reorderDragFrom = $state<number | null>(null);
+  let reorderDropOn = $state<number | null>(null);
+
+  const orderChanged = $derived(pageOrder.some((p, i) => p !== i + 1));
+
+  function onReorderDragStart(e: DragEvent, index: number) {
+    // macOS WebKit won't start a drag without setData
+    e.dataTransfer?.setData("text/plain", String(index));
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+    reorderDragFrom = index;
+  }
+
+  function onReorderDragOver(e: DragEvent, index: number) {
+    if (reorderDragFrom === null) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    reorderDropOn = index;
+  }
+
+  function onReorderDragLeave() {
+    reorderDropOn = null;
+  }
+
+  function onReorderDrop(e: DragEvent, index: number) {
+    e.preventDefault();
+    const from = reorderDragFrom;
+    reorderDragFrom = null;
+    reorderDropOn = null;
+    if (from === null || from === index) return;
+    const moved = pageOrder.splice(from, 1)[0];
+    pageOrder.splice(index, 0, moved);
+    renderThumbnails();
+  }
+
+  function onReorderDragEnd() {
+    reorderDragFrom = null;
+    reorderDropOn = null;
+  }
+
+  async function resetOrder() {
+    pageOrder = Array.from({ length: previewPageCount }, (_, i) => i + 1);
+    await renderThumbnails();
+  }
+
+  async function executeReorder() {
+    const path = $currentFilePath;
+    if (!path || !orderChanged) return;
+    busy = true;
+    resultMsg = "";
+    try {
+      const out = await save({
+        filters: [{ name: "PDF", extensions: ["pdf"] }],
+      });
+      if (!out) return;
+      const outPath = out as string;
+      await invoke("reorder_pages", {
+        req: { inputPath: path, outputPath: outPath, newOrder: pageOrder },
+      });
+      resultMsg = `Reordered pages → ${outPath.split(/[\\/]/).pop()}`;
       resultOk = true;
     } catch (e) {
       resultMsg = String(e);
@@ -658,29 +757,15 @@
   let watermarkColor = $state("#888888");
 
   async function executeWatermark() {
-    const path = $currentFilePath;
-    if (!path) return;
-    busy = true;
-    resultMsg = "";
-    try {
-      const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
-      if (!out) return;
-      const outPath = out as string;
-      await invoke("add_text_watermark", {
-        req: {
-          inputPath: path, outputPath: outPath,
-          text: watermarkText, fontSize: watermarkFontSize,
-          opacity: watermarkOpacity, angle: watermarkAngle, color: watermarkColor,
-        },
-      });
-      resultMsg = `Watermark added → ${outPath.split(/[\\/]/).pop()}`;
-      resultOk = true;
-    } catch (e) {
-      resultMsg = String(e);
-      resultOk = false;
-    } finally {
-      busy = false;
-    }
+    if (!$currentFilePath) return;
+    await applyEditInPlace(
+      "add_text_watermark",
+      {
+        text: watermarkText, fontSize: watermarkFontSize,
+        opacity: watermarkOpacity, angle: watermarkAngle, color: watermarkColor,
+      },
+      "Watermark added (in place — Ctrl/Cmd+Z to undo)",
+    );
   }
 
   // ==================== Image to PDF ====================
@@ -694,7 +779,29 @@
     });
     if (selected) {
       const paths = Array.isArray(selected) ? selected.map(String) : [String(selected)];
-      img2pdfFiles = [...img2pdfFiles, ...paths];
+      img2pdfFiles = [...new Set([...img2pdfFiles, ...paths])];
+    }
+  }
+
+  async function addImg2PdfFolder() {
+    const selected = await open({ directory: true });
+    if (!selected) return;
+    try {
+      const files = await invoke<string[]>("list_dir_files", {
+        dir: String(selected),
+        extensions: ["jpg", "jpeg", "png", "bmp", "webp"],
+      });
+      if (files.length === 0) {
+        resultMsg = "No image files found in the selected folder";
+        resultOk = false;
+        return;
+      }
+      img2pdfFiles = [...new Set([...img2pdfFiles, ...files])];
+      resultMsg = `Added ${files.length} image(s) from folder`;
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
     }
   }
 
@@ -788,30 +895,16 @@
   }
 
   async function executeSign() {
-    const path = $currentFilePath;
-    if (!path || !signImagePath) return;
-    busy = true;
-    resultMsg = "";
-    try {
-      const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
-      if (!out) return;
-      const outPath = out as string;
-      await invoke("sign_pdf", {
-        req: {
-          inputPath: path, outputPath: outPath,
-          signatureImagePath: signImagePath,
-          page: signPage, x: signX, y: signY,
-          width: signWidth, height: signHeight,
-        },
-      });
-      resultMsg = `Signature added to page ${signPage} → ${outPath.split(/[\\/]/).pop()}`;
-      resultOk = true;
-    } catch (e) {
-      resultMsg = String(e);
-      resultOk = false;
-    } finally {
-      busy = false;
-    }
+    if (!$currentFilePath || !signImagePath) return;
+    await applyEditInPlace(
+      "sign_pdf",
+      {
+        signatureImagePath: signImagePath,
+        page: signPage, x: signX, y: signY,
+        width: signWidth, height: signHeight,
+      },
+      `Signature added to page ${signPage} (in place — Ctrl/Cmd+Z to undo)`,
+    );
   }
 
   // ==================== OCR ====================
@@ -910,6 +1003,201 @@
     }
   }
 
+  // ==================== Table Extraction ====================
+
+  let tablePage = $state(1);
+  let tableCsv = $state("");
+
+  function csvEscape(value: string): string {
+    return /[",\n\r]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+  }
+
+  async function executeTable() {
+    const path = $currentFilePath;
+    if (!path) return;
+    busy = true;
+    resultMsg = "";
+    tableCsv = "";
+    try {
+      const data = await readFile(path);
+      const doc = await loadPdf(new Uint8Array(data));
+      const page = await doc.getPage(Math.min(tablePage, doc.numPages));
+      tablePage = Math.min(tablePage, doc.numPages);
+      const content = await page.getTextContent();
+
+      // Collect positioned text items (PDF coords, y-axis points up)
+      const items = (content.items as Array<Record<string, unknown>>)
+        .filter((it) => typeof it.str === "string" && String(it.str).trim())
+        .map((it) => ({
+          str: String(it.str),
+          x: (it.transform as number[])[4],
+          y: (it.transform as number[])[5],
+          w: typeof it.width === "number" ? it.width : 0,
+          h: typeof it.height === "number" && it.height > 0 ? it.height : 10,
+        }));
+      if (items.length === 0) {
+        resultMsg = `No text found on page ${tablePage}`;
+        resultOk = false;
+        return;
+      }
+
+      const heights = items.map((i) => i.h).sort((a, b) => a - b);
+      const medianH = heights[Math.floor(heights.length / 2)] || 10;
+
+      // Group items into rows by y coordinate
+      items.sort((a, b) => b.y - a.y);
+      const rows: typeof items[] = [];
+      let rowY: number | null = null;
+      for (const it of items) {
+        if (rowY === null || Math.abs(it.y - rowY) > medianH * 0.5) {
+          rows.push([it]);
+          rowY = it.y;
+        } else {
+          rows[rows.length - 1].push(it);
+        }
+      }
+
+      // Split each row into cells where the horizontal gap is large
+      const cellGap = Math.max(5, medianH * 0.9);
+      const wordGap = medianH * 0.15;
+      const table: string[][] = rows.map((row) => {
+        row.sort((a, b) => a.x - b.x);
+        const cells: string[] = [];
+        let cell = "";
+        let prevEnd: number | null = null;
+        for (const it of row) {
+          if (prevEnd !== null && it.x - prevEnd > cellGap) {
+            cells.push(cell.trim());
+            cell = "";
+          } else if (prevEnd !== null && it.x - prevEnd > wordGap && cell && !cell.endsWith(" ")) {
+            cell += " ";
+          }
+          cell += it.str;
+          prevEnd = Math.max(prevEnd ?? 0, it.x + it.w);
+        }
+        cells.push(cell.trim());
+        return cells;
+      });
+
+      const maxCols = Math.max(...table.map((r) => r.length));
+      if (maxCols < 2 || table.length < 1) {
+        resultMsg = `No table detected on page ${tablePage} (found ${maxCols} column(s))`;
+        resultOk = false;
+        return;
+      }
+
+      tableCsv = table.map((r) => r.map(csvEscape).join(",")).join("\n");
+      resultMsg = `Detected ${table.length} rows × ${maxCols} columns on page ${tablePage}`;
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function saveTableCsv() {
+    if (!tableCsv) return;
+    try {
+      const out = await save({ filters: [{ name: "CSV", extensions: ["csv"] }] });
+      if (!out) return;
+      await writeTextFile(out as string, tableCsv);
+      resultMsg = `Saved to ${(out as string).split(/[\\/]/).pop()}`;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    }
+  }
+
+  // ==================== Edit tools: Undo / Redo ====================
+  // In-place editing with byte snapshots of the current file.
+
+  const MAX_UNDO = 30;
+  let undoStack = $state<Uint8Array[]>([]);
+  let redoStack = $state<Uint8Array[]>([]);
+
+  const canUndo = $derived(undoStack.length > 0);
+  const canRedo = $derived(redoStack.length > 0);
+
+  $effect(() => {
+    // Reset history when the edited file changes
+    if ($currentFilePath) {
+      undoStack = [];
+      redoStack = [];
+    }
+  });
+
+  async function applyEditInPlace(command: string, req: Record<string, unknown>, successMsg: string) {
+    const path = $currentFilePath;
+    if (!path) return;
+    busy = true;
+    resultMsg = "";
+    let pushed = false;
+    try {
+      const snapshot = await readFile(path);
+      undoStack.push(snapshot);
+      pushed = true;
+      if (undoStack.length > MAX_UNDO) undoStack.shift();
+      redoStack = [];
+      await invoke(command, { req: { ...req, inputPath: path, outputPath: path } });
+      resultMsg = successMsg;
+      resultOk = true;
+      await loadThumbnails();
+    } catch (e) {
+      // Restore the pre-edit snapshot if the command may have partially written the file
+      if (pushed) {
+        const snap = undoStack.pop()!;
+        try { await writeFile(path, snap); } catch { /* keep the original error */ }
+      }
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function undoEdit() {
+    const path = $currentFilePath;
+    if (!path || undoStack.length === 0) return;
+    try {
+      redoStack.push(await readFile(path));
+      const prev = undoStack.pop()!;
+      await writeFile(path, prev);
+      await loadThumbnails();
+      resultMsg = "Undone";
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    }
+  }
+
+  async function redoEdit() {
+    const path = $currentFilePath;
+    if (!path || redoStack.length === 0) return;
+    try {
+      undoStack.push(await readFile(path));
+      const next = redoStack.pop()!;
+      await writeFile(path, next);
+      await loadThumbnails();
+      resultMsg = "Redone";
+      resultOk = true;
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    }
+  }
+
+  function onEditKeydown(e: KeyboardEvent) {
+    if (!isEditingTool(activeTool)) return;
+    const mod = e.metaKey || e.ctrlKey;
+    if (!mod || e.key.toLowerCase() !== "z") return;
+    e.preventDefault();
+    if (e.shiftKey) redoEdit();
+    else undoEdit();
+  }
+
   // ==================== Edit: Add Text ====================
 
   let editText = $state("");
@@ -920,20 +1208,12 @@
   let editTextY = $state(720);
 
   async function executeEditText() {
-    const path = $currentFilePath;
-    if (!path || !editText.trim()) return;
-    busy = true;
-    resultMsg = "";
-    try {
-      const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
-      if (!out) return;
-      const outPath = out as string;
-      await invoke("add_text_to_page", {
-        req: { inputPath: path, outputPath: outPath, text: editText, page: editTextPage, x: editTextX, y: editTextY, fontSize: editFontSize, color: editTextColor },
-      });
-      resultMsg = `Text added to page ${editTextPage} → ${outPath.split(/[\\/]/).pop()}`;
-      resultOk = true;
-    } catch (e) { resultMsg = String(e); resultOk = false; } finally { busy = false; }
+    if (!$currentFilePath || !editText.trim()) return;
+    await applyEditInPlace(
+      "add_text_to_page",
+      { text: editText, page: editTextPage, x: editTextX, y: editTextY, fontSize: editFontSize, color: editTextColor },
+      `Text added to page ${editTextPage} (in place — Ctrl/Cmd+Z to undo)`,
+    );
   }
 
   // ==================== Edit: Rectangle ====================
@@ -949,20 +1229,12 @@
   let editRectBorderW = $state(1);
 
   async function executeEditRect() {
-    const path = $currentFilePath;
-    if (!path) return;
-    busy = true;
-    resultMsg = "";
-    try {
-      const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
-      if (!out) return;
-      const outPath = out as string;
-      await invoke("add_rectangle", {
-        req: { inputPath: path, outputPath: outPath, page: editRectPage, x: editRectX, y: editRectY, width: editRectW, height: editRectH, borderColor: editRectBorder, fillColor: editRectHasFill ? editRectFill : null, borderWidth: editRectBorderW },
-      });
-      resultMsg = `Rectangle added to page ${editRectPage} → ${outPath.split(/[\\/]/).pop()}`;
-      resultOk = true;
-    } catch (e) { resultMsg = String(e); resultOk = false; } finally { busy = false; }
+    if (!$currentFilePath) return;
+    await applyEditInPlace(
+      "add_rectangle",
+      { page: editRectPage, x: editRectX, y: editRectY, width: editRectW, height: editRectH, borderColor: editRectBorder, fillColor: editRectHasFill ? editRectFill : null, borderWidth: editRectBorderW },
+      `Rectangle added to page ${editRectPage} (in place — Ctrl/Cmd+Z to undo)`,
+    );
   }
 
   // ==================== Edit: Highlight ====================
@@ -976,20 +1248,12 @@
   let editHlOpacity = $state(0.4);
 
   async function executeEditHighlight() {
-    const path = $currentFilePath;
-    if (!path) return;
-    busy = true;
-    resultMsg = "";
-    try {
-      const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
-      if (!out) return;
-      const outPath = out as string;
-      await invoke("add_highlight", {
-        req: { inputPath: path, outputPath: outPath, page: editHlPage, x: editHlX, y: editHlY, width: editHlW, height: editHlH, color: editHlColor, opacity: editHlOpacity },
-      });
-      resultMsg = `Highlight added to page ${editHlPage} → ${outPath.split(/[\\/]/).pop()}`;
-      resultOk = true;
-    } catch (e) { resultMsg = String(e); resultOk = false; } finally { busy = false; }
+    if (!$currentFilePath) return;
+    await applyEditInPlace(
+      "add_highlight",
+      { page: editHlPage, x: editHlX, y: editHlY, width: editHlW, height: editHlH, color: editHlColor, opacity: editHlOpacity },
+      `Highlight added to page ${editHlPage} (in place — Ctrl/Cmd+Z to undo)`,
+    );
   }
 
   // ==================== Navigation ====================
@@ -1028,6 +1292,15 @@
   function getThumbClasses(pageNum: number): string {
     const base =
       "relative rounded-lg overflow-hidden border-2 transition-all cursor-pointer hover:ring-2 hover:ring-primary/20";
+    if (activeTool === "reorder") {
+      if (
+        reorderDragFrom !== null &&
+        reorderDropOn === pageNum - 1 &&
+        reorderDragFrom !== reorderDropOn
+      )
+        return `${base} border-blue-500`;
+      return `${base} border-transparent hover:border-border`;
+    }
     if (activeTool === "delete") {
       return deletedPages.has(pageNum)
         ? `${base} border-red-500`
@@ -1042,6 +1315,7 @@
     if (activeTool === "editRect" && pageNum === editRectPage) return `${base} border-blue-500`;
     if (activeTool === "editHighlight" && pageNum === editHlPage) return `${base} border-blue-500`;
     if (activeTool === "sign" && pageNum === signPage) return `${base} border-blue-500`;
+    if (activeTool === "table" && pageNum === tablePage) return `${base} border-blue-500`;
     return `${base} border-transparent`;
   }
 
@@ -1060,6 +1334,8 @@
       toolDefs.find((t) => t.id === activeTool)?.hasPreview,
   );
 </script>
+
+<svelte:window onkeydown={onEditKeydown} />
 
 <div class="flex flex-col h-full">
   <!-- Header -->
@@ -1129,15 +1405,26 @@
             <p class="text-sm text-muted-foreground">
               Select PDF files to merge in order.
             </p>
-            <Button
-              variant="outline"
-              size="sm"
-              onclick={addMergeFiles}
-              class="gap-1.5"
-            >
-              <Icon_FileUp size={14} />
-              Add Files
-            </Button>
+            <div class="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onclick={addMergeFiles}
+                class="gap-1.5"
+              >
+                <Icon_FileUp size={14} />
+                Add Files
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onclick={addMergeFolder}
+                class="gap-1.5"
+              >
+                <Icon_FolderOpen size={14} />
+                Add Folder
+              </Button>
+            </div>
             {#if mergeFiles.length > 0}
               <div class="space-y-1">
                 {#each mergeFiles as file, i}
@@ -1219,6 +1506,60 @@
                   Rotate & Save
                 {/if}
               </Button>
+            {/if}
+          </div>
+        {/if}
+
+        <!-- Reorder Pages -->
+        {#if activeTool === "reorder"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onclick={openFileForTool}
+                >
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onclick={openCurrentInViewer}
+                >
+                  Go to Viewer
+                </Button>
+              </div>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                Drag thumbnails below to rearrange pages of:
+                <strong
+                  >{$currentFilePath.split(/[\\/]/).pop()}</strong
+                >
+              </p>
+              <div class="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onclick={resetOrder}
+                  disabled={busy || !orderChanged}
+                >
+                  Reset
+                </Button>
+                <Button
+                  onclick={executeReorder}
+                  disabled={busy || !orderChanged}
+                >
+                  {#if busy}
+                    <Icon_Loader2 size={14} class="animate-spin" />
+                  {:else}
+                    <Icon_Save size={14} class="mr-1.5" />
+                    Save Order
+                  {/if}
+                </Button>
+              </div>
             {/if}
           </div>
         {/if}
@@ -1576,7 +1917,7 @@
                   <Icon_Loader2 size={14} class="animate-spin" />
                 {:else}
                   <Icon_Save size={14} class="mr-1.5" />
-                  Add Watermark &amp; Save
+                  Add Watermark
                 {/if}
               </Button>
             {/if}
@@ -1589,10 +1930,16 @@
             <p class="text-sm text-muted-foreground">
               Select images to convert to a single PDF.
             </p>
-            <Button variant="outline" size="sm" onclick={addImg2PdfFiles} class="gap-1.5">
-              <Icon_FileUp size={14} />
-              Add Images
-            </Button>
+            <div class="flex gap-2">
+              <Button variant="outline" size="sm" onclick={addImg2PdfFiles} class="gap-1.5">
+                <Icon_FileUp size={14} />
+                Add Images
+              </Button>
+              <Button variant="outline" size="sm" onclick={addImg2PdfFolder} class="gap-1.5">
+                <Icon_FolderOpen size={14} />
+                Add Folder
+              </Button>
+            </div>
             {#if img2pdfFiles.length > 0}
               <div class="space-y-1">
                 {#each img2pdfFiles as file, i}
@@ -1720,7 +2067,7 @@
                   <Icon_Loader2 size={14} class="animate-spin" />
                 {:else}
                   <Icon_Save size={14} class="mr-1.5" />
-                  Sign &amp; Save
+                  Sign
                 {/if}
               </Button>
             {/if}
@@ -1785,6 +2132,72 @@
           </div>
         {/if}
 
+        <!-- Table Extraction -->
+        {#if activeTool === "table"}
+          <div class="space-y-3">
+            {#if !$currentFilePath}
+              <p class="text-sm text-muted-foreground">Open a PDF first.</p>
+              <div class="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onclick={openFileForTool}
+                >
+                  <Icon_FileUp size={14} class="mr-1.5" />
+                  Open PDF
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onclick={openCurrentInViewer}
+                >
+                  Go to Viewer
+                </Button>
+              </div>
+            {:else}
+              <p class="text-sm text-muted-foreground">
+                Detect and extract a table as CSV from:
+                <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong>
+              </p>
+              <div class="flex items-end gap-2">
+                <div class="space-y-1 w-28">
+                  <Label>Page</Label>
+                  <Input
+                    type="number"
+                    min="1"
+                    max={previewPageCount || 1}
+                    value={tablePage}
+                    onchange={(e) => (tablePage = parseInt((e.target as HTMLInputElement).value) || 1)}
+                  />
+                </div>
+                <Button onclick={executeTable} disabled={busy}>
+                  {#if busy}
+                    <Icon_Loader2 size={14} class="animate-spin" />
+                  {:else}
+                    <Icon_Table size={14} class="mr-1.5" />
+                    Extract Table
+                  {/if}
+                </Button>
+              </div>
+              <p class="text-xs text-muted-foreground">
+                Click a thumbnail below to pick the page. Works best on text-based PDFs.
+              </p>
+              {#if tableCsv}
+                <textarea
+                  readonly
+                  rows="8"
+                  class="w-full p-2 rounded-lg border border-input bg-transparent text-sm font-mono resize-y"
+                  value={tableCsv}
+                ></textarea>
+                <Button variant="outline" size="sm" onclick={saveTableCsv}>
+                  <Icon_Save size={14} class="mr-1.5" />
+                  Save as CSV
+                </Button>
+              {/if}
+            {/if}
+          </div>
+        {/if}
+
         <!-- Edit: Add Text -->
         {#if activeTool === "editText"}
           <div class="space-y-3">
@@ -1840,7 +2253,7 @@
                 </div>
               </div>
               <Button onclick={executeEditText} disabled={busy || !editText.trim()}>
-                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Save size={14} class="mr-1.5" />Add Text & Save}{/if}
+                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Save size={14} class="mr-1.5" />Add Text}{/if}
               </Button>
             {/if}
           </div>
@@ -1893,7 +2306,7 @@
                 {/if}
               </div>
               <Button onclick={executeEditRect} disabled={busy}>
-                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Save size={14} class="mr-1.5" />Add Rectangle & Save}{/if}
+                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Save size={14} class="mr-1.5" />Add Rectangle}{/if}
               </Button>
             {/if}
           </div>
@@ -1931,7 +2344,7 @@
                 </div>
               </div>
               <Button onclick={executeEditHighlight} disabled={busy}>
-                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Save size={14} class="mr-1.5" />Add Highlight & Save}{/if}
+                {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Save size={14} class="mr-1.5" />Add Highlight}{/if}
               </Button>
             {/if}
           </div>
@@ -1945,9 +2358,29 @@
               <span class="text-sm font-medium text-muted-foreground">
                 {t("tools.preview")} — {previewPage} / {previewPageCount}
               </span>
-              {#if thumbLoading}
-                <Icon_Loader2 size={14} class="animate-spin text-muted-foreground" />
-              {/if}
+              <div class="flex items-center gap-2">
+                <button
+                  class="flex items-center gap-1 px-2 py-1 rounded border border-border text-xs hover:bg-accent disabled:opacity-40"
+                  disabled={!canUndo || busy}
+                  onclick={undoEdit}
+                  title="Undo (Ctrl/Cmd+Z)"
+                >
+                  <Icon_Undo2 size={13} />
+                  Undo
+                </button>
+                <button
+                  class="flex items-center gap-1 px-2 py-1 rounded border border-border text-xs hover:bg-accent disabled:opacity-40"
+                  disabled={!canRedo || busy}
+                  onclick={redoEdit}
+                  title="Redo (Ctrl/Cmd+Shift+Z)"
+                >
+                  <Icon_Redo2 size={13} />
+                  Redo
+                </button>
+                {#if thumbLoading}
+                  <Icon_Loader2 size={14} class="animate-spin text-muted-foreground" />
+                {/if}
+              </div>
             </div>
             <div class="flex justify-center overflow-auto border rounded-lg p-2"
                  style:filter={$isDark ? "invert(0.92) hue-rotate(180deg)" : "none"}>
@@ -2028,6 +2461,12 @@
                 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
                 <div
                   class={getThumbClasses(i + 1)}
+                  draggable={activeTool === "reorder"}
+                  ondragstart={(e) => { if (activeTool === "reorder") onReorderDragStart(e, i); }}
+                  ondragover={(e) => { if (activeTool === "reorder") onReorderDragOver(e, i); }}
+                  ondragleave={() => { if (activeTool === "reorder") onReorderDragLeave(); }}
+                  ondrop={(e) => { if (activeTool === "reorder") onReorderDrop(e, i); }}
+                  ondragend={() => { if (activeTool === "reorder") onReorderDragEnd(); }}
                   onclick={() => {
                     if (activeTool === "delete") toggleDeletePage(i + 1);
                     if (activeTool === "extractPages") toggleExtractPage(i + 1);
@@ -2049,7 +2488,7 @@
                   <span
                     class="absolute top-1 left-1 text-[10px] leading-none bg-black/60 text-white px-1.5 py-0.5 rounded font-medium"
                   >
-                    {i + 1}
+                    {pageOrder[i] ?? i + 1}
                   </span>
                   {#if activeTool === "delete" && deletedPages.has(i + 1)}
                     <div

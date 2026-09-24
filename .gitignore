@@ -6,3 +6,6 @@ src-tauri/target/
 .env
 .env.*
 !.env.example
+.v2c/
+.zcodeignore
+.zcode/

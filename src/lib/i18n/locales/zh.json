@@ -80,6 +80,7 @@
     "merge": "合并",
     "split": "拆分",
     "rotate": "旋转",
+    "reorder": "页面排序",
     "deletePages": "删除页面",
     "extractPages": "提取页面",
     "compress": "压缩",
