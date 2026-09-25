@@ -20,6 +20,8 @@ export interface S3Config {
   root_prefix: string | null;
   max_versions: number | null;
   version_ttl_days: number | null;
+  auto_backup_config: boolean;
+  last_backup_at: string | null;
 }
 
 export interface AppConfig {

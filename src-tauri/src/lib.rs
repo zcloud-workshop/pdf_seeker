@@ -63,6 +63,10 @@ pub fn run() {
             commands::s3_ops::s3_delete_version,
             commands::s3_ops::s3_create_folder,
             commands::s3_ops::s3_get_presigned_url,
+            commands::s3_ops::sync_backup_config,
+            commands::s3_ops::sync_fetch_backup_info,
+            commands::s3_ops::sync_list_backup_versions,
+            commands::s3_ops::sync_restore_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

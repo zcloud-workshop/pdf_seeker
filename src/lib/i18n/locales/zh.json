@@ -78,7 +78,20 @@
     "s3MaxVersions": "最大保留版本数",
     "s3VersionTtl": "版本保留天数",
     "save": "保存",
-    "saved": "设置已保存"
+    "saved": "设置已保存",
+    "syncTitle": "云同步",
+    "syncHint": "将配置（含 S3 连接与最近文件）备份到当前 S3 存储桶，可跨设备恢复。注意：备份包含明文密钥，请使用私有存储桶。",
+    "syncAuto": "自动备份（保存设置时上传）",
+    "syncLastBackup": "上次备份",
+    "syncBackupNow": "立即备份",
+    "syncShowVersions": "云端版本",
+    "syncHideVersions": "收起版本",
+    "syncNoVersions": "暂无云端备份（需要存储桶开启版本控制才能保留历史）",
+    "syncLatest": "最新",
+    "syncRestore": "恢复",
+    "syncRestoreConfirm": "将用云端备份覆盖本地全部设置（包括当前 S3 连接配置），确定继续？",
+    "syncRestoreDone": "已从云端恢复配置",
+    "syncBackupDone": "备份已上传到云端"
   },
   "storage": {
     "title": "S3 兼容存储",

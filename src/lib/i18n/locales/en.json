@@ -78,7 +78,20 @@
     "s3MaxVersions": "Max Versions to Keep",
     "s3VersionTtl": "Version Retention Days",
     "save": "Save",
-    "saved": "Settings saved"
+    "saved": "Settings saved",
+    "syncTitle": "Cloud Sync",
+    "syncHint": "Back up your settings (incl. S3 connection and recent files) to the current S3 bucket and restore them on other devices. Note: the backup contains plaintext credentials — use a private bucket.",
+    "syncAuto": "Auto backup (upload on save)",
+    "syncLastBackup": "Last backup",
+    "syncBackupNow": "Back up now",
+    "syncShowVersions": "Cloud versions",
+    "syncHideVersions": "Hide versions",
+    "syncNoVersions": "No cloud backups yet (bucket versioning must be enabled to keep history)",
+    "syncLatest": "Latest",
+    "syncRestore": "Restore",
+    "syncRestoreConfirm": "This overwrites all local settings (including the current S3 connection) with the cloud backup. Continue?",
+    "syncRestoreDone": "Config restored from cloud",
+    "syncBackupDone": "Backup uploaded"
   },
   "storage": {
     "title": "S3 Compatible Storage",

@@ -2,7 +2,8 @@
   import { t } from "@/i18n/index.svelte.ts";
   import { Button, Input, Label, Separator } from "@/components/ui";
   import { invoke } from "@tauri-apps/api/core";
-  import type { AppConfig } from "@/lib/types";
+  import { ask } from "@tauri-apps/plugin-dialog";
+  import type { AppConfig, S3Config } from "@/lib/types";
 
   let language = $state("zh");
   let theme = $state("system");
@@ -18,9 +19,54 @@
   let s3RootPrefix = $state("");
   let s3MaxVersions = $state("");
   let s3VersionTtl = $state("");
+  let s3AutoBackup = $state(false);
   let saveStatus = $state("");
   let connectionStatus = $state<"idle" | "testing" | "ok" | "fail">("idle");
-  let loadedConfig: AppConfig | null = null;
+  let loadedConfig = $state<AppConfig | null>(null);
+
+  // Cloud sync state
+  let syncing = $state<"idle" | "backup" | "versions" | "restore">("idle");
+  let syncMsg = $state("");
+  let syncMsgIsError = $state(false);
+  let backupVersions = $state<
+    { version_id: string; size: number; last_modified: string; is_latest: boolean }[]
+  >([]);
+  let showVersions = $state(false);
+
+  function buildS3Config(): S3Config {
+    return {
+      auth_mode: s3AuthMode,
+      endpoint: s3Endpoint,
+      region: s3Region || "us-east-1",
+      bucket: s3Bucket,
+      access_key: s3AccessKey,
+      secret_key: s3SecretKey,
+      session_token: s3SessionToken || null,
+      force_path_style: s3PathStyle,
+      root_prefix: s3RootPrefix || null,
+      max_versions: s3MaxVersions ? parseInt(s3MaxVersions) : null,
+      version_ttl_days: s3VersionTtl ? parseInt(s3VersionTtl) : null,
+      auto_backup_config: s3AutoBackup,
+      last_backup_at: loadedConfig?.s3?.last_backup_at ?? null,
+    };
+  }
+
+  function flashSync(msg: string, isError = false) {
+    syncMsg = msg;
+    syncMsgIsError = isError;
+    setTimeout(() => (syncMsg = ""), isError ? 5000 : 3000);
+  }
+
+  function formatEpoch(sec: string | null | undefined): string {
+    if (!sec) return "";
+    const d = new Date(parseInt(sec) * 1000);
+    return isNaN(d.getTime()) ? "" : d.toLocaleString();
+  }
+
+  function formatS3Time(iso: string): string {
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? iso : d.toLocaleString();
+  }
 
   async function loadConfig() {
     try {
@@ -41,6 +87,7 @@
         s3RootPrefix = config.s3.root_prefix || "";
         s3MaxVersions = config.s3.max_versions?.toString() || "";
         s3VersionTtl = config.s3.version_ttl_days?.toString() || "";
+        s3AutoBackup = config.s3.auto_backup_config ?? false;
       }
     } catch (_) {}
   }
@@ -55,25 +102,15 @@
           recent_files_max: loadedConfig?.general.recent_files_max ?? 20,
           recent_files: loadedConfig?.general.recent_files ?? [],
         },
-        s3: s3Enabled
-          ? {
-              auth_mode: s3AuthMode,
-              endpoint: s3Endpoint,
-              region: s3Region,
-              bucket: s3Bucket,
-              access_key: s3AccessKey,
-              secret_key: s3SecretKey,
-              session_token: s3SessionToken || null,
-              force_path_style: s3PathStyle,
-              root_prefix: s3RootPrefix || null,
-              max_versions: s3MaxVersions ? parseInt(s3MaxVersions) : null,
-              version_ttl_days: s3VersionTtl ? parseInt(s3VersionTtl) : null,
-            }
-          : null,
+        s3: s3Enabled ? buildS3Config() : null,
       };
       await invoke("update_config", { newConfig: config });
+      loadedConfig = config;
       saveStatus = t("settings.saved");
       setTimeout(() => (saveStatus = ""), 2000);
+      if (s3Enabled && s3AutoBackup) {
+        backupNow(true);
+      }
     } catch (e) {
       saveStatus = String(e);
       setTimeout(() => (saveStatus = ""), 3000);
@@ -84,26 +121,72 @@
     if (!s3Enabled || !s3Endpoint || !s3Bucket) return;
     connectionStatus = "testing";
     try {
-      await invoke("s3_test_connection", {
-        s3Config: {
-          auth_mode: s3AuthMode,
-          endpoint: s3Endpoint,
-          region: s3Region || "us-east-1",
-          bucket: s3Bucket,
-          access_key: s3AccessKey,
-          secret_key: s3SecretKey,
-          session_token: s3SessionToken || null,
-          force_path_style: s3PathStyle,
-          root_prefix: s3RootPrefix || null,
-          max_versions: s3MaxVersions ? parseInt(s3MaxVersions) : null,
-          version_ttl_days: s3VersionTtl ? parseInt(s3VersionTtl) : null,
-        },
-      });
+      await invoke("s3_test_connection", { s3Config: buildS3Config() });
       connectionStatus = "ok";
     } catch {
       connectionStatus = "fail";
     }
     setTimeout(() => (connectionStatus = "idle"), 4000);
+  }
+
+  // ─── Cloud sync actions ────────────────────────────────────────────
+
+  async function backupNow(auto = false) {
+    if (!s3Enabled || !s3Bucket) return;
+    syncing = "backup";
+    try {
+      const info = await invoke<{ backed_at: string }>("sync_backup_config", {
+        s3Config: buildS3Config(),
+      });
+      if (loadedConfig?.s3) loadedConfig.s3.last_backup_at = info.backed_at;
+      flashSync(t("settings.syncBackupDone"));
+    } catch (e) {
+      flashSync(String(e), true);
+    } finally {
+      syncing = "idle";
+    }
+  }
+
+  async function toggleVersions() {
+    showVersions = !showVersions;
+    if (showVersions) {
+      syncing = "versions";
+      backupVersions = [];
+      try {
+        const versions = await invoke<
+          { version_id: string; size: number; last_modified: string; is_latest: boolean }[]
+        >("sync_list_backup_versions", { s3Config: buildS3Config() });
+        backupVersions = versions;
+      } catch (e) {
+        flashSync(String(e), true);
+        showVersions = false;
+      } finally {
+        syncing = "idle";
+      }
+    }
+  }
+
+  async function restoreVersion(versionId: string) {
+    const confirmed = await ask(t("settings.syncRestoreConfirm"), {
+      title: t("settings.syncRestore"),
+      kind: "warning",
+    });
+    if (!confirmed) return;
+    syncing = "restore";
+    try {
+      const restored: AppConfig = await invoke("sync_restore_config", {
+        s3Config: buildS3Config(),
+        versionId: versionId || null,
+      });
+      loadedConfig = restored;
+      s3Enabled = true;
+      await loadConfig();
+      flashSync(t("settings.syncRestoreDone"));
+    } catch (e) {
+      flashSync(String(e), true);
+    } finally {
+      syncing = "idle";
+    }
   }
 
   $effect(() => {
@@ -238,6 +321,83 @@
               <span class="text-sm text-green-600">{t("settings.s3Connected")}</span>
             {:else if connectionStatus === "fail"}
               <span class="text-sm text-destructive">{t("settings.s3Failed")}</span>
+            {/if}
+          </div>
+
+          <!-- Cloud sync (config backup / restore) -->
+          <div class="rounded-lg border border-border p-3 space-y-3">
+            <div>
+              <p class="text-sm font-medium">{t("settings.syncTitle")}</p>
+              <p class="text-xs text-muted-foreground mt-0.5">{t("settings.syncHint")}</p>
+            </div>
+            <label class="flex items-center gap-2 text-sm">
+              <input type="checkbox" bind:checked={s3AutoBackup} class="rounded" />
+              <span class="text-muted-foreground">{t("settings.syncAuto")}</span>
+            </label>
+            {#if loadedConfig?.s3?.last_backup_at}
+              <p class="text-xs text-muted-foreground">
+                {t("settings.syncLastBackup")}: {formatEpoch(loadedConfig.s3.last_backup_at)}
+              </p>
+            {/if}
+            <div class="flex items-center gap-2 flex-wrap">
+              <Button
+                variant="outline"
+                size="sm"
+                onclick={() => backupNow()}
+                disabled={syncing !== "idle"}
+              >
+                {t("settings.syncBackupNow")}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onclick={toggleVersions}
+                disabled={syncing !== "idle"}
+              >
+                {showVersions
+                  ? t("settings.syncHideVersions")
+                  : t("settings.syncShowVersions")}
+              </Button>
+              {#if syncing !== "idle"}
+                <span class="text-xs text-muted-foreground">{t("app.loading")}</span>
+              {/if}
+              {#if syncMsg}
+                <span
+                  class="text-xs {syncMsgIsError
+                    ? 'text-destructive'
+                    : 'text-green-600'} break-all"
+                >
+                  {syncMsg}
+                </span>
+              {/if}
+            </div>
+            {#if showVersions}
+              <div class="space-y-1 max-h-48 overflow-auto">
+                {#if backupVersions.length === 0}
+                  <p class="text-xs text-muted-foreground">{t("settings.syncNoVersions")}</p>
+                {:else}
+                  {#each backupVersions as ver (ver.version_id)}
+                    <div class="flex items-center justify-between gap-2 px-2 py-1.5 rounded border border-border text-xs">
+                      <div class="flex items-center gap-2 min-w-0">
+                        {#if ver.is_latest}
+                          <span class="px-1.5 py-0.5 rounded bg-primary/10 text-primary text-[10px] shrink-0">
+                            {t("settings.syncLatest")}
+                          </span>
+                        {/if}
+                        <span class="text-muted-foreground truncate">{formatS3Time(ver.last_modified)}</span>
+                        <span class="text-muted-foreground/60 shrink-0">{ver.size} B</span>
+                      </div>
+                      <button
+                        class="text-[11px] text-muted-foreground hover:text-foreground shrink-0 disabled:opacity-50"
+                        disabled={syncing !== "idle"}
+                        onclick={() => restoreVersion(ver.version_id)}
+                      >
+                        {t("settings.syncRestore")}
+                      </button>
+                    </div>
+                  {/each}
+                {/if}
+              </div>
             {/if}
           </div>
         </div>

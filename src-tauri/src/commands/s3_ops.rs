@@ -1,8 +1,9 @@
 use aws_sdk_s3::primitives::ByteStream;
+use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::config::S3Config;
+use crate::config::{AppConfig, S3Config};
 use crate::error::AppError;
 use crate::error::AppResult;
 
@@ -431,4 +432,269 @@ pub async fn s3_get_presigned_url(
         .map_err(|e| AppError::S3(e.to_string()))?;
 
     Ok(presigned.uri().to_string())
+}
+
+// ==================== Config sync (backup / restore) ====================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncBackupInfo {
+    /// Epoch seconds of the backup
+    pub backed_at: String,
+    pub app_version: String,
+    /// MD5 hex of the uploaded config.toml bytes
+    pub checksum: String,
+}
+
+/// Object key for a config-backup file under the user's root prefix
+fn sync_key(cfg: &S3Config, file: &str) -> String {
+    let base = prefix(cfg);
+    if base.is_empty() {
+        format!("config-backup/{}", file)
+    } else {
+        format!("{}/config-backup/{}", base, file)
+    }
+}
+
+#[tauri::command]
+pub async fn sync_backup_config(
+    app: tauri::AppHandle,
+    config: tauri::State<'_, std::sync::Mutex<AppConfig>>,
+    s3_config: S3Config,
+) -> AppResult<SyncBackupInfo> {
+    let backed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+
+    let toml_str = {
+        let mut cfg = config
+            .lock()
+            .map_err(|e| AppError::Config(e.to_string()))?;
+        if let Some(s3) = cfg.s3.as_mut() {
+            s3.last_backup_at = Some(backed_at.clone());
+        }
+        toml::to_string_pretty(&*cfg).map_err(AppError::TomlSer)?
+    };
+    let bytes = toml_str.into_bytes();
+    let checksum = Md5::digest(&bytes).iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    let info = SyncBackupInfo {
+        backed_at,
+        app_version: app.package_info().version.to_string(),
+        checksum: checksum.clone(),
+    };
+
+    let client = build_client(&s3_config).await?;
+    client
+        .put_object()
+        .bucket(&s3_config.bucket)
+        .key(sync_key(&s3_config, "config.toml"))
+        .body(ByteStream::from(bytes))
+        .send()
+        .await
+        .map_err(|e| AppError::S3(e.to_string()))?;
+    client
+        .put_object()
+        .bucket(&s3_config.bucket)
+        .key(sync_key(&s3_config, "info.json"))
+        .body(ByteStream::from(serde_json::to_vec(&info)?))
+        .send()
+        .await
+        .map_err(|e| AppError::S3(e.to_string()))?;
+
+    // Persist the stamped last_backup_at locally as well
+    let mut cfg = config
+        .lock()
+        .map_err(|e| AppError::Config(e.to_string()))?;
+    if let Some(s3) = cfg.s3.as_mut() {
+        s3.last_backup_at = Some(info.backed_at.clone());
+    }
+    crate::config::save_config_with_handle(&app, &cfg)?;
+
+    Ok(info)
+}
+
+#[tauri::command]
+pub async fn sync_fetch_backup_info(s3_config: S3Config) -> AppResult<Option<SyncBackupInfo>> {
+    let client = build_client(&s3_config).await?;
+    match client
+        .get_object()
+        .bucket(&s3_config.bucket)
+        .key(sync_key(&s3_config, "info.json"))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let data = resp
+                .body
+                .collect()
+                .await
+                .map_err(|e| AppError::S3(e.to_string()))?;
+            let info: SyncBackupInfo = serde_json::from_slice(&data.into_bytes())?;
+            Ok(Some(info))
+        }
+        Err(e) => {
+            let svc = e.into_service_error();
+            if svc.is_no_such_key() {
+                Ok(None)
+            } else {
+                Err(AppError::S3(svc.to_string()))
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn sync_list_backup_versions(
+    s3_config: S3Config,
+) -> AppResult<Vec<S3VersionItem>> {
+    let client = build_client(&s3_config).await?;
+    let key = sync_key(&s3_config, "config.toml");
+    let max_versions = s3_config.max_versions.unwrap_or(20) as i32;
+
+    let resp = client
+        .list_object_versions()
+        .bucket(&s3_config.bucket)
+        .prefix(&key)
+        .max_keys(max_versions)
+        .send()
+        .await
+        .map_err(|e| AppError::S3(e.to_string()))?;
+
+    let mut versions: Vec<S3VersionItem> = resp
+        .versions()
+        .iter()
+        .filter(|v| v.key() == Some(key.as_str()))
+        .map(|v| S3VersionItem {
+            version_id: v.version_id().unwrap_or("").to_string(),
+            size: v.size().unwrap_or(0) as u64,
+            last_modified: v
+                .last_modified()
+                .map(|t| t.to_string())
+                .unwrap_or_default(),
+            is_latest: v.is_latest().unwrap_or(false),
+        })
+        .collect();
+    versions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    Ok(versions)
+}
+
+#[tauri::command]
+pub async fn sync_restore_config(
+    app: tauri::AppHandle,
+    config: tauri::State<'_, std::sync::Mutex<AppConfig>>,
+    s3_config: S3Config,
+    version_id: Option<String>,
+) -> AppResult<AppConfig> {
+    let client = build_client(&s3_config).await?;
+    let mut req = client
+        .get_object()
+        .bucket(&s3_config.bucket)
+        .key(sync_key(&s3_config, "config.toml"));
+    if let Some(v) = version_id.as_deref() {
+        if !v.is_empty() {
+            req = req.version_id(v);
+        }
+    }
+    let resp = req.send().await.map_err(|e| AppError::S3(e.to_string()))?;
+    let data = resp
+        .body
+        .collect()
+        .await
+        .map_err(|e| AppError::S3(e.to_string()))?;
+    let text = String::from_utf8(data.into_bytes().to_vec())
+        .map_err(|e| AppError::Config(format!("Backup is not valid UTF-8: {}", e)))?;
+    let restored: AppConfig =
+        toml::from_str(&text).map_err(|e| AppError::Toml(e))?;
+
+    crate::config::save_config_with_handle(&app, &restored)?;
+    let mut cfg = config
+        .lock()
+        .map_err(|e| AppError::Config(e.to_string()))?;
+    *cfg = restored.clone();
+    Ok(restored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{GeneralConfig, S3AuthMode};
+
+    fn test_s3_config(root_prefix: Option<&str>) -> S3Config {
+        S3Config {
+            auth_mode: S3AuthMode::Static,
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            bucket: "test-bucket".into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+            session_token: None,
+            force_path_style: true,
+            root_prefix: root_prefix.map(String::from),
+            max_versions: None,
+            version_ttl_days: None,
+            auto_backup_config: false,
+            last_backup_at: None,
+        }
+    }
+
+    #[test]
+    fn test_sync_key_respects_root_prefix() {
+        assert_eq!(
+            sync_key(&test_s3_config(None), "config.toml"),
+            "config-backup/config.toml"
+        );
+        assert_eq!(
+            sync_key(&test_s3_config(Some("pdf")), "config.toml"),
+            "pdf/config-backup/config.toml"
+        );
+        assert_eq!(
+            sync_key(&test_s3_config(Some("pdf/")), "info.json"),
+            "pdf/config-backup/info.json"
+        );
+    }
+
+    #[test]
+    fn test_sync_backup_info_serde_roundtrip() {
+        let info = SyncBackupInfo {
+            backed_at: "1700000000".into(),
+            app_version: "0.4.0".into(),
+            checksum: "abc123".into(),
+        };
+        let json = serde_json::to_vec(&info).unwrap();
+        let parsed: SyncBackupInfo = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed.backed_at, "1700000000");
+        assert_eq!(parsed.app_version, "0.4.0");
+        assert_eq!(parsed.checksum, "abc123");
+    }
+
+    #[test]
+    fn test_config_toml_roundtrip_with_sync_fields() {
+        let cfg = AppConfig {
+            general: GeneralConfig {
+                language: "zh".into(),
+                theme: "dark".into(),
+                default_export_dir: None,
+                recent_files_max: 10,
+                recent_files: vec!["/tmp/a.pdf".into()],
+            },
+            s3: Some(S3Config {
+                auto_backup_config: true,
+                last_backup_at: Some("1700000000".into()),
+                ..test_s3_config(Some("pdf"))
+            }),
+        };
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        // Old configs without the new fields must still parse (serde defaults)
+        let legacy = toml_str
+            .replace("\nauto_backup_config = true", "")
+            .replace("\nlast_backup_at = \"1700000000\"", "");
+        let parsed: AppConfig = toml::from_str(&legacy).unwrap();
+        let s3 = parsed.s3.unwrap();
+        assert!(!s3.auto_backup_config);
+        assert!(s3.last_backup_at.is_none());
+        // Full roundtrip preserves everything
+        let parsed: AppConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.general.recent_files, vec!["/tmp/a.pdf".to_string()]);
+        assert_eq!(parsed.s3.unwrap().last_backup_at.as_deref(), Some("1700000000"));
+    }
 }

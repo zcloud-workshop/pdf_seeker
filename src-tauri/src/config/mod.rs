@@ -46,6 +46,12 @@ pub struct S3Config {
     pub root_prefix: Option<String>,
     pub max_versions: Option<usize>,
     pub version_ttl_days: Option<u64>,
+    /// Auto-upload a config backup to S3 whenever settings are saved
+    #[serde(default)]
+    pub auto_backup_config: bool,
+    /// Epoch seconds of the last successful config backup
+    #[serde(default)]
+    pub last_backup_at: Option<String>,
 }
 
 impl Default for AppConfig {
