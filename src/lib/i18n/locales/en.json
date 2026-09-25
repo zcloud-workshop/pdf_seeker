@@ -133,7 +133,21 @@
     "goToViewer": "Go to Viewer",
     "selectAll": "Select All",
     "clear": "Clear",
-    "keep": "keep"
+    "keep": "keep",
+    "plugins": "Plugins",
+    "pluginsEmpty": "No plugins found",
+    "pluginsDirHint": "Put plugins in the app's plugins directory (one sub-directory + plugin.json manifest each), see docs/plugins.md",
+    "pluginsBackList": "Back to plugins",
+    "pluginsNoInput": "No input file (no PDF is currently open)",
+    "pluginsChooseInput": "Choose input file",
+    "pluginsUseCurrent": "Use current PDF",
+    "pluginsRun": "Run",
+    "pluginsTimeout": "Timed out and terminated",
+    "pluginsExitCode": "Exit code",
+    "pluginsDone": "Finished",
+    "pluginsOpenOutput": "Open output file",
+    "pluginsStdout": "stdout",
+    "pluginsStderr": "stderr"
   },
   "tabs": {
     "close": "Close tab"

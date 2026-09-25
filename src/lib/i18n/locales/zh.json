@@ -133,7 +133,21 @@
     "goToViewer": "前往查看器",
     "selectAll": "全选",
     "clear": "清空",
-    "keep": "保留"
+    "keep": "保留",
+    "plugins": "插件",
+    "pluginsEmpty": "未发现插件",
+    "pluginsDirHint": "将插件放入应用的 plugins 目录（每个插件一个子目录 + plugin.json 清单），详见 docs/plugins.md",
+    "pluginsBackList": "返回插件列表",
+    "pluginsNoInput": "未指定输入文件（当前无打开的 PDF）",
+    "pluginsChooseInput": "选择输入文件",
+    "pluginsUseCurrent": "改用当前 PDF",
+    "pluginsRun": "运行",
+    "pluginsTimeout": "运行超时，已终止",
+    "pluginsExitCode": "退出码",
+    "pluginsDone": "运行完成",
+    "pluginsOpenOutput": "打开输出文件",
+    "pluginsStdout": "标准输出",
+    "pluginsStderr": "标准错误"
   },
   "tabs": {
     "close": "关闭标签页"

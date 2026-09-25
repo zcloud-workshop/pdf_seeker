@@ -54,6 +54,8 @@ pub fn run() {
             commands::security::encrypt_pdf,
             commands::security::decrypt_pdf,
             commands::fs_utils::list_dir_files,
+            commands::plugins::list_plugins,
+            commands::plugins::run_plugin,
             commands::s3_ops::s3_test_connection,
             commands::s3_ops::s3_list_files,
             commands::s3_ops::s3_upload_file,
