@@ -171,5 +171,16 @@
     "onlyChanged": "Changed pages only",
     "openVisual": "Open in side-by-side",
     "identical": "The two files have identical text content"
+  },
+  "updater": {
+    "title": "Software Update",
+    "autoCheck": "Check for updates on startup",
+    "checkNow": "Check for updates",
+    "available": "Update available",
+    "upToDate": "You are on the latest version",
+    "devSkip": "Update checks are skipped in dev builds",
+    "declined": "Update skipped",
+    "error": "Update check failed (network or endpoint unavailable)",
+    "restartPrompt": "Update installed. Relaunch the app now?"
   }
 }

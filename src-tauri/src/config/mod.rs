@@ -19,6 +19,13 @@ pub struct GeneralConfig {
     pub recent_files_max: usize,
     #[serde(default)]
     pub recent_files: Vec<String>,
+    /// Check for app updates on startup
+    #[serde(default = "default_true")]
+    pub auto_update_check: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -63,6 +70,7 @@ impl Default for AppConfig {
                 default_export_dir: None,
                 recent_files_max: 20,
                 recent_files: Vec::new(),
+                auto_update_check: true,
             },
             s3: None,
         }

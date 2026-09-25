@@ -171,5 +171,16 @@
     "onlyChanged": "仅显示差异页",
     "openVisual": "在并排视图查看",
     "identical": "两个文件文本内容完全一致"
+  },
+  "updater": {
+    "title": "软件更新",
+    "autoCheck": "启动时自动检查更新",
+    "checkNow": "立即检查更新",
+    "available": "发现新版本",
+    "upToDate": "当前已是最新版本",
+    "devSkip": "开发模式下不检查更新",
+    "declined": "已跳过此次更新",
+    "error": "检查更新失败（网络或更新源不可用）",
+    "restartPrompt": "更新已安装，立即重启应用？"
   }
 }

@@ -676,6 +676,7 @@ mod tests {
                 default_export_dir: None,
                 recent_files_max: 10,
                 recent_files: vec!["/tmp/a.pdf".into()],
+                auto_update_check: true,
             },
             s3: Some(S3Config {
                 auto_backup_config: true,

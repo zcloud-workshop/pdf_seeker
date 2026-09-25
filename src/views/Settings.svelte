@@ -3,10 +3,14 @@
   import { Button, Input, Label, Separator } from "@/components/ui";
   import { invoke } from "@tauri-apps/api/core";
   import { ask } from "@tauri-apps/plugin-dialog";
-  import type { AppConfig, S3Config } from "@/lib/types";
+  import type { AppConfig, S3Config } from "@/types";
+  import { checkForUpdates } from "@/updater";
 
   let language = $state("zh");
   let theme = $state("system");
+  let autoUpdateCheck = $state(true);
+  let updateChecking = $state(false);
+  let updateStatus = $state("");
   let s3Enabled = $state(false);
   let s3AuthMode = $state<"none" | "static" | "env">("static");
   let s3Endpoint = $state("");
@@ -74,6 +78,7 @@
       loadedConfig = config;
       language = config.general.language;
       theme = config.general.theme;
+      autoUpdateCheck = config.general.auto_update_check ?? true;
       if (config.s3) {
         s3Enabled = true;
         s3AuthMode = config.s3.auth_mode || "static";
@@ -101,6 +106,7 @@
           default_export_dir: loadedConfig?.general.default_export_dir ?? null,
           recent_files_max: loadedConfig?.general.recent_files_max ?? 20,
           recent_files: loadedConfig?.general.recent_files ?? [],
+          auto_update_check: autoUpdateCheck,
         },
         s3: s3Enabled ? buildS3Config() : null,
       };
@@ -189,6 +195,21 @@
     }
   }
 
+  async function runUpdateCheck() {
+    updateChecking = true;
+    updateStatus = "";
+    try {
+      const result = await checkForUpdates();
+      if (result === "up-to-date") updateStatus = t("updater.upToDate");
+      else if (result === "dev-skip") updateStatus = t("updater.devSkip");
+      else if (result === "error") updateStatus = t("updater.error");
+      else if (result === "declined") updateStatus = t("updater.declined");
+      // "installed" ends in relaunch (or a restart prompt) — no extra text
+    } finally {
+      updateChecking = false;
+    }
+  }
+
   $effect(() => {
     loadConfig();
   });
@@ -224,6 +245,27 @@
             <option value="light">{t("settings.themeLight")}</option>
             <option value="dark">{t("settings.themeDark")}</option>
           </select>
+        </div>
+      </div>
+
+      <!-- Update check -->
+      <div class="flex items-center justify-between pt-1">
+        <label class="flex items-center gap-2 text-sm">
+          <input type="checkbox" bind:checked={autoUpdateCheck} class="rounded" />
+          <span class="text-muted-foreground">{t("updater.autoCheck")}</span>
+        </label>
+        <div class="flex items-center gap-2">
+          {#if updateStatus}
+            <span class="text-xs text-muted-foreground">{updateStatus}</span>
+          {/if}
+          <Button
+            variant="outline"
+            size="sm"
+            onclick={runUpdateCheck}
+            disabled={updateChecking}
+          >
+            {updateChecking ? t("app.loading") : t("updater.checkNow")}
+          </Button>
         </div>
       </div>
     </section>
