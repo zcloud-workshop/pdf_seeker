@@ -1933,6 +1933,132 @@ pub fn replace_text(req: ReplaceTextRequest) -> AppResult<()> {
     save_doc(&mut doc, &req.output_path)
 }
 
+// ==================== Outline (bookmarks) ====================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutlineItemInput {
+    pub title: String,
+    pub page: u32,
+    #[serde(default)]
+    pub children: Vec<OutlineItemInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetOutlineRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub items: Vec<OutlineItemInput>,
+}
+
+/// Encode a text string for a PDF string object: ASCII stays as-is,
+/// anything else becomes UTF-16BE with a BOM (PDF 1.7 §7.9.2.2).
+fn encode_pdf_text(s: &str) -> Vec<u8> {
+    if s.is_ascii() {
+        s.as_bytes().to_vec()
+    } else {
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in s.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        bytes
+    }
+}
+
+fn count_outline_items(items: &[OutlineItemInput]) -> i64 {
+    items
+        .iter()
+        .map(|i| 1 + count_outline_items(&i.children))
+        .sum()
+}
+
+/// Create outline item objects for one nesting level, link siblings,
+/// recurse into children. Returns the object ids of this level.
+fn build_outline_items(
+    doc: &mut Document,
+    pages: &std::collections::BTreeMap<u32, ObjectId>,
+    items: &[OutlineItemInput],
+    parent: ObjectId,
+) -> Result<Vec<ObjectId>, String> {
+    let mut ids = Vec::with_capacity(items.len());
+    for item in items {
+        if item.title.trim().is_empty() {
+            return Err("Outline title cannot be empty".into());
+        }
+        let page_id = *pages
+            .get(&item.page)
+            .ok_or_else(|| format!("Page {} not found", item.page))?;
+        let dict = lopdf::Dictionary::from_iter(vec![
+            (b"Title".to_vec(), Object::String(encode_pdf_text(&item.title), lopdf::StringFormat::Literal)),
+            (b"Parent".to_vec(), Object::Reference(parent)),
+            (
+                b"Dest".to_vec(),
+                Object::Array(vec![
+                    Object::Reference(page_id),
+                    Object::Name(b"XYZ".to_vec()),
+                    Object::Null,
+                    Object::Null,
+                    Object::Null,
+                ]),
+            ),
+        ]);
+        ids.push(doc.add_object(Object::Dictionary(dict)));
+    }
+
+    for (i, id) in ids.iter().enumerate() {
+        let child_ids = build_outline_items(doc, pages, &items[i].children, *id)?;
+        if let Some(Object::Dictionary(dict)) = doc.objects.get_mut(id) {
+            if i > 0 {
+                dict.set(b"Prev", Object::Reference(ids[i - 1]));
+            }
+            if i + 1 < ids.len() {
+                dict.set(b"Next", Object::Reference(ids[i + 1]));
+            }
+            if let Some(first) = child_ids.first() {
+                dict.set(b"First", Object::Reference(*first));
+                dict.set(b"Last", Object::Reference(*child_ids.last().unwrap()));
+                dict.set(b"Count", Object::Integer(child_ids.len() as i64));
+            }
+        }
+    }
+    Ok(ids)
+}
+
+#[tauri::command]
+pub fn set_outline(req: SetOutlineRequest) -> AppResult<()> {
+    let mut doc = load_doc(&req.input_path)?;
+    let pages = doc.get_pages();
+
+    let root_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+        (b"Type".to_vec(), Object::Name(b"Outlines".to_vec())),
+    ])));
+
+    let top_ids = build_outline_items(&mut doc, &pages, &req.items, root_id)?;
+
+    if let Some(Object::Dictionary(dict)) = doc.objects.get_mut(&root_id) {
+        if let Some(first) = top_ids.first() {
+            dict.set(b"First", Object::Reference(*first));
+            dict.set(b"Last", Object::Reference(*top_ids.last().unwrap()));
+        }
+        dict.set(b"Count", Object::Integer(count_outline_items(&req.items)));
+    }
+
+    let root_ref = doc
+        .trailer
+        .get(b"Root")
+        .map_err(|e| format!("Catalog error: {}", e))?
+        .as_reference()
+        .map_err(|_| "Catalog is not a reference".to_string())?;
+    if let Some(Object::Dictionary(dict)) = doc.objects.get_mut(&root_ref) {
+        dict.set(b"Outlines", Object::Reference(root_id));
+    } else {
+        return Err("Catalog is not a dictionary".into());
+    }
+
+    save_doc(&mut doc, &req.output_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2502,6 +2628,126 @@ mod tests {
             input_path: src,
             output_path: dir.path().join("x.pdf").to_string_lossy().to_string(),
             replacements: vec![],
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_outline_structure_and_chinese_titles() {
+        let dir = TempDir::new().unwrap();
+        let input = create_test_pdf(dir.path(), "in.pdf", 3);
+        let out = dir.path().join("out.pdf");
+        set_outline(SetOutlineRequest {
+            input_path: input,
+            output_path: out.to_string_lossy().to_string(),
+            items: vec![
+                OutlineItemInput {
+                    title: "第一章 概述".into(),
+                    page: 1,
+                    children: vec![
+                        OutlineItemInput { title: "1.1 背景".into(), page: 2, children: vec![] },
+                        OutlineItemInput { title: "1.2 目标".into(), page: 3, children: vec![] },
+                    ],
+                },
+                OutlineItemInput { title: "Chapter 2".into(), page: 3, children: vec![] },
+            ],
+        })
+        .unwrap();
+
+        let doc = Document::load(&out).unwrap();
+        let root_ref = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let outlines_ref = doc
+            .get_object(root_ref)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Outlines")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let outlines = doc.get_object(outlines_ref).unwrap().as_dict().unwrap();
+        assert_eq!(outlines.get(b"Count").unwrap(), &Object::Integer(4));
+
+        // First top-level item: Chinese title stored as UTF-16BE with BOM
+        let first_ref = outlines.get(b"First").unwrap().as_reference().unwrap();
+        let first = doc.get_object(first_ref).unwrap().as_dict().unwrap();
+        assert_eq!(
+            first.get(b"Title").unwrap(),
+            &Object::String(encode_pdf_text("第一章 概述"), lopdf::StringFormat::Literal)
+        );
+
+        // /Dest points at the page-1 object with /XYZ nulls
+        let page1 = *doc.get_pages().get(&1).unwrap();
+        match first.get(b"Dest").unwrap() {
+            Object::Array(arr) => {
+                assert_eq!(arr[0], Object::Reference(page1));
+                assert_eq!(arr[1], Object::Name(b"XYZ".to_vec()));
+                assert_eq!(arr[2], Object::Null);
+            }
+            o => panic!("dest not array: {:?}", o),
+        }
+
+        // Children linked: /First //Last /Count=2, child /Parent back-link, sibling /Next
+        assert_eq!(first.get(b"Count").unwrap(), &Object::Integer(2));
+        let child1_ref = first.get(b"First").unwrap().as_reference().unwrap();
+        let child1 = doc.get_object(child1_ref).unwrap().as_dict().unwrap();
+        assert_eq!(child1.get(b"Parent").unwrap(), &Object::Reference(first_ref));
+        assert_eq!(
+            child1.get(b"Next").unwrap().as_reference().unwrap(),
+            first.get(b"Last").unwrap().as_reference().unwrap()
+        );
+
+        // Last top-level item: /Prev back to first, no /Next
+        let last_ref = outlines.get(b"Last").unwrap().as_reference().unwrap();
+        let last = doc.get_object(last_ref).unwrap().as_dict().unwrap();
+        assert_eq!(last.get(b"Prev").unwrap().as_reference().unwrap(), first_ref);
+        assert!(last.get(b"Next").is_err());
+    }
+
+    #[test]
+    fn test_set_outline_empty_clears() {
+        let dir = TempDir::new().unwrap();
+        let input = create_test_pdf(dir.path(), "in.pdf", 2);
+        let out = dir.path().join("out.pdf");
+        // First set a non-empty outline, then replace with an empty one
+        set_outline(SetOutlineRequest {
+            input_path: input.clone(),
+            output_path: out.to_string_lossy().to_string(),
+            items: vec![OutlineItemInput { title: "A".into(), page: 1, children: vec![] }],
+        })
+        .unwrap();
+        set_outline(SetOutlineRequest {
+            input_path: out.to_string_lossy().to_string(),
+            output_path: out.to_string_lossy().to_string(),
+            items: vec![],
+        })
+        .unwrap();
+
+        let doc = Document::load(&out).unwrap();
+        let root_ref = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let outlines_ref = doc
+            .get_object(root_ref)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Outlines")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let outlines = doc.get_object(outlines_ref).unwrap().as_dict().unwrap();
+        assert_eq!(outlines.get(b"Count").unwrap(), &Object::Integer(0));
+        assert!(outlines.get(b"First").is_err());
+    }
+
+    #[test]
+    fn test_set_outline_invalid_page_fails() {
+        let dir = TempDir::new().unwrap();
+        let input = create_test_pdf(dir.path(), "in.pdf", 2);
+        let out = dir.path().join("out.pdf");
+        let result = set_outline(SetOutlineRequest {
+            input_path: input,
+            output_path: out.to_string_lossy().to_string(),
+            items: vec![OutlineItemInput { title: "X".into(), page: 99, children: vec![] }],
         });
         assert!(result.is_err());
     }

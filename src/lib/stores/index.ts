@@ -72,4 +72,7 @@ export const isDark = writable<boolean>(false);
 
 export const isFullscreen = writable<boolean>(false);
 
+/** Viewer left panel: PDF outline (bookmarks) visibility */
+export const outlineVisible = writable<boolean>(false);
+
 export const sidebarCollapsed = writable<boolean>(false);

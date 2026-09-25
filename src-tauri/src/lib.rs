@@ -49,6 +49,7 @@ pub fn run() {
             commands::pdf_ops::get_form_fields,
             commands::pdf_ops::fill_form,
             commands::pdf_ops::replace_text,
+            commands::pdf_ops::set_outline,
             commands::security::encrypt_pdf,
             commands::security::decrypt_pdf,
             commands::fs_utils::list_dir_files,

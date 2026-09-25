@@ -6,10 +6,20 @@ declare module "pdfjs-dist" {
     promise: Promise<PDFDocumentProxy>;
   };
 
+  export interface OutlineItem {
+    title: string;
+    dest: string | unknown[] | null;
+    url: string | null;
+    items: OutlineItem[] | null;
+  }
+
   export interface PDFDocumentProxy {
     numPages: number;
     getPage(pageNumber: number): Promise<PDFPageProxy>;
     destroy(): void;
+    getOutline(): Promise<OutlineItem[] | null>;
+    getDestination(dest: string): Promise<unknown[] | null>;
+    getPageIndex(ref: { num: number; gen: number }): Promise<number>;
   }
 
   export interface PDFPageProxy {

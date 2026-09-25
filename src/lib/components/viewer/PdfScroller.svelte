@@ -4,6 +4,7 @@
     currentPage,
     isDark,
     isFullscreen,
+    outlineVisible,
     totalPages,
     zoomLevel,
     type Tab,
@@ -14,12 +15,24 @@
     ZoomOut,
     ChevronLeft,
     ChevronRight,
+    ChevronDown,
     FileText,
     Loader2,
     Maximize,
     Minimize,
+    BookOpen,
+    Pencil,
+    Plus,
+    Trash2,
+    ArrowUp,
+    ArrowDown,
+    IndentIncrease,
+    IndentDecrease,
+    Check,
+    X,
   } from "lucide-svelte";
-  import { readFile } from "@tauri-apps/plugin-fs";
+  import { readFile, writeFile } from "@tauri-apps/plugin-fs";
+  import { invoke } from "@tauri-apps/api/core";
   import {
     loadPdf,
     getPageViewport,
@@ -99,6 +112,8 @@
     pageWidths = [];
     basePageHeights = [];
     basePageWidths = [];
+    outlineNodes = [];
+    editingOutline = false;
     try {
       const data = await readFile(path);
       const doc = await loadPdf(new Uint8Array(data));
@@ -108,6 +123,10 @@
       zoom = 1.0;
       await loadBaseDimensions(doc);
       applyZoomToDimensions(1.0);
+      const outline = await readOutline(doc);
+      outlineNodes = outline;
+      savedOutlineJson = JSON.stringify(outline);
+      outlineUndoSnapshot = null;
     } catch (e) {
       errorMsg = String(e);
       pdfDoc = null;
@@ -360,6 +379,225 @@
     applyZoomButton(1.0);
   }
 
+  // ─── Outline (bookmarks) ────────────────────────────────────────────
+
+  interface OutlineNode {
+    id: number;
+    title: string;
+    pageNum: number | null;
+    expanded: boolean;
+    children: OutlineNode[];
+  }
+
+  let outlineNodes = $state<OutlineNode[]>([]);
+  let editingOutline = $state(false);
+  let selectedNodeId = $state<number | null>(null);
+  let renamingId = $state<number | null>(null);
+  let renameDraft = $state("");
+  let newBookmarkTitle = $state("");
+  let outlineSaving = $state(false);
+  let outlineError = $state("");
+  let outlineUndoSnapshot = $state<Uint8Array | null>(null);
+  let savedOutlineJson = "[]";
+  let outlineIdSeq = 1;
+
+  async function readOutline(doc: PdfDocumentProxy): Promise<OutlineNode[]> {
+    try {
+      const raw = await doc.getOutline();
+      if (!raw) return [];
+      const map = async (
+        items: { title: string; dest: unknown; items: unknown[] | null }[],
+      ): Promise<OutlineNode[]> =>
+        Promise.all(
+          items.map(async (it) => ({
+            id: outlineIdSeq++,
+            title: it.title,
+            pageNum: await resolveOutlinePage(doc, it.dest),
+            expanded: true,
+            children: await map((it.items || []) as never),
+          })),
+        );
+      return await map(raw as never);
+    } catch {
+      return [];
+    }
+  }
+
+  async function resolveOutlinePage(
+    doc: PdfDocumentProxy,
+    dest: unknown,
+  ): Promise<number | null> {
+    try {
+      let d = dest;
+      if (typeof d === "string") d = await doc.getDestination(d);
+      if (!Array.isArray(d)) return null;
+      const ref = d[0];
+      if (!ref || typeof ref !== "object") return null;
+      return (await doc.getPageIndex(ref as { num: number; gen: number })) + 1;
+    } catch {
+      return null;
+    }
+  }
+
+  interface OutlineRow {
+    node: OutlineNode;
+    depth: number;
+  }
+
+  const outlineRows = $derived.by(() => {
+    const rows: OutlineRow[] = [];
+    const walk = (nodes: OutlineNode[], depth: number) => {
+      for (const n of nodes) {
+        rows.push({ node: n, depth });
+        if (n.expanded && n.children.length > 0) walk(n.children, depth + 1);
+      }
+    };
+    walk(outlineNodes, 0);
+    return rows;
+  });
+
+  function locate(
+    id: number,
+  ): { list: OutlineNode[]; index: number; parent: OutlineNode | null } | null {
+    const search = (
+      list: OutlineNode[],
+      parent: OutlineNode | null,
+    ): { list: OutlineNode[]; index: number; parent: OutlineNode | null } | null => {
+      const index = list.findIndex((n) => n.id === id);
+      if (index >= 0) return { list, index, parent };
+      for (const n of list) {
+        const r = search(n.children, n);
+        if (r) return r;
+      }
+      return null;
+    };
+    return search(outlineNodes, null);
+  }
+
+  function moveNode(id: number, dir: -1 | 1) {
+    const loc = locate(id);
+    if (!loc) return;
+    const j = loc.index + dir;
+    if (j < 0 || j >= loc.list.length) return;
+    const tmp = loc.list[loc.index];
+    loc.list[loc.index] = loc.list[j];
+    loc.list[j] = tmp;
+  }
+
+  function promoteNode(id: number) {
+    const loc = locate(id);
+    if (!loc || !loc.parent) return;
+    const parentLoc = locate(loc.parent.id);
+    if (!parentLoc) return;
+    const [node] = loc.list.splice(loc.index, 1);
+    parentLoc.list.splice(parentLoc.index + 1, 0, node);
+  }
+
+  function demoteNode(id: number) {
+    const loc = locate(id);
+    if (!loc || loc.index === 0) return;
+    const prev = loc.list[loc.index - 1];
+    const [node] = loc.list.splice(loc.index, 1);
+    prev.children.push(node);
+    prev.expanded = true;
+  }
+
+  function deleteNode(id: number) {
+    const loc = locate(id);
+    if (loc) {
+      loc.list.splice(loc.index, 1);
+      if (selectedNodeId === id) selectedNodeId = null;
+    }
+  }
+
+  function addBookmarkAtCurrentPage() {
+    const title = newBookmarkTitle.trim();
+    if (!title) return;
+    const node: OutlineNode = {
+      id: outlineIdSeq++,
+      title,
+      pageNum: pageNo,
+      expanded: true,
+      children: [],
+    };
+    if (selectedNodeId != null) {
+      const loc = locate(selectedNodeId);
+      if (loc) {
+        loc.list[loc.index].expanded = true;
+        loc.list[loc.index].children.push(node);
+        newBookmarkTitle = "";
+        return;
+      }
+    }
+    outlineNodes.push(node);
+    newBookmarkTitle = "";
+  }
+
+  function startRename(node: OutlineNode) {
+    renamingId = node.id;
+    renameDraft = node.title;
+  }
+
+  function commitRename() {
+    if (renamingId != null) {
+      const loc = locate(renamingId);
+      if (loc && renameDraft.trim()) loc.list[loc.index].title = renameDraft.trim();
+    }
+    renamingId = null;
+  }
+
+  function cancelOutlineEdit() {
+    outlineNodes = JSON.parse(savedOutlineJson);
+    editingOutline = false;
+    selectedNodeId = null;
+    renamingId = null;
+    outlineError = "";
+  }
+
+  function toInputItems(nodes: OutlineNode[]): unknown[] {
+    // Nodes whose destination page cannot be resolved are dropped on write
+    return nodes
+      .filter((n) => n.pageNum != null)
+      .map((n) => ({
+        title: n.title,
+        page: n.pageNum,
+        children: toInputItems(n.children),
+      }));
+  }
+
+  async function applyOutlineEdit() {
+    outlineSaving = true;
+    outlineError = "";
+    try {
+      const snapshot = await readFile(tab.path);
+      const items = toInputItems(outlineNodes);
+      await invoke("set_outline", {
+        req: { inputPath: tab.path, outputPath: tab.path, items },
+      });
+      outlineUndoSnapshot = new Uint8Array(snapshot);
+      editingOutline = false;
+      selectedNodeId = null;
+      renamingId = null;
+      await loadDocument(tab.path);
+    } catch (e) {
+      outlineError = String(e);
+    } finally {
+      outlineSaving = false;
+    }
+  }
+
+  async function undoOutlineEdit() {
+    if (!outlineUndoSnapshot) return;
+    const snap = outlineUndoSnapshot;
+    outlineUndoSnapshot = null;
+    try {
+      await writeFile(tab.path, snap);
+      await loadDocument(tab.path);
+    } catch {
+      outlineUndoSnapshot = snap;
+    }
+  }
+
   // ─── Fullscreen ─────────────────────────────────────────────────────
 
   async function toggleFullscreen() {
@@ -405,6 +643,17 @@
         if (e.ctrlKey || e.metaKey) {
           e.preventDefault();
           resetZoom();
+        }
+        break;
+      case "z":
+      case "Z":
+        if (
+          (e.ctrlKey || e.metaKey) &&
+          !e.shiftKey &&
+          outlineUndoSnapshot
+        ) {
+          e.preventDefault();
+          undoOutlineEdit();
         }
         break;
       case "F11":
@@ -521,10 +770,190 @@
 </script>
 
 <div
-  class="flex flex-col h-full"
+  class="flex h-full"
   onmousemove={handleMouseMove}
   role="application"
 >
+  {#if $outlineVisible}
+    <aside class="w-64 shrink-0 border-r border-border bg-card flex flex-col overflow-hidden">
+      <div class="flex items-center justify-between h-9 px-3 border-b border-border shrink-0">
+        <span class="text-xs font-medium text-foreground">{t("viewer.outline")}</span>
+        <div class="flex items-center gap-0.5">
+          {#if !editingOutline}
+            <button
+              class="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
+              title={t("viewer.outlineEdit")}
+              onclick={() => (editingOutline = true)}
+            >
+              <Pencil size={13} />
+            </button>
+          {:else}
+            <button
+              class="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground disabled:opacity-50"
+              title={t("viewer.outlineApply")}
+              disabled={outlineSaving}
+              onclick={applyOutlineEdit}
+            >
+              {#if outlineSaving}
+                <Loader2 size={13} class="animate-spin" />
+              {:else}
+                <Check size={13} />
+              {/if}
+            </button>
+            <button
+              class="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
+              title={t("viewer.outlineCancel")}
+              onclick={cancelOutlineEdit}
+            >
+              <X size={13} />
+            </button>
+          {/if}
+          <button
+            class="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
+            title={t("tabs.close")}
+            onclick={() => outlineVisible.set(false)}
+          >
+            <X size={13} />
+          </button>
+        </div>
+      </div>
+
+      <div class="flex-1 overflow-auto py-1">
+        {#if outlineRows.length === 0}
+          <p class="text-xs text-muted-foreground px-3 py-2">{t("viewer.outlineEmpty")}</p>
+        {:else}
+          {#each outlineRows as row (row.node.id)}
+            <div
+              class="group flex items-center gap-0.5 pr-1 rounded-sm {selectedNodeId === row.node.id
+                ? 'bg-accent'
+                : 'hover:bg-accent/40'}"
+              style="padding-left: {row.depth * 14 + 4}px"
+            >
+              {#if row.node.children.length > 0}
+                <button
+                  class="p-0.5 shrink-0 text-muted-foreground hover:text-foreground"
+                  title={row.node.expanded ? t("viewer.outlineCollapse") : t("viewer.outlineExpand")}
+                  onclick={() => (row.node.expanded = !row.node.expanded)}
+                >
+                  <ChevronDown
+                    size={12}
+                    class="transition-transform {row.node.expanded ? '' : '-rotate-90'}"
+                  />
+                </button>
+              {:else}
+                <span class="w-[18px] shrink-0"></span>
+              {/if}
+
+              {#if renamingId === row.node.id}
+                <input
+                  class="flex-1 min-w-0 h-6 px-1 rounded border border-input bg-background text-xs"
+                  bind:value={renameDraft}
+                  onkeydown={(e) => {
+                    if (e.key === 'Enter') commitRename();
+                    if (e.key === 'Escape') renamingId = null;
+                  }}
+                  onblur={commitRename}
+                />
+              {:else}
+                <button
+                  class="flex-1 min-w-0 text-left truncate text-xs {row.node.pageNum == null
+                    ? 'text-muted-foreground/50 italic'
+                    : 'text-foreground'}"
+                  title={row.node.title}
+                  onclick={() => {
+                    if (editingOutline) {
+                      selectedNodeId = row.node.id;
+                    } else if (row.node.pageNum != null) {
+                      scrollToPage(row.node.pageNum);
+                    }
+                  }}
+                  ondblclick={() => editingOutline && startRename(row.node)}
+                >
+                  {row.node.title}
+                </button>
+                {#if row.node.pageNum != null}
+                  <span class="text-[10px] text-muted-foreground/70 tabular-nums shrink-0">
+                    {row.node.pageNum}
+                  </span>
+                {/if}
+              {/if}
+
+              {#if editingOutline && renamingId !== row.node.id}
+                <span
+                  class="flex items-center shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
+                >
+                  <button
+                    class="p-0.5 text-muted-foreground hover:text-foreground disabled:opacity-30"
+                    title={t("viewer.outlineMoveUp")}
+                    onclick={() => moveNode(row.node.id, -1)}
+                  >
+                    <ArrowUp size={11} />
+                  </button>
+                  <button
+                    class="p-0.5 text-muted-foreground hover:text-foreground disabled:opacity-30"
+                    title={t("viewer.outlineMoveDown")}
+                    onclick={() => moveNode(row.node.id, 1)}
+                  >
+                    <ArrowDown size={11} />
+                  </button>
+                  <button
+                    class="p-0.5 text-muted-foreground hover:text-foreground"
+                    title={t("viewer.outlinePromote")}
+                    onclick={() => promoteNode(row.node.id)}
+                  >
+                    <IndentDecrease size={11} />
+                  </button>
+                  <button
+                    class="p-0.5 text-muted-foreground hover:text-foreground"
+                    title={t("viewer.outlineDemote")}
+                    onclick={() => demoteNode(row.node.id)}
+                  >
+                    <IndentIncrease size={11} />
+                  </button>
+                  <button
+                    class="p-0.5 text-muted-foreground hover:text-destructive"
+                    title={t("viewer.outlineDelete")}
+                    onclick={() => deleteNode(row.node.id)}
+                  >
+                    <Trash2 size={11} />
+                  </button>
+                </span>
+              {/if}
+            </div>
+          {/each}
+        {/if}
+      </div>
+
+      {#if editingOutline}
+        <div class="border-t border-border p-2 space-y-1.5 shrink-0">
+          <div class="flex gap-1">
+            <input
+              class="flex-1 min-w-0 h-7 px-2 rounded border border-input bg-background text-xs"
+              placeholder={t("viewer.outlineAddTitle")}
+              bind:value={newBookmarkTitle}
+              onkeydown={(e) => e.key === 'Enter' && addBookmarkAtCurrentPage()}
+            />
+            <button
+              class="shrink-0 px-1.5 h-7 rounded border border-input hover:bg-accent text-xs flex items-center gap-1"
+              title={t("viewer.outlineAdd")}
+              onclick={addBookmarkAtCurrentPage}
+            >
+              <Plus size={12} />
+              {pageNo}
+            </button>
+          </div>
+          {#if outlineError}
+            <p class="text-[11px] text-destructive break-all">{outlineError}</p>
+          {/if}
+          {#if outlineUndoSnapshot}
+            <p class="text-[10px] text-muted-foreground">{t("viewer.outlineUndoHint")}</p>
+          {/if}
+        </div>
+      {/if}
+    </aside>
+  {/if}
+
+  <div class="flex flex-col flex-1 min-w-0">
   <!-- PDF continuous scroll area -->
   <div
     bind:this={scrollContainer}
@@ -575,6 +1004,19 @@
         ? 'opacity-100'
         : 'opacity-0 pointer-events-none'}"
     >
+      <Tooltip message={t("viewer.outline")}>
+        <Button
+          variant="ghost"
+          size="icon"
+          class={$outlineVisible ? "text-foreground bg-accent" : ""}
+          onclick={() => outlineVisible.update((v) => !v)}
+        >
+          <BookOpen size={16} />
+        </Button>
+      </Tooltip>
+
+      <div class="w-px h-5 bg-border mx-1"></div>
+
       <Tooltip message="Previous Page (← / PgUp)">
         <Button
           variant="ghost"
@@ -642,4 +1084,5 @@
       </Tooltip>
     </div>
   {/if}
+  </div>
 </div>

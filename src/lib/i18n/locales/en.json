@@ -26,7 +26,22 @@
     "fitWidth": "Fit Width",
     "fitPage": "Fit Page",
     "rotateLeft": "Rotate Left",
-    "rotateRight": "Rotate Right"
+    "rotateRight": "Rotate Right",
+    "outline": "Bookmarks",
+    "outlineEdit": "Edit bookmarks",
+    "outlineApply": "Apply changes (write to file)",
+    "outlineCancel": "Cancel editing",
+    "outlineEmpty": "No bookmarks",
+    "outlineAddTitle": "Bookmark title",
+    "outlineAdd": "Add at current page",
+    "outlineExpand": "Expand",
+    "outlineCollapse": "Collapse",
+    "outlineMoveUp": "Move up",
+    "outlineMoveDown": "Move down",
+    "outlinePromote": "Promote (outdent)",
+    "outlineDemote": "Demote (indent)",
+    "outlineDelete": "Delete",
+    "outlineUndoHint": "Cmd/Ctrl+Z undoes the last write"
   },
   "recent": {
     "title": "Recent Files",

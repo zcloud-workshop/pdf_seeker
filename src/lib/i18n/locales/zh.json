@@ -26,7 +26,22 @@
     "fitWidth": "适应宽度",
     "fitPage": "适应页面",
     "rotateLeft": "向左旋转",
-    "rotateRight": "向右旋转"
+    "rotateRight": "向右旋转",
+    "outline": "书签",
+    "outlineEdit": "编辑书签",
+    "outlineApply": "应用更改（写入文件）",
+    "outlineCancel": "取消编辑",
+    "outlineEmpty": "无书签",
+    "outlineAddTitle": "书签标题",
+    "outlineAdd": "在当前页新增",
+    "outlineExpand": "展开",
+    "outlineCollapse": "折叠",
+    "outlineMoveUp": "上移",
+    "outlineMoveDown": "下移",
+    "outlinePromote": "升级（减少缩进）",
+    "outlineDemote": "降级（增加缩进）",
+    "outlineDelete": "删除",
+    "outlineUndoHint": "Cmd/Ctrl+Z 可撤销最近一次写入"
   },
   "recent": {
     "title": "最近文件",
