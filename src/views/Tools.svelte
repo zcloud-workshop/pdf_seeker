@@ -1,6 +1,6 @@
 <script lang="ts">
   import { t } from "@/i18n/index.svelte.ts";
-  import { currentView, currentFilePath, isDark } from "@/stores";
+  import { currentView, currentFilePath, isDark, openTab } from "@/stores";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import { readFile, writeTextFile, writeFile } from "@tauri-apps/plugin-fs";
@@ -1664,7 +1664,7 @@
     });
     if (selected) {
       const path = typeof selected === "string" ? selected : String(selected);
-      currentFilePath.set(path);
+      openTab(path);
     }
   }
 

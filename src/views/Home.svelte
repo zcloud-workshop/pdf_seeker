@@ -2,7 +2,7 @@
   import { t } from "@/i18n/index.svelte.ts";
   import { Button } from "@/components/ui";
   import { FolderOpen, FileText, Wrench } from "lucide-svelte";
-  import { currentView, currentFilePath } from "@/stores";
+  import { currentView, openTab } from "@/stores";
   import { open } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
 
@@ -23,7 +23,7 @@
     });
     if (selected) {
       const path = typeof selected === "string" ? selected : selected.path;
-      currentFilePath.set(path);
+      openTab(path);
       currentView.set("viewer");
       try {
         await invoke("add_recent_file", { path });
@@ -40,7 +40,7 @@
   }
 
   async function openRecent(path: string) {
-    currentFilePath.set(path);
+    openTab(path);
     currentView.set("viewer");
     try {
       await invoke("add_recent_file", { path });

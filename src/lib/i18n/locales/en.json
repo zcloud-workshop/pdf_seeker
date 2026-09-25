@@ -105,5 +105,8 @@
     "selectAll": "Select All",
     "clear": "Clear",
     "keep": "keep"
+  },
+  "tabs": {
+    "close": "Close tab"
   }
 }

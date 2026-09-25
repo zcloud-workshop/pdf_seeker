@@ -14,11 +14,11 @@
     PanelLeft,
   } from "lucide-svelte";
   import {
-    currentFilePath,
     currentFileName,
     currentView,
     isDark,
     isFullscreen,
+    openTab,
     sidebarCollapsed,
   } from "@/stores";
   import { invoke } from "@tauri-apps/api/core";
@@ -30,8 +30,7 @@
     });
     if (selected) {
       const path = typeof selected === "string" ? selected : String(selected);
-      currentFilePath.set(path);
-      currentFileName.set(path.split(/[\\/]/).pop() || "Untitled");
+      openTab(path);
       currentView.set("viewer");
       try {
         await invoke("add_recent_file", { path });

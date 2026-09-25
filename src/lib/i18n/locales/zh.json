@@ -105,5 +105,8 @@
     "selectAll": "全选",
     "clear": "清空",
     "keep": "保留"
+  },
+  "tabs": {
+    "close": "关闭标签页"
   }
 }

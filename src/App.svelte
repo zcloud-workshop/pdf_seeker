@@ -1,6 +1,7 @@
 <script lang="ts">
   import "@/i18n/index.svelte.ts";
-  import { Sidebar, Toolbar } from "@/components/layout";
+  import type { Component } from "svelte";
+  import { Sidebar, Toolbar, TabBar } from "@/components/layout";
   import { currentView } from "@/stores";
   import Home from "$views/Home.svelte";
   import Viewer from "$views/Viewer.svelte";
@@ -9,7 +10,7 @@
   import Settings from "$views/Settings.svelte";
   import type { ViewName } from "@/stores";
 
-  const views: Record<ViewName, typeof Home> = {
+  const views: Record<ViewName, Component> = {
     home: Home,
     viewer: Viewer,
     tools: Tools,
@@ -22,6 +23,7 @@
   <Sidebar />
   <div class="flex flex-col flex-1 min-w-0">
     <Toolbar />
+    <TabBar />
     <main class="flex-1 overflow-hidden">
       {#key $currentView}
         {@const CurrentView = views[$currentView]}
