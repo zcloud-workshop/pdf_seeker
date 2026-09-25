@@ -29,6 +29,7 @@ pub fn run() {
             commands::pdf_ops::rotate_pdf,
             commands::pdf_ops::delete_pages,
             commands::pdf_ops::extract_text,
+            commands::pdf_ops::extract_page_texts,
             commands::pdf_ops::split_pdf,
             commands::pdf_ops::extract_pages_pdf,
             commands::pdf_ops::compress_pdf,

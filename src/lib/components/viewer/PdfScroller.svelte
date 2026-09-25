@@ -43,7 +43,16 @@
 
   // ─── Props ──────────────────────────────────────────────────────────
 
-  let { tab, active = false }: { tab: Tab; active?: boolean } = $props();
+  let {
+    tab,
+    active = false,
+    initialPage,
+  }: { tab: Tab; active?: boolean; initialPage?: number } = $props();
+
+  /** Expose the scroll container so other components (e.g. PDF compare) can sync scrolling */
+  export function getScrollContainer(): HTMLDivElement | undefined {
+    return scrollContainer;
+  }
 
   // ─── State ───────────────────────────────────────────────────────────
 
@@ -690,6 +699,23 @@
   }
 
   // ─── Effects ────────────────────────────────────────────────────────
+
+  // Jump to initialPage once pages are laid out (used by PDF compare)
+  $effect(() => {
+    const target = initialPage;
+    if (target == null) return;
+    let rafId = 0;
+    let tries = 0;
+    const check = () => {
+      if (pageHeights.length > 0) {
+        rafId = requestAnimationFrame(() => scrollToPage(target));
+      } else if (tries++ < 600) {
+        rafId = requestAnimationFrame(check);
+      }
+    };
+    rafId = requestAnimationFrame(check);
+    return () => cancelAnimationFrame(rafId);
+  });
 
   // Load once on mount — a tab's path never changes (openTab dedupes paths)
   $effect(() => {

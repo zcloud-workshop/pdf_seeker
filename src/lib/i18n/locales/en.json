@@ -8,7 +8,8 @@
     "viewer": "Viewer",
     "tools": "Tools",
     "storage": "Storage",
-    "settings": "Settings"
+    "settings": "Settings",
+    "compare": "Compare"
   },
   "toolbar": {
     "openFile": "Open File",
@@ -123,5 +124,25 @@
   },
   "tabs": {
     "close": "Close tab"
+  },
+  "compare": {
+    "title": "PDF Compare",
+    "pickA": "Choose file A",
+    "pickB": "Choose file B",
+    "hint": "Choose two PDF files to start comparing",
+    "textMode": "Text diff",
+    "visualMode": "Side by side",
+    "page": "Page",
+    "pageSame": "Same",
+    "pageChanged": "Changed",
+    "onlyA": "Only in A",
+    "onlyB": "Only in B",
+    "sumSame": "Same pages:",
+    "sumChanged": "Changed pages:",
+    "sumOnlyA": "Only A:",
+    "sumOnlyB": "Only B:",
+    "onlyChanged": "Changed pages only",
+    "openVisual": "Open in side-by-side",
+    "identical": "The two files have identical text content"
   }
 }

@@ -5,6 +5,7 @@
     Home,
     FileText,
     Wrench,
+    GitCompare,
     HardDrive,
     Settings,
   } from "lucide-svelte";
@@ -15,6 +16,7 @@
     { view: "home", icon: Home, labelKey: "nav.home" },
     { view: "viewer", icon: FileText, labelKey: "nav.viewer" },
     { view: "tools", icon: Wrench, labelKey: "nav.tools" },
+    { view: "compare", icon: GitCompare, labelKey: "nav.compare" },
     { view: "storage", icon: HardDrive, labelKey: "nav.storage" },
     { view: "settings", icon: Settings, labelKey: "nav.settings" },
   ];

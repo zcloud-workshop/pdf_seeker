@@ -373,8 +373,22 @@ pub fn extract_text(path: String) -> AppResult<TextExtractResult> {
     })
 }
 
-// ==================== Split PDF ====================
+/// Per-page text extraction (for PDF compare)
+#[tauri::command]
+pub fn extract_page_texts(path: String) -> AppResult<Vec<String>> {
+    let doc = load_doc(&path)?;
+    let pages = doc.get_pages();
+    let mut texts = Vec::with_capacity(pages.len());
+    for (page_num, _) in pages.iter() {
+        let text = doc
+            .extract_text(&[*page_num])
+            .map_err(|e| format!("Extract page {}: {}", page_num, e))?;
+        texts.push(text);
+    }
+    Ok(texts)
+}
 
+// ==================== Split PDF ====================
 #[tauri::command]
 pub fn split_pdf(req: SplitPdfRequest) -> AppResult<Vec<String>> {
     let doc = load_doc(&req.input_path)?;
@@ -2630,6 +2644,34 @@ mod tests {
             replacements: vec![],
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_page_texts() {
+        let dir = TempDir::new().unwrap();
+        let base = create_test_pdf(dir.path(), "pt_base.pdf", 3);
+        let src = dir.path().join("pt_src.pdf").to_string_lossy().to_string();
+        add_text_to_page(AddTextRequest {
+            input_path: base,
+            output_path: src.clone(),
+            page: 2,
+            x: 72.0,
+            y: 700.0,
+            text: "Second page text".into(),
+            font_size: 12.0,
+            color: "#000000".into(),
+        })
+        .unwrap();
+
+        let texts = extract_page_texts(src).unwrap();
+        assert_eq!(texts.len(), 3);
+        assert!(texts[1].contains("Second page text"));
+        assert!(!texts[0].contains("Second page text"));
+    }
+
+    #[test]
+    fn test_extract_page_texts_missing_file_fails() {
+        assert!(extract_page_texts("/nonexistent/x.pdf".into()).is_err());
     }
 
     #[test]

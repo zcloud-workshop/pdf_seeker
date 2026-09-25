@@ -1,6 +1,6 @@
 import { derived, get, writable } from "svelte/store";
 
-export type ViewName = "home" | "viewer" | "tools" | "storage" | "settings";
+export type ViewName = "home" | "viewer" | "tools" | "compare" | "storage" | "settings";
 
 export const currentView = writable<ViewName>("home");
 

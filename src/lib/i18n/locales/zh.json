@@ -8,7 +8,8 @@
     "viewer": "查看器",
     "tools": "工具",
     "storage": "存储",
-    "settings": "设置"
+    "settings": "设置",
+    "compare": "对比"
   },
   "toolbar": {
     "openFile": "打开文件",
@@ -123,5 +124,25 @@
   },
   "tabs": {
     "close": "关闭标签页"
+  },
+  "compare": {
+    "title": "PDF 对比",
+    "pickA": "选择文件 A",
+    "pickB": "选择文件 B",
+    "hint": "选择两个 PDF 文件开始对比",
+    "textMode": "文本差异",
+    "visualMode": "并排对比",
+    "page": "第",
+    "pageSame": "相同",
+    "pageChanged": "有差异",
+    "onlyA": "仅文件 A",
+    "onlyB": "仅文件 B",
+    "sumSame": "相同页",
+    "sumChanged": "差异页",
+    "sumOnlyA": "仅 A",
+    "sumOnlyB": "仅 B",
+    "onlyChanged": "仅显示差异页",
+    "openVisual": "在并排视图查看",
+    "identical": "两个文件文本内容完全一致"
   }
 }

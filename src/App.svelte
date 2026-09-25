@@ -6,6 +6,7 @@
   import Home from "$views/Home.svelte";
   import Viewer from "$views/Viewer.svelte";
   import Tools from "$views/Tools.svelte";
+  import Compare from "$views/Compare.svelte";
   import Storage from "$views/Storage.svelte";
   import Settings from "$views/Settings.svelte";
   import type { ViewName } from "@/stores";
@@ -14,6 +15,7 @@
     home: Home,
     viewer: Viewer,
     tools: Tools,
+    compare: Compare,
     storage: Storage,
     settings: Settings,
   };
