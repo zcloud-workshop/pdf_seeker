@@ -24,7 +24,6 @@ anyhow = "1"
 lopdf = "0.34"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 toml = "0.8"
-directories = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 log = "0.4"

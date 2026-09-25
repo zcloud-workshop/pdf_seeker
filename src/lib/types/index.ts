@@ -3,6 +3,7 @@ export interface GeneralConfig {
   theme: string;
   default_export_dir: string | null;
   recent_files_max: number;
+  recent_files: string[];
 }
 
 export type S3AuthMode = "none" | "static" | "env";

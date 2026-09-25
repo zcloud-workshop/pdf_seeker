@@ -20,10 +20,12 @@
   let s3VersionTtl = $state("");
   let saveStatus = $state("");
   let connectionStatus = $state<"idle" | "testing" | "ok" | "fail">("idle");
+  let loadedConfig: AppConfig | null = null;
 
   async function loadConfig() {
     try {
       const config: AppConfig = await invoke("get_config");
+      loadedConfig = config;
       language = config.general.language;
       theme = config.general.theme;
       if (config.s3) {
@@ -49,8 +51,9 @@
         general: {
           language,
           theme,
-          default_export_dir: null,
-          recent_files_max: 20,
+          default_export_dir: loadedConfig?.general.default_export_dir ?? null,
+          recent_files_max: loadedConfig?.general.recent_files_max ?? 20,
+          recent_files: loadedConfig?.general.recent_files ?? [],
         },
         s3: s3Enabled
           ? {

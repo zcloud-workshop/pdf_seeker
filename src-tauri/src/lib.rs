@@ -3,6 +3,7 @@ mod config;
 mod error;
 
 use std::sync::Mutex;
+use tauri::Manager;
 
 pub fn run() {
     let initial_config = config::AppConfig::default();
@@ -13,7 +14,9 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(Mutex::new(initial_config))
         .setup(|app| {
-            config::init(app.handle())?;
+            if let Some(state) = app.try_state::<Mutex<config::AppConfig>>() {
+                config::init(app.handle(), &state)?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
