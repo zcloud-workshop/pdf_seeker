@@ -8,7 +8,8 @@
     "viewer": "Viewer",
     "tools": "Tools",
     "storage": "Storage",
-    "settings": "Settings"
+    "settings": "Settings",
+    "compare": "Compare"
   },
   "toolbar": {
     "openFile": "Open File",
@@ -26,7 +27,22 @@
     "fitWidth": "Fit Width",
     "fitPage": "Fit Page",
     "rotateLeft": "Rotate Left",
-    "rotateRight": "Rotate Right"
+    "rotateRight": "Rotate Right",
+    "outline": "Bookmarks",
+    "outlineEdit": "Edit bookmarks",
+    "outlineApply": "Apply changes (write to file)",
+    "outlineCancel": "Cancel editing",
+    "outlineEmpty": "No bookmarks",
+    "outlineAddTitle": "Bookmark title",
+    "outlineAdd": "Add at current page",
+    "outlineExpand": "Expand",
+    "outlineCollapse": "Collapse",
+    "outlineMoveUp": "Move up",
+    "outlineMoveDown": "Move down",
+    "outlinePromote": "Promote (outdent)",
+    "outlineDemote": "Demote (indent)",
+    "outlineDelete": "Delete",
+    "outlineUndoHint": "Cmd/Ctrl+Z undoes the last write"
   },
   "recent": {
     "title": "Recent Files",
@@ -62,7 +78,20 @@
     "s3MaxVersions": "Max Versions to Keep",
     "s3VersionTtl": "Version Retention Days",
     "save": "Save",
-    "saved": "Settings saved"
+    "saved": "Settings saved",
+    "syncTitle": "Cloud Sync",
+    "syncHint": "Back up your settings (incl. S3 connection and recent files) to the current S3 bucket and restore them on other devices. Note: the backup contains plaintext credentials — use a private bucket.",
+    "syncAuto": "Auto backup (upload on save)",
+    "syncLastBackup": "Last backup",
+    "syncBackupNow": "Back up now",
+    "syncShowVersions": "Cloud versions",
+    "syncHideVersions": "Hide versions",
+    "syncNoVersions": "No cloud backups yet (bucket versioning must be enabled to keep history)",
+    "syncLatest": "Latest",
+    "syncRestore": "Restore",
+    "syncRestoreConfirm": "This overwrites all local settings (including the current S3 connection) with the cloud backup. Continue?",
+    "syncRestoreDone": "Config restored from cloud",
+    "syncBackupDone": "Backup uploaded"
   },
   "storage": {
     "title": "S3 Compatible Storage",
@@ -104,6 +133,54 @@
     "goToViewer": "Go to Viewer",
     "selectAll": "Select All",
     "clear": "Clear",
-    "keep": "keep"
+    "keep": "keep",
+    "plugins": "Plugins",
+    "pluginsEmpty": "No plugins found",
+    "pluginsDirHint": "Put plugins in the app's plugins directory (one sub-directory + plugin.json manifest each), see docs/plugins.md",
+    "pluginsBackList": "Back to plugins",
+    "pluginsNoInput": "No input file (no PDF is currently open)",
+    "pluginsChooseInput": "Choose input file",
+    "pluginsUseCurrent": "Use current PDF",
+    "pluginsRun": "Run",
+    "pluginsTimeout": "Timed out and terminated",
+    "pluginsExitCode": "Exit code",
+    "pluginsDone": "Finished",
+    "pluginsOpenOutput": "Open output file",
+    "pluginsStdout": "stdout",
+    "pluginsStderr": "stderr"
+  },
+  "tabs": {
+    "close": "Close tab"
+  },
+  "compare": {
+    "title": "PDF Compare",
+    "pickA": "Choose file A",
+    "pickB": "Choose file B",
+    "hint": "Choose two PDF files to start comparing",
+    "textMode": "Text diff",
+    "visualMode": "Side by side",
+    "page": "Page",
+    "pageSame": "Same",
+    "pageChanged": "Changed",
+    "onlyA": "Only in A",
+    "onlyB": "Only in B",
+    "sumSame": "Same pages:",
+    "sumChanged": "Changed pages:",
+    "sumOnlyA": "Only A:",
+    "sumOnlyB": "Only B:",
+    "onlyChanged": "Changed pages only",
+    "openVisual": "Open in side-by-side",
+    "identical": "The two files have identical text content"
+  },
+  "updater": {
+    "title": "Software Update",
+    "autoCheck": "Check for updates on startup",
+    "checkNow": "Check for updates",
+    "available": "Update available",
+    "upToDate": "You are on the latest version",
+    "devSkip": "Update checks are skipped in dev builds",
+    "declined": "Update skipped",
+    "error": "Update check failed (network or endpoint unavailable)",
+    "restartPrompt": "Update installed. Relaunch the app now?"
   }
 }

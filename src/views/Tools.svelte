@@ -1,6 +1,6 @@
 <script lang="ts">
   import { t } from "@/i18n/index.svelte.ts";
-  import { currentView, currentFilePath, isDark } from "@/stores";
+  import { currentView, currentFilePath, isDark, openTab } from "@/stores";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import { readFile, writeTextFile, writeFile } from "@tauri-apps/plugin-fs";
@@ -38,7 +38,10 @@
     ClipboardList as Icon_ClipboardList,
     Replace as Icon_Replace,
     ShieldCheck as Icon_ShieldCheck,
+    Puzzle as Icon_Puzzle,
+    Play as Icon_Play,
   } from "lucide-svelte";
+  import { open as openShell } from "@tauri-apps/plugin-shell";
   import { loadPdf, renderPageToCanvas, type PdfDocumentProxy } from "@/pdf-engine";
   import { tick } from "svelte";
 
@@ -47,7 +50,7 @@
     | "compress" | "watermark" | "img2pdf" | "pdf2img"
     | "pdf2text" | "sign" | "ocr" | "table"
     | "editText" | "editRect" | "editHighlight" | "crop" | "annotate" | "form"
-    | "replaceText" | "security";
+    | "replaceText" | "security" | "plugins";
 
   let activeTool: ToolId | null = $state(null);
   let busy = $state(false);
@@ -118,6 +121,7 @@
     { id: "form", icon: Icon_ClipboardList, labelKey: "tools.form", ready: true, hasPreview: false },
     { id: "replaceText", icon: Icon_Replace, labelKey: "tools.replaceText", ready: true, hasPreview: false },
     { id: "security", icon: Icon_ShieldCheck, labelKey: "tools.security", ready: true, hasPreview: false },
+    { id: "plugins", icon: Icon_Puzzle, labelKey: "tools.plugins", ready: true, hasPreview: false },
     { id: "table", icon: Icon_Table, labelKey: "tools.extractTable", ready: true, hasPreview: true },
   ];
 
@@ -1664,12 +1668,98 @@
     });
     if (selected) {
       const path = typeof selected === "string" ? selected : String(selected);
-      currentFilePath.set(path);
+      openTab(path);
     }
   }
 
   function openCurrentInViewer() {
     if ($currentFilePath) currentView.set("viewer");
+  }
+
+  // ==================== Plugins ====================
+
+  interface PluginManifest {
+    id: string;
+    name: string;
+    version?: string | null;
+    description?: string | null;
+    command: string;
+    args?: string[];
+    output?: { mode: string; extension?: string | null };
+    timeoutSecs?: number;
+  }
+
+  let plugins = $state<PluginManifest[]>([]);
+  let activePlugin = $state<PluginManifest | null>(null);
+  let pluginBusy = $state(false);
+  let pluginInputPath = $state<string | null>(null);
+  let pluginResult = $state<{
+    exitCode: number | null;
+    stdout: string;
+    stderr: string;
+    timedOut: boolean;
+    outputPath?: string;
+  } | null>(null);
+
+  async function loadPlugins() {
+    try {
+      plugins = await invoke<PluginManifest[]>("list_plugins");
+    } catch (_) {
+      plugins = [];
+    }
+  }
+
+  async function choosePluginInput() {
+    const selected = await open({
+      filters: [{ name: "PDF", extensions: ["pdf"] }],
+    });
+    if (selected) {
+      pluginInputPath =
+        typeof selected === "string" ? selected : String(selected);
+    }
+  }
+
+  async function executePlugin() {
+    if (!activePlugin) return;
+    const inputPath = pluginInputPath ?? $currentFilePath;
+    if ((activePlugin.args ?? []).some((a) => a.includes("{input}")) && !inputPath) {
+      resultMsg = String(t("tools.pluginsNoInput"));
+      resultOk = false;
+      return;
+    }
+    let outputPath: string | null = null;
+    if (activePlugin.output?.mode === "file") {
+      const ext = activePlugin.output.extension || "txt";
+      const chosen = await save({
+        filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
+      });
+      if (!chosen) return;
+      outputPath = typeof chosen === "string" ? chosen : String(chosen);
+    }
+    pluginBusy = true;
+    pluginResult = null;
+    try {
+      const r = await invoke<{
+        exitCode: number | null;
+        stdout: string;
+        stderr: string;
+        timedOut: boolean;
+      }>("run_plugin", {
+        req: { pluginId: activePlugin.id, inputPath, outputPath },
+      });
+      pluginResult = { ...r, outputPath: outputPath ?? undefined };
+    } catch (e) {
+      resultMsg = String(e);
+      resultOk = false;
+    } finally {
+      pluginBusy = false;
+    }
+  }
+
+  async function openPluginOutput(path: string) {
+    try {
+      await openShell(path);
+    } catch (_) {}
   }
 
   function selectTool(id: ToolId) {
@@ -1687,6 +1777,7 @@
     }
     if (id === "pdf2text" && $currentFilePath) executePdf2Text();
     if (id === "ocr") checkOcr();
+    if (id === "plugins") loadPlugins();
   }
 
   function getThumbClasses(pageNum: number): string {
@@ -3024,6 +3115,105 @@
                 <Button onclick={executeDecryptPdf} disabled={busy}>
                   {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_ShieldCheck size={14} class="mr-1.5" />Decrypt &amp; Save As}{/if}
                 </Button>
+              {/if}
+            {/if}
+          </div>
+        {/if}
+
+        {#if activeTool === "plugins"}
+          <div class="space-y-3">
+            {#if !activePlugin}
+              {#if plugins.length === 0}
+                <p class="text-sm text-muted-foreground">{t("tools.pluginsEmpty")}</p>
+                <p class="text-xs text-muted-foreground">{t("tools.pluginsDirHint")}</p>
+              {:else}
+                <div class="space-y-2">
+                  {#each plugins as p (p.id)}
+                    <button
+                      class="w-full text-left px-3 py-2 rounded-lg border border-border hover:border-primary/40 transition-colors"
+                      onclick={() => {
+                        activePlugin = p;
+                        pluginResult = null;
+                        pluginInputPath = null;
+                      }}
+                    >
+                      <div class="flex items-center justify-between gap-2">
+                        <span class="text-sm font-medium text-foreground">{p.name}</span>
+                        {#if p.version}
+                          <span class="text-[10px] text-muted-foreground shrink-0">v{p.version}</span>
+                        {/if}
+                      </div>
+                      {#if p.description}
+                        <p class="text-xs text-muted-foreground mt-0.5">{p.description}</p>
+                      {/if}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            {:else}
+              <div class="flex items-center justify-between">
+                <span class="text-sm font-medium text-foreground">{activePlugin.name}</span>
+                <button
+                  class="text-xs text-muted-foreground hover:text-foreground"
+                  onclick={() => (activePlugin = null)}
+                >
+                  {t("tools.pluginsBackList")}
+                </button>
+              </div>
+              {#if activePlugin.description}
+                <p class="text-xs text-muted-foreground">{activePlugin.description}</p>
+              {/if}
+              <p class="text-xs text-muted-foreground truncate" title={pluginInputPath ?? $currentFilePath ?? ""}>
+                {pluginInputPath ?? $currentFilePath ?? t("tools.pluginsNoInput")}
+              </p>
+              <div class="flex gap-2">
+                <Button variant="outline" size="sm" onclick={choosePluginInput}>
+                  <Icon_FolderOpen size={14} class="mr-1.5" />
+                  {t("tools.pluginsChooseInput")}
+                </Button>
+                {#if pluginInputPath}
+                  <Button variant="ghost" size="sm" onclick={() => (pluginInputPath = null)}>
+                    {t("tools.pluginsUseCurrent")}
+                  </Button>
+                {/if}
+              </div>
+              <Button onclick={executePlugin} disabled={pluginBusy}>
+                {#if pluginBusy}
+                  <Icon_Loader2 size={14} class="animate-spin" />
+                {:else}
+                  <Icon_Play size={14} class="mr-1.5" />
+                  {t("tools.pluginsRun")}
+                {/if}
+              </Button>
+
+              {#if pluginResult}
+                {#if pluginResult.timedOut}
+                  <p class="text-xs text-destructive">{t("tools.pluginsTimeout")}</p>
+                {:else if pluginResult.exitCode !== 0}
+                  <p class="text-xs text-destructive">
+                    {t("tools.pluginsExitCode")}: {pluginResult.exitCode}
+                  </p>
+                {:else}
+                  <p class="text-xs text-green-600">{t("tools.pluginsDone")}</p>
+                {/if}
+                {#if pluginResult.outputPath}
+                  <Button variant="outline" size="sm" onclick={() => openPluginOutput(pluginResult!.outputPath!)}>
+                    <Icon_FileOutput size={14} class="mr-1.5" />
+                    {t("tools.pluginsOpenOutput")}
+                  </Button>
+                {/if}
+                {#if pluginResult.stdout}
+                  <div>
+                    <p class="text-xs text-muted-foreground mb-1">{t("tools.pluginsStdout")}</p>
+                    <pre class="max-h-64 overflow-auto rounded-lg border border-border bg-muted/40 p-2 text-[11px] whitespace-pre-wrap">{pluginResult.stdout}</pre>
+                  </div>
+                {/if}
+                {#if pluginResult.stderr}
+                  <div>
+                    <p class="text-xs text-muted-foreground mb-1">{t("tools.pluginsStderr")}</p>
+                    <pre class="max-h-48 overflow-auto rounded-lg border border-border bg-muted/40 p-2 text-[11px] whitespace-pre-wrap text-destructive">{pluginResult.stderr}</pre>
+                  </div>
+                {/if}
               {/if}
             {/if}
           </div>

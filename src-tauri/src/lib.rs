@@ -3,6 +3,7 @@ mod config;
 mod error;
 
 use std::sync::Mutex;
+use tauri::Manager;
 
 pub fn run() {
     let initial_config = config::AppConfig::default();
@@ -11,9 +12,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(Mutex::new(initial_config))
         .setup(|app| {
-            config::init(app.handle())?;
+            if let Some(state) = app.try_state::<Mutex<config::AppConfig>>() {
+                config::init(app.handle(), &state)?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -26,6 +31,7 @@ pub fn run() {
             commands::pdf_ops::rotate_pdf,
             commands::pdf_ops::delete_pages,
             commands::pdf_ops::extract_text,
+            commands::pdf_ops::extract_page_texts,
             commands::pdf_ops::split_pdf,
             commands::pdf_ops::extract_pages_pdf,
             commands::pdf_ops::compress_pdf,
@@ -46,9 +52,12 @@ pub fn run() {
             commands::pdf_ops::get_form_fields,
             commands::pdf_ops::fill_form,
             commands::pdf_ops::replace_text,
+            commands::pdf_ops::set_outline,
             commands::security::encrypt_pdf,
             commands::security::decrypt_pdf,
             commands::fs_utils::list_dir_files,
+            commands::plugins::list_plugins,
+            commands::plugins::run_plugin,
             commands::s3_ops::s3_test_connection,
             commands::s3_ops::s3_list_files,
             commands::s3_ops::s3_upload_file,
@@ -58,6 +67,10 @@ pub fn run() {
             commands::s3_ops::s3_delete_version,
             commands::s3_ops::s3_create_folder,
             commands::s3_ops::s3_get_presigned_url,
+            commands::s3_ops::sync_backup_config,
+            commands::s3_ops::sync_fetch_backup_info,
+            commands::s3_ops::sync_list_backup_versions,
+            commands::s3_ops::sync_restore_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

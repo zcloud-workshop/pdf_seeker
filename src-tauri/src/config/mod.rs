@@ -2,6 +2,7 @@ use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tauri::Manager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +17,15 @@ pub struct GeneralConfig {
     pub theme: String,
     pub default_export_dir: Option<String>,
     pub recent_files_max: usize,
+    #[serde(default)]
+    pub recent_files: Vec<String>,
+    /// Check for app updates on startup
+    #[serde(default = "default_true")]
+    pub auto_update_check: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -43,6 +53,12 @@ pub struct S3Config {
     pub root_prefix: Option<String>,
     pub max_versions: Option<usize>,
     pub version_ttl_days: Option<u64>,
+    /// Auto-upload a config backup to S3 whenever settings are saved
+    #[serde(default)]
+    pub auto_backup_config: bool,
+    /// Epoch seconds of the last successful config backup
+    #[serde(default)]
+    pub last_backup_at: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -53,6 +69,8 @@ impl Default for AppConfig {
                 theme: "system".to_string(),
                 default_export_dir: None,
                 recent_files_max: 20,
+                recent_files: Vec::new(),
+                auto_update_check: true,
             },
             s3: None,
         }
@@ -76,10 +94,6 @@ fn config_file_path(handle: &tauri::AppHandle) -> AppResult<PathBuf> {
     Ok(config_dir(handle)?.join(CONFIG_FILE_NAME))
 }
 
-pub fn load_config() -> AppConfig {
-    AppConfig::default()
-}
-
 pub fn load_config_with_handle(handle: &tauri::AppHandle) -> AppResult<AppConfig> {
     let path = config_file_path(handle)?;
     if !path.exists() {
@@ -92,19 +106,6 @@ pub fn load_config_with_handle(handle: &tauri::AppHandle) -> AppResult<AppConfig
     Ok(config)
 }
 
-pub fn save_config(config: &AppConfig) -> AppResult<()> {
-    let content = toml::to_string_pretty(config)?;
-    // Write to default location when no handle available
-    let home = directories::ProjectDirs::from("com", "pdfseeker", "PDF Seeker")
-        .map(|d| d.config_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    if !home.exists() {
-        fs::create_dir_all(&home)?;
-    }
-    fs::write(home.join(CONFIG_FILE_NAME), content)?;
-    Ok(())
-}
-
 pub fn save_config_with_handle(handle: &tauri::AppHandle, config: &AppConfig) -> AppResult<()> {
     let path = config_file_path(handle)?;
     let content = toml::to_string_pretty(config)?;
@@ -112,7 +113,9 @@ pub fn save_config_with_handle(handle: &tauri::AppHandle, config: &AppConfig) ->
     Ok(())
 }
 
-pub fn init(handle: &tauri::AppHandle) -> AppResult<()> {
-    load_config_with_handle(handle)?;
+pub fn init(handle: &tauri::AppHandle, state: &Mutex<AppConfig>) -> AppResult<()> {
+    let loaded = load_config_with_handle(handle)?;
+    let mut cfg = state.lock().map_err(|e| AppError::Config(e.to_string()))?;
+    *cfg = loaded;
     Ok(())
 }

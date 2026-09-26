@@ -3,6 +3,8 @@ export interface GeneralConfig {
   theme: string;
   default_export_dir: string | null;
   recent_files_max: number;
+  recent_files: string[];
+  auto_update_check: boolean;
 }
 
 export type S3AuthMode = "none" | "static" | "env";
@@ -19,6 +21,8 @@ export interface S3Config {
   root_prefix: string | null;
   max_versions: number | null;
   version_ttl_days: number | null;
+  auto_backup_config: boolean;
+  last_backup_at: string | null;
 }
 
 export interface AppConfig {

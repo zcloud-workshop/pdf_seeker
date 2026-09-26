@@ -8,7 +8,8 @@
     "viewer": "查看器",
     "tools": "工具",
     "storage": "存储",
-    "settings": "设置"
+    "settings": "设置",
+    "compare": "对比"
   },
   "toolbar": {
     "openFile": "打开文件",
@@ -26,7 +27,22 @@
     "fitWidth": "适应宽度",
     "fitPage": "适应页面",
     "rotateLeft": "向左旋转",
-    "rotateRight": "向右旋转"
+    "rotateRight": "向右旋转",
+    "outline": "书签",
+    "outlineEdit": "编辑书签",
+    "outlineApply": "应用更改（写入文件）",
+    "outlineCancel": "取消编辑",
+    "outlineEmpty": "无书签",
+    "outlineAddTitle": "书签标题",
+    "outlineAdd": "在当前页新增",
+    "outlineExpand": "展开",
+    "outlineCollapse": "折叠",
+    "outlineMoveUp": "上移",
+    "outlineMoveDown": "下移",
+    "outlinePromote": "升级（减少缩进）",
+    "outlineDemote": "降级（增加缩进）",
+    "outlineDelete": "删除",
+    "outlineUndoHint": "Cmd/Ctrl+Z 可撤销最近一次写入"
   },
   "recent": {
     "title": "最近文件",
@@ -62,7 +78,20 @@
     "s3MaxVersions": "最大保留版本数",
     "s3VersionTtl": "版本保留天数",
     "save": "保存",
-    "saved": "设置已保存"
+    "saved": "设置已保存",
+    "syncTitle": "云同步",
+    "syncHint": "将配置（含 S3 连接与最近文件）备份到当前 S3 存储桶，可跨设备恢复。注意：备份包含明文密钥，请使用私有存储桶。",
+    "syncAuto": "自动备份（保存设置时上传）",
+    "syncLastBackup": "上次备份",
+    "syncBackupNow": "立即备份",
+    "syncShowVersions": "云端版本",
+    "syncHideVersions": "收起版本",
+    "syncNoVersions": "暂无云端备份（需要存储桶开启版本控制才能保留历史）",
+    "syncLatest": "最新",
+    "syncRestore": "恢复",
+    "syncRestoreConfirm": "将用云端备份覆盖本地全部设置（包括当前 S3 连接配置），确定继续？",
+    "syncRestoreDone": "已从云端恢复配置",
+    "syncBackupDone": "备份已上传到云端"
   },
   "storage": {
     "title": "S3 兼容存储",
@@ -104,6 +133,54 @@
     "goToViewer": "前往查看器",
     "selectAll": "全选",
     "clear": "清空",
-    "keep": "保留"
+    "keep": "保留",
+    "plugins": "插件",
+    "pluginsEmpty": "未发现插件",
+    "pluginsDirHint": "将插件放入应用的 plugins 目录（每个插件一个子目录 + plugin.json 清单），详见 docs/plugins.md",
+    "pluginsBackList": "返回插件列表",
+    "pluginsNoInput": "未指定输入文件（当前无打开的 PDF）",
+    "pluginsChooseInput": "选择输入文件",
+    "pluginsUseCurrent": "改用当前 PDF",
+    "pluginsRun": "运行",
+    "pluginsTimeout": "运行超时，已终止",
+    "pluginsExitCode": "退出码",
+    "pluginsDone": "运行完成",
+    "pluginsOpenOutput": "打开输出文件",
+    "pluginsStdout": "标准输出",
+    "pluginsStderr": "标准错误"
+  },
+  "tabs": {
+    "close": "关闭标签页"
+  },
+  "compare": {
+    "title": "PDF 对比",
+    "pickA": "选择文件 A",
+    "pickB": "选择文件 B",
+    "hint": "选择两个 PDF 文件开始对比",
+    "textMode": "文本差异",
+    "visualMode": "并排对比",
+    "page": "第",
+    "pageSame": "相同",
+    "pageChanged": "有差异",
+    "onlyA": "仅文件 A",
+    "onlyB": "仅文件 B",
+    "sumSame": "相同页",
+    "sumChanged": "差异页",
+    "sumOnlyA": "仅 A",
+    "sumOnlyB": "仅 B",
+    "onlyChanged": "仅显示差异页",
+    "openVisual": "在并排视图查看",
+    "identical": "两个文件文本内容完全一致"
+  },
+  "updater": {
+    "title": "软件更新",
+    "autoCheck": "启动时自动检查更新",
+    "checkNow": "立即检查更新",
+    "available": "发现新版本",
+    "upToDate": "当前已是最新版本",
+    "devSkip": "开发模式下不检查更新",
+    "declined": "已跳过此次更新",
+    "error": "检查更新失败（网络或更新源不可用）",
+    "restartPrompt": "更新已安装，立即重启应用？"
   }
 }

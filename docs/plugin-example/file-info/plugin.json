@@ -1,0 +1,10 @@
+{
+  "id": "file-info",
+  "name": "File Info (demo)",
+  "version": "1.0.0",
+  "description": "打印输入 PDF 的名称、大小与 SHA-256（Python 标准库，零依赖示例）",
+  "command": "python3",
+  "args": ["{dir}/file_info.py", "{input}"],
+  "output": { "mode": "text" },
+  "timeoutSecs": 30
+}
