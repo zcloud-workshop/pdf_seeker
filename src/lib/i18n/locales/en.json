@@ -1,7 +1,9 @@
 {
   "app": {
     "name": "PDF Seeker",
-    "loading": "Loading..."
+    "loading": "Loading...",
+    "exitWhileEditingTitle": "Write in progress",
+    "exitWhileEditing": "A PDF write is still in progress. Quitting now abandons it; the file itself will not be corrupted. Quit anyway?"
   },
   "nav": {
     "home": "Home",
@@ -167,7 +169,9 @@
     "pluginsStderr": "stderr"
   },
   "tabs": {
-    "close": "Close tab"
+    "close": "Close tab",
+    "closeBlockedTitle": "Write in progress",
+    "closeBlocked": "This file is currently being written by an edit or undo. Try closing the tab again once it finishes."
   },
   "compare": {
     "title": "PDF Compare",
@@ -201,6 +205,7 @@
     "devSkip": "Update checks are skipped in dev builds",
     "declined": "Update skipped",
     "error": "Update failed",
-    "restartPrompt": "Update installed. Relaunch the app now?"
+    "restartPrompt": "Update installed. Relaunch the app now?",
+    "busyEditing": "A PDF write is in progress. Finish or cancel it, then check for updates again."
   }
 }
