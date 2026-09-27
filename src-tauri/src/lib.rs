@@ -24,6 +24,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::config::get_config,
             commands::config::update_config,
+            commands::config::set_theme_preference,
             commands::recent::get_recent_files,
             commands::recent::add_recent_file,
             commands::recent::clear_recent_files,
