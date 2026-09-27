@@ -1,54 +1,104 @@
 <script lang="ts">
   import { t } from "@/i18n/index.svelte.ts";
   import { invoke } from "@tauri-apps/api/core";
-  import { open, save } from "@tauri-apps/plugin-dialog";
+  import { ask, open, save } from "@tauri-apps/plugin-dialog";
+  import { tick } from "svelte";
   import { Button, Input } from "@/components/ui";
   import {
     HardDrive, Upload, Download, FolderTree, Clock,
     FolderPlus, Trash2, FileText, ChevronRight, RefreshCw,
     Loader2, AlertCircle, CheckCircle, X,
   } from "lucide-svelte";
-  // @ts-ignore - module resolution for types
-  import type { S3Config } from "@/lib/types";
+  import type { AppConfig, S3Config } from "@/types";
+  import {
+    parseS3ListResult,
+    parseS3VersionsResult,
+    type S3FileItem,
+    type S3VersionItem,
+  } from "@/storage/contracts";
 
   let s3Config = $state<S3Config | null>(null);
   let currentFolder = $state("");
   let folderPath = $state<string[]>([]);
-  let files = $state<Array<{ key: string; name: string; size: number; lastModified: string; isDir: boolean }>>([]);
+  let files = $state<S3FileItem[]>([]);
   let loading = $state(false);
+  let configLoading = $state(true);
+  let configError = $state("");
+  let fileState = $state<"loading" | "empty" | "ready" | "error">("loading");
   let error = $state("");
+  let listRequestId = 0;
+  let configRequestId = 0;
   let uploading = $state(false);
   let downloading = $state(false);
   let uploadProgress = $state("");
   let versionsOpen = $state(false);
   let versionsKey = $state("");
-  let versions = $state<Array<{ versionId: string; size: number; lastModified: string; isLatest: boolean }>>([]);
+  let versions = $state<S3VersionItem[]>([]);
   let versionsLoading = $state(false);
+  let versionsError = $state("");
+  let versionRequestId = 0;
+  let versionsDialog: HTMLDivElement | undefined = $state();
+  let versionsTrigger: HTMLElement | null = null;
   let showNewFolder = $state(false);
   let newFolderName = $state("");
 
   async function loadConfig() {
+    const requestId = ++configRequestId;
+    configLoading = true;
+    configError = "";
     try {
-      const config = await invoke<{ general: any; s3: S3Config | null }>("get_config");
+      const config = await invoke<AppConfig>("get_config");
+      if (requestId !== configRequestId) return;
       s3Config = config.s3;
-    } catch (_) {}
+      currentFolder = "";
+      folderPath = [];
+      if (s3Config) {
+        await loadFiles("", s3Config);
+      } else {
+        files = [];
+        fileState = "empty";
+      }
+    } catch (e) {
+      if (requestId === configRequestId) {
+        configError = String(e);
+      }
+    } finally {
+      if (requestId === configRequestId) configLoading = false;
+    }
   }
 
-  async function loadFiles() {
-    if (!s3Config) return;
+  async function loadFiles(folder = currentFolder, config = s3Config) {
+    if (!config) return;
+    const requestId = ++listRequestId;
     loading = true;
+    fileState = "loading";
     error = "";
     try {
-      const result = await invoke<{
-        items: Array<{ key: string; name: string; size: number; lastModified: string; isDir: boolean }>;
-        commonPrefixes: string[];
-      }>("s3_list_files", { s3Config, folder: currentFolder });
+      const result = parseS3ListResult(
+        await invoke<unknown>("s3_list_files", { s3Config: config, folder }),
+      );
+      if (
+        requestId !== listRequestId ||
+        folder !== currentFolder ||
+        config !== s3Config
+      ) {
+        return;
+      }
       files = result.items;
+      fileState = files.length === 0 ? "empty" : "ready";
     } catch (e) {
+      if (
+        requestId !== listRequestId ||
+        folder !== currentFolder ||
+        config !== s3Config
+      ) {
+        return;
+      }
       error = String(e);
       files = [];
+      fileState = "error";
     } finally {
-      loading = false;
+      if (requestId === listRequestId) loading = false;
     }
   }
 
@@ -59,13 +109,19 @@
   async function navigateTo(name: string) {
     currentFolder = currentFolder ? `${currentFolder}/${name}` : name;
     folderPath = [...folderPath, name];
-    await loadFiles();
+    await loadFiles(currentFolder);
   }
 
   async function navigateToIndex(index: number) {
-    folderPath = folderPath.slice(0, index);
+    folderPath = folderPath.slice(0, index + 1);
     currentFolder = folderPath.join("/");
-    await loadFiles();
+    await loadFiles(currentFolder);
+  }
+
+  async function navigateToRoot() {
+    folderPath = [];
+    currentFolder = "";
+    await loadFiles("");
   }
 
   async function uploadFiles() {
@@ -89,7 +145,7 @@
         await invoke("s3_upload_file", {
           s3Config,
           localPath: paths[i],
-          remoteKey: currentFolder ? `${currentFolder}/${name}` : name,
+          folder: currentFolder,
         });
       }
       uploadProgress = "";
@@ -114,10 +170,10 @@
       await invoke("s3_download_file", {
         s3Config,
         remoteKey: key,
-        localPath: out as string,
+        localPath: out,
       });
     } catch (e) {
-      error = String(e);
+      error = `${t("storage.downloadError")}: ${key} -> ${out} (${String(e)})`;
     } finally {
       downloading = false;
     }
@@ -125,6 +181,11 @@
 
   async function deleteFile(key: string) {
     if (!s3Config) return;
+    const confirmed = await ask(`${t("storage.deleteConfirm")}\n\n${key}`, {
+      title: t("storage.delete"),
+      kind: "warning",
+    });
+    if (!confirmed) return;
     error = "";
     try {
       await invoke("s3_delete_file", { s3Config, remoteKey: key });
@@ -134,36 +195,99 @@
     }
   }
 
-  async function showVersions(key: string) {
+  async function showVersions(key: string, trigger?: HTMLElement) {
     if (!s3Config) return;
+    const requestId = ++versionRequestId;
+    if (trigger) {
+      versionsTrigger = trigger;
+    } else if (!versionsTrigger) {
+      versionsTrigger =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    }
     versionsKey = key;
     versionsOpen = true;
     versionsLoading = true;
     versions = [];
+    versionsError = "";
     error = "";
+    await tick();
+    versionsDialog?.focus();
     try {
-      const result = await invoke<{
-        versions: Array<{ versionId: string; size: number; lastModified: string; isLatest: boolean }>;
-        deleteMarkers: string[];
-      }>("s3_list_versions", { s3Config, remoteKey: key });
+      const result = parseS3VersionsResult(
+        await invoke<unknown>("s3_list_versions", { s3Config, remoteKey: key }),
+      );
+      if (requestId !== versionRequestId || versionsKey !== key) return;
       versions = result.versions;
     } catch (e) {
-      error = String(e);
+      if (requestId === versionRequestId && versionsKey === key) {
+        versionsError = String(e);
+      }
     } finally {
-      versionsLoading = false;
+      if (requestId === versionRequestId) versionsLoading = false;
     }
+  }
+
+  function closeVersions() {
+    versionRequestId++;
+    versionsOpen = false;
+    versionsLoading = false;
+    const trigger = versionsTrigger;
+    versionsTrigger = null;
+    queueMicrotask(() => trigger?.focus());
   }
 
   async function deleteVersion(versionId: string) {
     if (!s3Config) return;
+    const confirmed = await ask(
+      `${t("storage.deleteVersionConfirm")}\n\n${versionsKey}\n${versionId}`,
+      { title: t("storage.deleteVersion"), kind: "warning" },
+    );
+    if (!confirmed) return;
     error = "";
     try {
       await invoke("s3_delete_version", { s3Config, remoteKey: versionsKey, versionId });
       await showVersions(versionsKey);
     } catch (e) {
-      error = String(e);
+      versionsError = String(e);
     }
   }
+
+  $effect(() => {
+    if (!versionsOpen) return;
+    const handleKeydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeVersions();
+        return;
+      }
+      if (event.key !== "Tab" || !versionsDialog) return;
+      const focusable = Array.from(
+        versionsDialog.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (focusable.length === 0) {
+        event.preventDefault();
+        versionsDialog.focus();
+      } else if (
+        event.shiftKey &&
+        (document.activeElement === focusable[0] ||
+          !versionsDialog.contains(document.activeElement))
+      ) {
+        event.preventDefault();
+        focusable[focusable.length - 1].focus();
+      } else if (
+        !event.shiftKey &&
+        (document.activeElement === focusable[focusable.length - 1] ||
+          !versionsDialog.contains(document.activeElement))
+      ) {
+        event.preventDefault();
+        focusable[0].focus();
+      }
+    };
+    window.addEventListener("keydown", handleKeydown);
+    return () => window.removeEventListener("keydown", handleKeydown);
+  });
 
   async function createFolder() {
     if (!s3Config || !newFolderName.trim()) return;
@@ -205,29 +329,52 @@
   <div class="flex items-center h-12 px-6 border-b border-border bg-card shrink-0">
     <h1 class="text-base font-semibold text-foreground">{t("nav.storage")}</h1>
     <div class="flex-1"></div>
-    {#if s3Config}
+    {#if configLoading}
+      <Loader2 size={15} class="animate-spin text-muted-foreground" />
+    {:else if s3Config}
       <Button variant="outline" size="sm" onclick={uploadFiles} disabled={uploading} class="gap-1.5 mr-2">
         {#if uploading}
           <Loader2 size={14} class="animate-spin" />
         {:else}
           <Upload size={14} />
         {/if}
-        {t("storage.upload") || "Upload"}
+        {t("storage.upload")}
       </Button>
-      <Button variant="outline" size="sm" onclick={() => showNewFolder = !showNewFolder} class="gap-1.5 mr-2">
+      <Button
+        variant="outline"
+        size="sm"
+        onclick={() => showNewFolder = !showNewFolder}
+        class="gap-1.5 mr-2"
+        aria-label={t("storage.newFolder")}
+      >
         <FolderPlus size={14} />
-        {t("storage.newFolder") || "New Folder"}
+        {t("storage.newFolder")}
       </Button>
-      <Button variant="ghost" size="sm" onclick={refresh} class="gap-1">
+      <Button
+        variant="ghost"
+        size="sm"
+        onclick={refresh}
+        class="gap-1"
+        title={t("storage.refresh")}
+        aria-label={t("storage.refresh")}
+      >
         <RefreshCw size={14} class={loading ? "animate-spin" : ""} />
       </Button>
     {:else}
-      <span class="text-sm text-muted-foreground">Please configure S3 in Settings</span>
+      <span class="text-sm text-muted-foreground">{t("storage.noConfig")}</span>
     {/if}
   </div>
 
   <div class="flex-1 overflow-auto p-6">
-    {#if !s3Config}
+    {#if configLoading}
+      <div class="flex items-center justify-center h-full">
+        <Loader2 size={24} class="animate-spin text-muted-foreground" />
+      </div>
+    {:else if configError}
+      <div class="flex items-center justify-center h-full text-sm text-destructive">
+        {configError}
+      </div>
+    {:else if !s3Config}
       <div class="flex flex-col items-center justify-center h-full gap-6">
         <div class="p-6 rounded-2xl bg-muted/50">
           <HardDrive size={48} class="text-muted-foreground/40 mx-auto" />
@@ -235,7 +382,7 @@
         <div class="text-center space-y-1">
           <p class="text-muted-foreground">{t("settings.s3")}</p>
           <p class="text-xs text-muted-foreground/70">
-            Configure S3 storage in Settings to enable cloud features.
+            {t("storage.noConfig")}
           </p>
         </div>
       </div>
@@ -244,7 +391,7 @@
       <div class="flex items-center gap-1 mb-4 text-sm">
         <button
           class="text-muted-foreground hover:text-foreground transition-colors"
-          onclick={() => { folderPath = []; currentFolder = ""; loadFiles(); }}
+          onclick={navigateToRoot}
         >
           {t("settings.s3")}
         </button>
@@ -262,14 +409,21 @@
       <!-- New folder input -->
       {#if showNewFolder}
         <div class="flex items-center gap-2 mb-4">
+          <label for="new-folder-name" class="text-sm font-medium">{t("storage.folderName")}</label>
           <Input
-            value={newFolderName}
-            onchange={(e) => (newFolderName = (e.target as HTMLInputElement).value)}
-            placeholder="Folder name"
+            id="new-folder-name"
+            bind:value={newFolderName}
+            placeholder={t("storage.folderName")}
             class="w-60"
           />
-          <Button size="sm" onclick={createFolder}>Create</Button>
-          <Button variant="ghost" size="sm" onclick={() => { showNewFolder = false; newFolderName = ""; }}>
+          <Button size="sm" onclick={createFolder}>{t("storage.createFolder")}</Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            title={t("storage.close")}
+            aria-label={t("storage.close")}
+            onclick={() => { showNewFolder = false; newFolderName = ""; }}
+          >
             <X size={14} />
           </Button>
         </div>
@@ -287,7 +441,7 @@
       {#if downloading}
         <div class="mb-4 p-2 rounded-lg bg-muted text-sm text-muted-foreground flex items-center gap-2">
           <Loader2 size={14} class="animate-spin" />
-          Downloading...
+          {t("storage.downloading")}
         </div>
       {/if}
 
@@ -304,10 +458,14 @@
         <div class="flex items-center justify-center py-12">
           <Loader2 size={24} class="animate-spin text-muted-foreground" />
         </div>
-      {:else if files.length === 0}
+      {:else if fileState === "empty"}
         <div class="flex flex-col items-center justify-center py-12 text-muted-foreground">
           <FolderTree size={40} class="mb-3 opacity-40" />
-          <p class="text-sm">Empty folder</p>
+          <p class="text-sm">{t("storage.empty")}</p>
+        </div>
+      {:else if fileState === "error"}
+        <div class="py-12 text-center text-sm text-muted-foreground">
+          {t("storage.loadFailed")}
         </div>
       {:else}
         <div class="space-y-1">
@@ -315,7 +473,7 @@
             <div
               class="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-accent transition-colors group"
             >
-              {#if file.isDir}
+              {#if file.is_dir}
                 <button
                   class="flex items-center gap-3 flex-1 text-left"
                   onclick={() => navigateTo(file.name)}
@@ -327,25 +485,28 @@
                 <FileText size={18} class="text-muted-foreground shrink-0" />
                 <span class="text-sm text-foreground flex-1 truncate" title={file.key}>{file.name}</span>
                 <span class="text-xs text-muted-foreground w-20 text-right">{formatSize(file.size)}</span>
-                <span class="text-xs text-muted-foreground w-40 text-right">{formatDate(file.lastModified)}</span>
-                <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                <span class="text-xs text-muted-foreground w-40 text-right">{formatDate(file.last_modified)}</span>
+                <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
                   <button
-                    class="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-                    title="Download"
+                    class="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    title={t("storage.download")}
+                    aria-label={t("storage.download")}
                     onclick={() => downloadFile(file.key, file.name)}
                   >
                     <Download size={14} />
                   </button>
                   <button
-                    class="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-                    title="Versions"
-                    onclick={() => showVersions(file.key)}
+                    class="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    title={t("storage.versions")}
+                    aria-label={t("storage.versions")}
+                    onclick={(event) => showVersions(file.key, event.currentTarget)}
                   >
                     <Clock size={14} />
                   </button>
                   <button
-                    class="p-1 rounded hover:bg-muted text-destructive/70 hover:text-destructive"
-                    title="Delete"
+                    class="p-1 rounded hover:bg-muted text-destructive/70 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    title={t("storage.delete")}
+                    aria-label={t("storage.delete")}
                     onclick={() => deleteFile(file.key)}
                   >
                     <Trash2 size={14} />
@@ -359,49 +520,59 @@
 
       <!-- Versions panel -->
       {#if versionsOpen}
-        <!-- svelte-ignore a11y_no_static_element_interactions a11y_interactive_supports_focus -->
         <div
           class="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-          onclick={() => { versionsOpen = false; }}
-          role="dialog"
+          role="presentation"
         >
           <div
-            class="bg-card border border-border rounded-xl shadow-lg w-[500px] max-h-[70vh] flex flex-col"
-            onclick={(e) => e.stopPropagation()}
+            bind:this={versionsDialog}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="storage-versions-title"
+            tabindex="-1"
+            class="bg-card border border-border rounded-xl shadow-lg w-[calc(100vw-2rem)] max-w-[500px] max-h-[70vh] flex flex-col"
           >
             <div class="flex items-center justify-between px-5 py-4 border-b border-border">
-              <h3 class="text-sm font-medium text-foreground flex items-center gap-2">
+              <h3 id="storage-versions-title" class="text-sm font-medium text-foreground flex items-center gap-2 min-w-0">
                 <Clock size={16} />
-                Versions — {versionsKey.split("/").pop()}
+                <span class="truncate" title={versionsKey}>{t("storage.versions")}: {versionsKey}</span>
               </h3>
-              <button class="text-muted-foreground hover:text-foreground" onclick={() => { versionsOpen = false; }}>
+              <button
+                class="text-muted-foreground hover:text-foreground"
+                title={t("storage.close")}
+                aria-label={t("storage.close")}
+                onclick={closeVersions}
+              >
                 <X size={16} />
               </button>
             </div>
             <div class="flex-1 overflow-auto p-3">
-              {#if versionsLoading}
+              {#if versionsError}
+                <p class="text-sm text-destructive text-center py-8">{versionsError}</p>
+              {:else if versionsLoading}
                 <div class="flex items-center justify-center py-8">
                   <Loader2 size={20} class="animate-spin text-muted-foreground" />
                 </div>
               {:else if versions.length === 0}
-                <p class="text-sm text-muted-foreground text-center py-8">No versions found</p>
+                <p class="text-sm text-muted-foreground text-center py-8">{t("storage.noVersions")}</p>
               {:else}
                 <div class="space-y-1">
                   {#each versions as ver}
                     <div class="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-accent text-sm">
-                      {#if ver.isLatest}
+                      {#if ver.is_latest}
                         <CheckCircle size={14} class="text-green-600 shrink-0" />
                       {:else}
                         <div class="w-3.5 shrink-0"></div>
                       {/if}
-                      <span class="text-muted-foreground w-20 text-xs font-mono truncate">{ver.versionId.slice(0, 12)}...</span>
+                      <span class="text-muted-foreground w-20 text-xs font-mono truncate" title={ver.version_id}>{ver.version_id.slice(0, 12)}...</span>
                       <span class="flex-1 text-muted-foreground">{formatSize(ver.size)}</span>
-                      <span class="text-muted-foreground text-xs">{formatDate(ver.lastModified)}</span>
-                      {#if !ver.isLatest}
+                      <span class="text-muted-foreground text-xs">{formatDate(ver.last_modified)}</span>
+                      {#if !ver.is_latest}
                         <button
                           class="p-1 rounded hover:bg-muted text-destructive/70 hover:text-destructive"
-                          title="Delete version"
-                          onclick={() => deleteVersion(ver.versionId)}
+                          title={t("storage.deleteVersion")}
+                          aria-label={t("storage.deleteVersion")}
+                          onclick={() => deleteVersion(ver.version_id)}
                         >
                           <Trash2 size={13} />
                         </button>

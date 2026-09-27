@@ -4,7 +4,12 @@
   import { invoke } from "@tauri-apps/api/core";
   import { ask } from "@tauri-apps/plugin-dialog";
   import type { AppConfig, S3Config } from "@/types";
-  import { checkForUpdates } from "@/updater";
+  import { checkForUpdates, updaterState } from "@/updater";
+  import {
+    activeThemePreference,
+    applyConfig,
+    saveAndApplyConfig,
+  } from "@/settings";
 
   let language = $state("zh");
   let theme = $state("system");
@@ -22,10 +27,11 @@
   let s3PathStyle = $state(false);
   let s3RootPrefix = $state("");
   let s3MaxVersions = $state("");
-  let s3VersionTtl = $state("");
   let s3AutoBackup = $state(false);
   let saveStatus = $state("");
+  let configRecoveryNotice = $state("");
   let connectionStatus = $state<"idle" | "testing" | "ok" | "fail">("idle");
+  let connectionError = $state("");
   let loadedConfig = $state<AppConfig | null>(null);
 
   // Cloud sync state
@@ -49,7 +55,7 @@
       force_path_style: s3PathStyle,
       root_prefix: s3RootPrefix || null,
       max_versions: s3MaxVersions ? parseInt(s3MaxVersions) : null,
-      version_ttl_days: s3VersionTtl ? parseInt(s3VersionTtl) : null,
+      version_ttl_days: loadedConfig?.s3?.version_ttl_days ?? null,
       auto_backup_config: s3AutoBackup,
       last_backup_at: loadedConfig?.s3?.last_backup_at ?? null,
     };
@@ -72,29 +78,37 @@
     return isNaN(d.getTime()) ? iso : d.toLocaleString();
   }
 
+  function hydrateConfig(config: AppConfig) {
+    loadedConfig = config;
+    configRecoveryNotice = config.recovery_notice ?? "";
+    language = config.general.language === "en" ? "en" : "zh";
+    theme =
+      config.general.theme === "light" || config.general.theme === "dark"
+        ? config.general.theme
+        : "system";
+    autoUpdateCheck = config.general.auto_update_check ?? true;
+    s3Enabled = config.s3 !== null;
+    s3AuthMode = config.s3?.auth_mode ?? "static";
+    s3Endpoint = config.s3?.endpoint ?? "";
+    s3Region = config.s3?.region ?? "";
+    s3Bucket = config.s3?.bucket ?? "";
+    s3AccessKey = config.s3?.access_key ?? "";
+    s3SecretKey = config.s3?.secret_key ?? "";
+    s3SessionToken = config.s3?.session_token ?? "";
+    s3PathStyle = config.s3?.force_path_style ?? false;
+    s3RootPrefix = config.s3?.root_prefix ?? "";
+    s3MaxVersions = config.s3?.max_versions?.toString() ?? "";
+    s3AutoBackup = config.s3?.auto_backup_config ?? false;
+  }
+
   async function loadConfig() {
     try {
       const config: AppConfig = await invoke("get_config");
-      loadedConfig = config;
-      language = config.general.language;
-      theme = config.general.theme;
-      autoUpdateCheck = config.general.auto_update_check ?? true;
-      if (config.s3) {
-        s3Enabled = true;
-        s3AuthMode = config.s3.auth_mode || "static";
-        s3Endpoint = config.s3.endpoint;
-        s3Region = config.s3.region;
-        s3Bucket = config.s3.bucket;
-        s3AccessKey = config.s3.access_key;
-        s3SecretKey = config.s3.secret_key;
-        s3SessionToken = config.s3.session_token || "";
-        s3PathStyle = config.s3.force_path_style;
-        s3RootPrefix = config.s3.root_prefix || "";
-        s3MaxVersions = config.s3.max_versions?.toString() || "";
-        s3VersionTtl = config.s3.version_ttl_days?.toString() || "";
-        s3AutoBackup = config.s3.auto_backup_config ?? false;
-      }
-    } catch (_) {}
+      hydrateConfig(config);
+      applyConfig(config);
+    } catch (error) {
+      saveStatus = String(error);
+    }
   }
 
   async function saveConfig() {
@@ -110,12 +124,12 @@
         },
         s3: s3Enabled ? buildS3Config() : null,
       };
-      await invoke("update_config", { newConfig: config });
-      loadedConfig = config;
+      await saveAndApplyConfig(config);
+      hydrateConfig(config);
       saveStatus = t("settings.saved");
       setTimeout(() => (saveStatus = ""), 2000);
       if (s3Enabled && s3AutoBackup) {
-        backupNow(true);
+        await backupNow();
       }
     } catch (e) {
       saveStatus = String(e);
@@ -124,20 +138,22 @@
   }
 
   async function testConnection() {
-    if (!s3Enabled || !s3Endpoint || !s3Bucket) return;
+    if (!s3Enabled || !s3Bucket) return;
     connectionStatus = "testing";
+    connectionError = "";
     try {
       await invoke("s3_test_connection", { s3Config: buildS3Config() });
       connectionStatus = "ok";
-    } catch {
+    } catch (error) {
       connectionStatus = "fail";
+      connectionError = String(error);
     }
     setTimeout(() => (connectionStatus = "idle"), 4000);
   }
 
   // ─── Cloud sync actions ────────────────────────────────────────────
 
-  async function backupNow(auto = false) {
+  async function backupNow() {
     if (!s3Enabled || !s3Bucket) return;
     syncing = "backup";
     try {
@@ -184,9 +200,8 @@
         s3Config: buildS3Config(),
         versionId: versionId || null,
       });
-      loadedConfig = restored;
-      s3Enabled = true;
-      await loadConfig();
+      hydrateConfig(restored);
+      applyConfig(restored);
       flashSync(t("settings.syncRestoreDone"));
     } catch (e) {
       flashSync(String(e), true);
@@ -202,13 +217,23 @@
       const result = await checkForUpdates();
       if (result === "up-to-date") updateStatus = t("updater.upToDate");
       else if (result === "dev-skip") updateStatus = t("updater.devSkip");
-      else if (result === "error") updateStatus = t("updater.error");
+      else if (result === "error") updateStatus = $updaterState.error || t("updater.error");
       else if (result === "declined") updateStatus = t("updater.declined");
       // "installed" ends in relaunch (or a restart prompt) — no extra text
     } finally {
       updateChecking = false;
     }
   }
+
+  function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  $effect(() => {
+    theme = $activeThemePreference;
+  });
 
   $effect(() => {
     loadConfig();
@@ -219,6 +244,13 @@
   <h1 class="text-xl font-semibold text-foreground mb-6">{t("settings.title")}</h1>
 
   <div class="max-w-2xl space-y-8">
+    {#if configRecoveryNotice}
+      <div class="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm">
+        <p class="font-medium text-destructive">{t("settings.configRecovered")}</p>
+        <p class="mt-1 break-all text-muted-foreground">{configRecoveryNotice}</p>
+      </div>
+    {/if}
+
     <!-- General Settings -->
     <section class="space-y-4">
       <h2 class="text-sm font-medium text-foreground">{t("settings.general")}</h2>
@@ -258,13 +290,32 @@
           {#if updateStatus}
             <span class="text-xs text-muted-foreground">{updateStatus}</span>
           {/if}
+          {#if $updaterState.status === "downloading"}
+            <span class="text-xs text-muted-foreground">
+              {t("updater.downloading")} {formatBytes($updaterState.downloadedBytes)}
+              {#if $updaterState.totalBytes !== null}
+                / {formatBytes($updaterState.totalBytes)}
+              {/if}
+            </span>
+          {:else if $updaterState.status === "installing"}
+            <span class="text-xs text-muted-foreground">{t("updater.installing")}</span>
+          {:else if $updaterState.status === "error" && !updateStatus}
+            <span class="text-xs text-destructive">{$updaterState.error}</span>
+          {/if}
           <Button
             variant="outline"
             size="sm"
             onclick={runUpdateCheck}
-            disabled={updateChecking}
+            disabled={
+              updateChecking ||
+              $updaterState.status === "checking" ||
+              $updaterState.status === "downloading" ||
+              $updaterState.status === "installing"
+            }
           >
-            {updateChecking ? t("app.loading") : t("updater.checkNow")}
+            {updateChecking || $updaterState.status === "checking"
+              ? t("updater.checking")
+              : t("updater.checkNow")}
           </Button>
         </div>
       </div>
@@ -276,7 +327,9 @@
         <h2 class="text-sm font-medium text-foreground">{t("settings.s3")}</h2>
         <label class="flex items-center gap-2 text-sm">
           <input type="checkbox" bind:checked={s3Enabled} class="rounded" />
-          <span class="text-muted-foreground">{s3Enabled ? "Enabled" : "Disabled"}</span>
+          <span class="text-muted-foreground">
+            {s3Enabled ? t("settings.s3Enabled") : t("settings.s3Disabled")}
+          </span>
         </label>
       </div>
       <Separator />
@@ -321,25 +374,21 @@
             </div>
             <div class="space-y-1.5">
               <Label>{t("settings.s3SessionToken")}</Label>
-              <Input bind:value={s3SessionToken} />
+              <Input type="password" bind:value={s3SessionToken} autocomplete="off" />
             </div>
           {:else if s3AuthMode === "env"}
             <p class="text-xs text-muted-foreground">
               {t("settings.s3AuthEnvHint")}
             </p>
           {/if}
-          <div class="grid grid-cols-3 gap-3">
+          <div class="grid grid-cols-2 gap-3">
             <div class="space-y-1.5">
               <Label>{t("settings.s3RootPrefix")}</Label>
               <Input bind:value={s3RootPrefix} placeholder="pdf/" />
             </div>
             <div class="space-y-1.5">
               <Label>{t("settings.s3MaxVersions")}</Label>
-              <Input type="number" bind:value={s3MaxVersions} placeholder="10" />
-            </div>
-            <div class="space-y-1.5">
-              <Label>{t("settings.s3VersionTtl")}</Label>
-              <Input type="number" bind:value={s3VersionTtl} placeholder="90" />
+              <Input type="number" min="1" bind:value={s3MaxVersions} placeholder="20" />
             </div>
           </div>
           <div class="flex items-center gap-2">
@@ -356,13 +405,15 @@
               disabled={connectionStatus === "testing"}
             >
               {connectionStatus === "testing"
-                ? "Testing..."
+                ? t("settings.s3Testing")
                 : t("settings.s3TestConnection")}
             </Button>
             {#if connectionStatus === "ok"}
               <span class="text-sm text-green-600">{t("settings.s3Connected")}</span>
             {:else if connectionStatus === "fail"}
-              <span class="text-sm text-destructive">{t("settings.s3Failed")}</span>
+              <span class="text-sm text-destructive" title={connectionError}>
+                {t("settings.s3Failed")}: {connectionError}
+              </span>
             {/if}
           </div>
 
@@ -386,7 +437,7 @@
                 variant="outline"
                 size="sm"
                 onclick={() => backupNow()}
-                disabled={syncing !== "idle"}
+                disabled={syncing !== "idle" || !s3Enabled || !s3Bucket}
               >
                 {t("settings.syncBackupNow")}
               </Button>
@@ -394,7 +445,7 @@
                 variant="outline"
                 size="sm"
                 onclick={toggleVersions}
-                disabled={syncing !== "idle"}
+                disabled={syncing !== "idle" || !s3Enabled || !s3Bucket}
               >
                 {showVersions
                   ? t("settings.syncHideVersions")
