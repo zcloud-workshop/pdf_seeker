@@ -1,0 +1,20 @@
+{
+  "items": [
+    {
+      "key": "pdf/中文/报告.pdf",
+      "name": "报告.pdf",
+      "size": 42,
+      "last_modified": "2026-09-27T12:00:00Z",
+      "is_dir": false
+    },
+    {
+      "key": "pdf/中文/嵌套/",
+      "name": "嵌套",
+      "size": 0,
+      "last_modified": "",
+      "is_dir": true
+    }
+  ],
+  "prefixes": [],
+  "common_prefixes": ["pdf/中文/嵌套/"]
+}
