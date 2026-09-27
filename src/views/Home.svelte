@@ -17,16 +17,16 @@
   }
 
   async function handleOpen() {
+    // multiple: false makes open() resolve to string | null
     const selected = await open({
       multiple: false,
       filters: [{ name: "PDF", extensions: ["pdf"] }],
     });
     if (selected) {
-      const path = typeof selected === "string" ? selected : selected.path;
-      openTab(path);
+      openTab(selected);
       currentView.set("viewer");
       try {
-        await invoke("add_recent_file", { path });
+        await invoke("add_recent_file", { path: selected });
         await loadRecent();
       } catch (_) {}
     }
