@@ -1,6 +1,7 @@
+use image as img_crate;
 use lopdf::{Document, Object, ObjectId};
 use serde::{Deserialize, Serialize};
-use image as img_crate;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub type ObjId = ObjectId;
 pub type AppResult<T> = Result<T, String>;
@@ -107,20 +108,277 @@ pub struct OcrRequest {
     pub language: String,
 }
 
+static PDF_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(super) fn lock_pdf_writes() -> AppResult<MutexGuard<'static, ()>> {
+    PDF_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "PDF write lock is unavailable".to_string())
+}
+
 fn load_doc(path: &str) -> AppResult<Document> {
     Document::load(path).map_err(|e| format!("Load '{}': {}", path, e))
 }
 
-fn save_doc(doc: &mut Document, path: &str) -> AppResult<()> {
-    doc.save(path)
-        .map(|_| ())
-        .map_err(|e| format!("Save '{}': {}", path, e))
+struct TempPdfFile(std::path::PathBuf);
+
+impl Drop for TempPdfFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn save_doc_with(
+    doc: &mut Document,
+    path: &str,
+    write: impl FnOnce(&mut Document, &std::path::Path) -> std::io::Result<()>,
+) -> AppResult<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let target = std::path::Path::new(path);
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| format!("Invalid output path: {}", path))?;
+    let mut temp = None;
+    for _ in 0..32 {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            id
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => {
+                drop(file);
+                temp = Some(TempPdfFile(temp_path));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Create temporary PDF beside '{}': {}", path, e)),
+        }
+    }
+    let temp = temp.ok_or_else(|| {
+        format!(
+            "Could not reserve temporary PDF beside '{}': name collisions",
+            path
+        )
+    })?;
+    write(doc, &temp.0).map_err(|e| format!("Save temporary PDF for '{}': {}", path, e))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temp.0)
+        .map_err(|e| format!("Open temporary PDF for '{}': {}", path, e))?;
+    file.sync_all()
+        .map_err(|e| format!("Flush temporary PDF for '{}': {}", path, e))?;
+    Document::load(&temp.0).map_err(|e| format!("Validate temporary PDF for '{}': {}", path, e))?;
+    replace_pdf_file(&temp.0, target).map_err(|e| format!("Replace '{}': {}", path, e))?;
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+pub(super) fn save_doc(doc: &mut Document, path: &str) -> AppResult<()> {
+    save_doc_with(doc, path, |doc, temp| doc.save(temp).map(|_| ()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_pdf_file(temp: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_pdf_file(temp: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0x1 | 0x8) };
+    if ok == 0 {
+        let code = unsafe { GetLastError() };
+        Err(std::io::Error::from_raw_os_error(code as i32))
+    } else {
+        Ok(())
+    }
+}
+
+fn flatten_contents(
+    doc: &Document,
+    object: &Object,
+    out: &mut Vec<ObjectId>,
+    visited: &mut std::collections::HashSet<ObjectId>,
+) -> AppResult<()> {
+    match object {
+        Object::Reference(id) => {
+            if !visited.insert(*id) {
+                return Err(format!("Circular Contents reference at {} {}", id.0, id.1));
+            }
+            let resolved = doc
+                .get_object(*id)
+                .map_err(|e| format!("Resolve Contents: {}", e))?;
+            match resolved {
+                Object::Array(items) => {
+                    for item in items {
+                        flatten_contents(doc, item, out, visited)?;
+                    }
+                }
+                Object::Stream(_) => out.push(*id),
+                _ => return Err("Contents must resolve to a stream or array".into()),
+            }
+            visited.remove(id);
+        }
+        Object::Array(items) => {
+            for item in items {
+                flatten_contents(doc, item, out, visited)?;
+            }
+        }
+        Object::Stream(_) => {
+            return Err("Direct Contents streams are unsupported by lopdf serialization".into())
+        }
+        _ => return Err("Contents must be a stream reference or array".into()),
+    }
+    Ok(())
+}
+
+fn append_page_content(
+    doc: &mut Document,
+    page_id: ObjectId,
+    new_stream_id: ObjectId,
+) -> AppResult<()> {
+    let contents = doc
+        .get_object(page_id)
+        .map_err(|e| format!("Page error: {}", e))?
+        .as_dict()
+        .map_err(|e| format!("Page dictionary error: {}", e))?
+        .get(b"Contents")
+        .ok()
+        .cloned();
+    let mut streams = Vec::new();
+    if let Some(contents) = contents {
+        flatten_contents(
+            doc,
+            &contents,
+            &mut streams,
+            &mut std::collections::HashSet::new(),
+        )?;
+    }
+    streams.push(new_stream_id);
+    let page = doc
+        .objects
+        .get_mut(&page_id)
+        .ok_or("Page object is missing")?;
+    page.as_dict_mut()
+        .map_err(|e| format!("Page dictionary error: {}", e))?
+        .set(
+            "Contents",
+            Object::Array(streams.into_iter().map(Object::Reference).collect()),
+        );
+    Ok(())
+}
+
+fn add_page_resource(
+    doc: &mut Document,
+    page_id: ObjectId,
+    category: &[u8],
+    preferred: &[u8],
+    value: Object,
+) -> AppResult<Vec<u8>> {
+    fn as_dict(doc: &Document, object: &Object) -> AppResult<lopdf::Dictionary> {
+        match object {
+            Object::Dictionary(dict) => Ok(dict.clone()),
+            Object::Reference(id) => doc
+                .get_object(*id)
+                .and_then(Object::as_dict)
+                .map(Clone::clone)
+                .map_err(|e| format!("Resolve resource dictionary: {}", e)),
+            _ => Err("Resource entry must be a dictionary".into()),
+        }
+    }
+
+    let existing = inherited_page_value(doc, page_id, b"Resources")?;
+    let mut resources = match existing.as_ref() {
+        Some(object) => as_dict(doc, object)?,
+        None => lopdf::Dictionary::new(),
+    };
+    let mut category_dict = match resources.get(category) {
+        Ok(object) => as_dict(doc, object)?,
+        Err(_) => lopdf::Dictionary::new(),
+    };
+    let mut name = preferred.to_vec();
+    let mut suffix = 1u32;
+    while category_dict.has(&name) {
+        name = format!("{}{}", String::from_utf8_lossy(preferred), suffix).into_bytes();
+        suffix += 1;
+    }
+    category_dict.set(name.clone(), value);
+    resources.set(category.to_vec(), Object::Dictionary(category_dict));
+    let resource_id = doc.add_object(Object::Dictionary(resources));
+    let page = doc
+        .objects
+        .get_mut(&page_id)
+        .ok_or("Page object is missing")?
+        .as_dict_mut()
+        .map_err(|e| format!("Page dictionary error: {}", e))?;
+    page.set("Resources", Object::Reference(resource_id));
+    Ok(name)
+}
+
+static OCR_TASK_DIRS: OnceLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+    OnceLock::new();
+
+fn ocr_task_dirs() -> &'static Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    OCR_TASK_DIRS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+struct OwnedOcrDir(std::path::PathBuf);
+
+impl Drop for OwnedOcrDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn claim_ocr_dir(path: &std::path::Path) -> AppResult<OwnedOcrDir> {
+    let mut dirs = ocr_task_dirs()
+        .lock()
+        .map_err(|_| "OCR task registry is unavailable".to_string())?;
+    if !dirs.remove(path) {
+        return Err("OCR image directory is not owned by an active task".into());
+    }
+    Ok(OwnedOcrDir(path.to_path_buf()))
 }
 
 fn escape_pdf_string(s: &str) -> String {
     s.replace('\\', "\\\\")
-     .replace('(', "\\(")
-     .replace(')', "\\)")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
+}
+
+fn validate_page_text(text: &str) -> AppResult<()> {
+    if !text.is_ascii() {
+        return Err(
+            "Visible page text currently supports ASCII only; no licensed CJK font is configured"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_page_ranges(ranges: &str, max: u32) -> AppResult<Vec<Vec<u32>>> {
@@ -130,21 +388,37 @@ fn parse_page_ranges(ranges: &str, max: u32) -> AppResult<Vec<Vec<u32>>> {
     let mut result = Vec::new();
     for part in ranges.split(',') {
         let trimmed = part.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            return Err("Empty page range".into());
+        }
         if trimmed.contains('-') {
             let nums: Vec<&str> = trimmed.split('-').collect();
-            if nums.len() != 2 { return Err(format!("Invalid range: {}", trimmed)); }
-            let s: u32 = nums[0].parse().map_err(|_| format!("Invalid number: {}", nums[0]))?;
-            let e: u32 = nums[1].parse().map_err(|_| format!("Invalid number: {}", nums[1]))?;
-            if s < 1 || e > max || s > e { return Err(format!("Range {} out of bounds (1-{})", trimmed, max)); }
+            if nums.len() != 2 {
+                return Err(format!("Invalid range: {}", trimmed));
+            }
+            let s: u32 = nums[0]
+                .parse()
+                .map_err(|_| format!("Invalid number: {}", nums[0]))?;
+            let e: u32 = nums[1]
+                .parse()
+                .map_err(|_| format!("Invalid number: {}", nums[1]))?;
+            if s < 1 || e > max || s > e {
+                return Err(format!("Range {} out of bounds (1-{})", trimmed, max));
+            }
             result.push((s..=e).collect());
         } else {
-            let n: u32 = trimmed.parse().map_err(|_| format!("Invalid number: {}", trimmed))?;
-            if n < 1 || n > max { return Err(format!("Page {} out of bounds (1-{})", n, max)); }
+            let n: u32 = trimmed
+                .parse()
+                .map_err(|_| format!("Invalid number: {}", trimmed))?;
+            if n < 1 || n > max {
+                return Err(format!("Page {} out of bounds (1-{})", n, max));
+            }
             result.push(vec![n]);
         }
     }
-    if result.is_empty() { return Err("No valid ranges".into()); }
+    if result.is_empty() {
+        return Err("No valid ranges".into());
+    }
     Ok(result)
 }
 
@@ -156,23 +430,26 @@ fn embed_image(doc: &mut Document, data: &[u8], path: &str) -> AppResult<(Object
         .to_lowercase();
 
     if ext == "jpg" || ext == "jpeg" {
-        let img = img_crate::load_from_memory(data)
-            .map_err(|e| format!("Image decode: {}", e))?;
+        let img = img_crate::load_from_memory(data).map_err(|e| format!("Image decode: {}", e))?;
         let (w, h) = (img.width(), img.height());
+        let color_space = if img.color() == img_crate::ColorType::L8 {
+            b"DeviceGray".to_vec()
+        } else {
+            b"DeviceRGB".to_vec()
+        };
         let dict = lopdf::Dictionary::from_iter(vec![
             (b"Type".to_vec(), Object::Name(b"XObject".to_vec())),
             (b"Subtype".to_vec(), Object::Name(b"Image".to_vec())),
             (b"Width".to_vec(), Object::Integer(w as i64)),
             (b"Height".to_vec(), Object::Integer(h as i64)),
-            (b"ColorSpace".to_vec(), Object::Name(b"DeviceRGB".to_vec())),
+            (b"ColorSpace".to_vec(), Object::Name(color_space)),
             (b"BitsPerComponent".to_vec(), Object::Integer(8)),
             (b"Filter".to_vec(), Object::Name(b"DCTDecode".to_vec())),
         ]);
         let id = doc.add_object(Object::Stream(lopdf::Stream::new(dict, data.to_vec())));
         Ok((id, w, h))
     } else {
-        let img = img_crate::load_from_memory(data)
-            .map_err(|e| format!("Image decode: {}", e))?;
+        let img = img_crate::load_from_memory(data).map_err(|e| format!("Image decode: {}", e))?;
         let rgba = img.to_rgba8();
         let (w, h) = (rgba.width(), rgba.height());
         let mut rgb_data = Vec::with_capacity((w * h * 3) as usize);
@@ -188,22 +465,30 @@ fn embed_image(doc: &mut Document, data: &[u8], path: &str) -> AppResult<(Object
             (b"Height".to_vec(), Object::Integer(h as i64)),
             (b"ColorSpace".to_vec(), Object::Name(b"DeviceRGB".to_vec())),
             (b"BitsPerComponent".to_vec(), Object::Integer(8)),
-            (b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec())),
         ]);
-        let id = doc.add_object(Object::Stream(lopdf::Stream::new(dict, rgb_data)));
-        let smask_dict = lopdf::Dictionary::from_iter(vec![
-            (b"Type".to_vec(), Object::Name(b"XObject".to_vec())),
-            (b"Subtype".to_vec(), Object::Name(b"Image".to_vec())),
-            (b"Width".to_vec(), Object::Integer(w as i64)),
-            (b"Height".to_vec(), Object::Integer(h as i64)),
-            (b"ColorSpace".to_vec(), Object::Name(b"DeviceGray".to_vec())),
-            (b"BitsPerComponent".to_vec(), Object::Integer(8)),
-            (b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec())),
-        ]);
-        let smask_id = doc.add_object(Object::Stream(lopdf::Stream::new(smask_dict, alpha_data)));
-        if let Some(obj) = doc.objects.get_mut(&id) {
-            if let Ok(stream) = obj.as_stream_mut() {
-                stream.dict.set(b"SMask", Object::Reference(smask_id));
+        let mut rgb_stream = lopdf::Stream::new(dict, rgb_data);
+        rgb_stream
+            .compress()
+            .map_err(|e| format!("Compress image pixels: {}", e))?;
+        let id = doc.add_object(Object::Stream(rgb_stream));
+        if alpha_data.iter().any(|alpha| *alpha != 255) {
+            let smask_dict = lopdf::Dictionary::from_iter(vec![
+                (b"Type".to_vec(), Object::Name(b"XObject".to_vec())),
+                (b"Subtype".to_vec(), Object::Name(b"Image".to_vec())),
+                (b"Width".to_vec(), Object::Integer(w as i64)),
+                (b"Height".to_vec(), Object::Integer(h as i64)),
+                (b"ColorSpace".to_vec(), Object::Name(b"DeviceGray".to_vec())),
+                (b"BitsPerComponent".to_vec(), Object::Integer(8)),
+            ]);
+            let mut alpha_stream = lopdf::Stream::new(smask_dict, alpha_data);
+            alpha_stream
+                .compress()
+                .map_err(|e| format!("Compress image alpha: {}", e))?;
+            let smask_id = doc.add_object(Object::Stream(alpha_stream));
+            if let Some(obj) = doc.objects.get_mut(&id) {
+                if let Ok(stream) = obj.as_stream_mut() {
+                    stream.dict.set(b"SMask", Object::Reference(smask_id));
+                }
             }
         }
         Ok((id, w, h))
@@ -211,7 +496,9 @@ fn embed_image(doc: &mut Document, data: &[u8], path: &str) -> AppResult<(Object
 }
 
 fn get_pages_ref(doc: &Document) -> AppResult<ObjectId> {
-    let root_ref = doc.trailer.get(b"Root")
+    let root_ref = doc
+        .trailer
+        .get(b"Root")
         .and_then(|o| o.as_reference())
         .map_err(|e| format!("Root error: {}", e))?;
     doc.get_object(root_ref)
@@ -221,8 +508,131 @@ fn get_pages_ref(doc: &Document) -> AppResult<ObjectId> {
         .map_err(|e| format!("Pages error: {}", e))
 }
 
+fn inherited_page_value(
+    doc: &Document,
+    page_id: ObjectId,
+    key: &[u8],
+) -> AppResult<Option<Object>> {
+    let mut current = page_id;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Err("Circular page Parent chain".into());
+        }
+        let dict = doc
+            .get_object(current)
+            .map_err(|e| format!("Page tree object error: {}", e))?
+            .as_dict()
+            .map_err(|e| format!("Page tree dictionary error: {}", e))?;
+        if let Ok(value) = dict.get(key) {
+            return Ok(Some(value.clone()));
+        }
+        match dict.get(b"Parent").and_then(Object::as_reference) {
+            Ok(parent) => current = parent,
+            Err(_) => return Ok(None),
+        }
+    }
+}
+
+fn flatten_page_tree(doc: &mut Document, page_ids: &[ObjectId]) -> AppResult<ObjectId> {
+    let pages_ref = get_pages_ref(doc)?;
+    fn collect_nodes(
+        doc: &Document,
+        node_id: ObjectId,
+        out: &mut Vec<ObjectId>,
+        visited: &mut std::collections::HashSet<ObjectId>,
+    ) -> AppResult<()> {
+        if !visited.insert(node_id) {
+            return Err("Circular page tree".into());
+        }
+        out.push(node_id);
+        let node = doc
+            .get_object(node_id)
+            .map_err(|e| format!("Page tree node error: {}", e))?;
+        let dict = node
+            .as_dict()
+            .map_err(|e| format!("Page tree node dictionary error: {}", e))?;
+        if dict.get(b"Type").and_then(Object::as_name).ok() != Some(b"Pages") {
+            return Ok(());
+        }
+        let kids = dict
+            .get(b"Kids")
+            .and_then(Object::as_array)
+            .map_err(|e| format!("Page tree Kids error: {}", e))?;
+        for child in kids {
+            let child_id = child
+                .as_reference()
+                .map_err(|e| format!("Page tree child error: {}", e))?;
+            let child_dict = doc
+                .get_object(child_id)
+                .and_then(Object::as_dict)
+                .map_err(|e| format!("Page tree child error: {}", e))?;
+            if child_dict.get(b"Type").and_then(Object::as_name).ok() == Some(b"Pages") {
+                collect_nodes(doc, child_id, out, visited)?;
+            }
+        }
+        Ok(())
+    }
+    let mut old_nodes = Vec::new();
+    collect_nodes(
+        doc,
+        pages_ref,
+        &mut old_nodes,
+        &mut std::collections::HashSet::new(),
+    )?;
+    let inherited_keys: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+    let mut inherited_by_page = Vec::with_capacity(page_ids.len());
+    for page_id in page_ids {
+        let mut values = Vec::new();
+        for key in inherited_keys {
+            let has_value = doc
+                .get_object(*page_id)
+                .map_err(|e| format!("Page error: {}", e))?
+                .as_dict()
+                .map_err(|e| format!("Page dictionary error: {}", e))?
+                .get(key)
+                .is_ok();
+            if !has_value {
+                if let Some(value) = inherited_page_value(doc, *page_id, key)? {
+                    values.push((key.to_vec(), value));
+                }
+            }
+        }
+        inherited_by_page.push(values);
+    }
+    for (page_id, values) in page_ids.iter().zip(inherited_by_page) {
+        let dict = doc
+            .objects
+            .get_mut(page_id)
+            .ok_or("Page object is missing")?
+            .as_dict_mut()
+            .map_err(|e| format!("Page dictionary error: {}", e))?;
+        for (key, value) in values {
+            dict.set(key, value);
+        }
+        dict.set("Parent", Object::Reference(pages_ref));
+    }
+    let pages = doc
+        .objects
+        .get_mut(&pages_ref)
+        .ok_or("Pages object is missing")?
+        .as_dict_mut()
+        .map_err(|e| format!("Pages dictionary error: {}", e))?;
+    pages.set(
+        "Kids",
+        Object::Array(page_ids.iter().copied().map(Object::Reference).collect()),
+    );
+    pages.set("Count", Object::Integer(page_ids.len() as i64));
+    for node_id in old_nodes.into_iter().filter(|id| *id != pages_ref) {
+        doc.objects.remove(&node_id);
+    }
+    Ok(pages_ref)
+}
+
 fn get_page_size(page_dict: &lopdf::Dictionary) -> (f64, f64) {
-    page_dict.get(b"MediaBox").ok()
+    page_dict
+        .get(b"MediaBox")
+        .ok()
         .and_then(|mb| mb.as_array().ok())
         .map(|arr| {
             let w = arr.get(2).and_then(|o| o.as_i64().ok()).unwrap_or(612) as f64;
@@ -242,39 +652,38 @@ fn obj_as_f64(o: &Object) -> Option<f64> {
 
 #[tauri::command]
 pub fn merge_pdfs(paths: Vec<String>, output_path: String) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     if paths.is_empty() {
         return Err("No input PDFs".into());
     }
 
     let mut merged = load_doc(&paths[0])?;
+    let first_pages: Vec<ObjectId> = merged.get_pages().values().copied().collect();
+    flatten_page_tree(&mut merged, &first_pages)?;
 
     for path in paths.iter().skip(1) {
         let mut doc = load_doc(path)?;
 
         // Collect page IDs and all object IDs BEFORE renumbering
         let old_page_ids: Vec<ObjId> = doc.get_pages().values().copied().collect();
-        let mut sorted_old_ids: Vec<ObjId> = doc.objects.keys().copied().collect();
-        sorted_old_ids.sort();
-
+        flatten_page_tree(&mut doc, &old_page_ids)?;
         // Renumber so IDs don't collide with merged's objects
         let start_id = merged.max_id + 1;
         doc.renumber_objects_with(start_id);
 
-        // Build old→new ID mapping (sorted old IDs → sequential new IDs)
-        let id_map: std::collections::BTreeMap<ObjId, ObjId> = sorted_old_ids
-            .iter()
-            .enumerate()
-            .map(|(i, old)| (*old, (start_id + i as u32, 0)))
-            .collect();
-
         // Map old page IDs to new IDs
-        let doc_pages: Vec<ObjId> = old_page_ids
-            .iter()
-            .map(|old| *id_map.get(old).unwrap_or(old))
-            .collect();
+        let doc_pages: Vec<ObjId> = doc.get_pages().values().copied().collect();
+        let source_pages_ref = get_pages_ref(&doc)?;
+        let source_catalog_ref = doc
+            .trailer
+            .get(b"Root")
+            .and_then(Object::as_reference)
+            .map_err(|e| format!("Source catalog error: {}", e))?;
 
         for (id, obj) in doc.objects {
-            merged.objects.insert(id, obj);
+            if id != source_pages_ref && id != source_catalog_ref {
+                merged.objects.insert(id, obj);
+            }
         }
         // Update max_id so save() includes all objects in the xref table
         if let Some(max_key) = merged.objects.keys().max() {
@@ -296,22 +705,33 @@ pub fn merge_pdfs(paths: Vec<String>, output_path: String) -> AppResult<()> {
 
         let merged_count = merged.get_pages().len();
 
-        let pages_obj = merged
+        let existing_kids = merged
+            .objects
+            .get(&pages_ref)
+            .ok_or("Pages object missing")?
+            .as_dict()
+            .and_then(|dict| dict.get(b"Kids"))
+            .and_then(Object::as_array)
+            .map_err(|e| format!("Pages Kids error: {}", e))?
+            .to_vec();
+        let mut kids = existing_kids;
+        for page_id in &doc_pages {
+            let page = merged
+                .objects
+                .get_mut(page_id)
+                .ok_or("Merged page object missing")?
+                .as_dict_mut()
+                .map_err(|e| format!("Merged page dictionary error: {}", e))?;
+            page.set("Parent", Object::Reference(pages_ref));
+            kids.push(Object::Reference(*page_id));
+        }
+        let pages_dict = merged
             .objects
             .get_mut(&pages_ref)
-            .ok_or("Pages object missing")?;
-
-        let pages_dict = pages_obj
+            .ok_or("Pages object missing")?
             .as_dict_mut()
             .map_err(|e| format!("Pages dict error: {}", e))?;
-
-        if let Ok(kids) = pages_dict.get_mut(b"Kids") {
-            if let Ok(arr) = kids.as_array_mut() {
-                for page_id in &doc_pages {
-                    arr.push(Object::Reference(*page_id));
-                }
-            }
-        }
+        pages_dict.set("Kids", Object::Array(kids));
 
         let total_count = (merged_count + doc_pages.len()) as i64;
         pages_dict.set("Count", Object::Integer(total_count));
@@ -322,6 +742,7 @@ pub fn merge_pdfs(paths: Vec<String>, output_path: String) -> AppResult<()> {
 
 #[tauri::command]
 pub fn rotate_pdf(req: RotatePdfRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     let mut doc = load_doc(&req.input_path)?;
     let page_ids: Vec<ObjId> = doc.get_pages().values().copied().collect();
 
@@ -334,10 +755,7 @@ pub fn rotate_pdf(req: RotatePdfRequest) -> AppResult<()> {
                     .and_then(|o| o.as_i64().ok())
                     .unwrap_or(0);
 
-                dict.set(
-                    "Rotate",
-                    Object::Integer((cur + req.angle as i64) % 360),
-                );
+                dict.set("Rotate", Object::Integer((cur + req.angle as i64) % 360));
             }
         }
     }
@@ -347,6 +765,7 @@ pub fn rotate_pdf(req: RotatePdfRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn delete_pages(req: DeletePagesRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     let mut doc = load_doc(&req.input_path)?;
     doc.delete_pages(&req.pages_to_delete);
     save_doc(&mut doc, &req.output_path)
@@ -391,32 +810,65 @@ pub fn extract_page_texts(path: String) -> AppResult<Vec<String>> {
 // ==================== Split PDF ====================
 #[tauri::command]
 pub fn split_pdf(req: SplitPdfRequest) -> AppResult<Vec<String>> {
+    let _write_lock = lock_pdf_writes()?;
     let doc = load_doc(&req.input_path)?;
     let total = doc.get_pages().len() as u32;
-    let mut output_paths = Vec::new();
-
+    if total == 0 {
+        return Err("PDF has no pages".into());
+    }
     let ranges = if req.mode == "single" {
         (1..=total).map(|p| vec![p]).collect::<Vec<_>>()
     } else {
         parse_page_ranges(&req.ranges.unwrap_or_default(), total)?
     };
 
-    for range in &ranges {
+    let mut selected = std::collections::HashSet::new();
+    for page in ranges.iter().flatten() {
+        if !selected.insert(*page) {
+            return Err(format!(
+                "Page {} appears more than once in the split ranges",
+                page
+            ));
+        }
+    }
+    let output_paths: Vec<String> = ranges
+        .iter()
+        .map(|range| {
+            let name = if range.len() == 1 {
+                format!("page_{}.pdf", range[0])
+            } else {
+                format!("pages_{}-{}.pdf", range[0], range[range.len() - 1])
+            };
+            std::path::Path::new(&req.output_dir)
+                .join(name)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    if let Some(path) = output_paths
+        .iter()
+        .find(|path| std::path::Path::new(path).exists())
+    {
+        return Err(format!("Output already exists: {}", path));
+    }
+
+    let mut written = Vec::new();
+    for (range, output_path) in ranges.iter().zip(&output_paths) {
         let mut doc_clone = doc.clone();
-        let pages_to_delete: Vec<u32> = (1..=total)
-            .filter(|p| !range.contains(p))
-            .collect();
+        let pages_to_delete: Vec<u32> = (1..=total).filter(|p| !range.contains(p)).collect();
         if !pages_to_delete.is_empty() {
             doc_clone.delete_pages(&pages_to_delete);
         }
-        let name = if range.len() == 1 {
-            format!("page_{}.pdf", range[0])
-        } else {
-            format!("pages_{}-{}.pdf", range[0], range[range.len() - 1])
-        };
-        let output_path = format!("{}/{}", req.output_dir.trim_end_matches('/').trim_end_matches('\\'), name);
-        save_doc(&mut doc_clone, &output_path)?;
-        output_paths.push(output_path);
+        if let Err(error) = save_doc(&mut doc_clone, output_path) {
+            for path in &written {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(format!(
+                "Split failed; earlier outputs were removed: {}",
+                error
+            ));
+        }
+        written.push(output_path);
     }
 
     Ok(output_paths)
@@ -426,8 +878,21 @@ pub fn split_pdf(req: SplitPdfRequest) -> AppResult<Vec<String>> {
 
 #[tauri::command]
 pub fn extract_pages_pdf(req: ExtractPagesRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     let mut doc = load_doc(&req.input_path)?;
     let total = doc.get_pages().len() as u32;
+    if req.pages_to_extract.is_empty() {
+        return Err("No pages selected".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for page in &req.pages_to_extract {
+        if *page == 0 || *page > total {
+            return Err(format!("Page {} is outside 1-{}", page, total));
+        }
+        if !seen.insert(*page) {
+            return Err(format!("Duplicate page number: {}", page));
+        }
+    }
     let pages_to_delete: Vec<u32> = (1..=total)
         .filter(|p| !req.pages_to_extract.contains(p))
         .collect();
@@ -441,6 +906,7 @@ pub fn extract_pages_pdf(req: ExtractPagesRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn compress_pdf(input_path: String, output_path: String) -> AppResult<CompressResult> {
+    let _write_lock = lock_pdf_writes()?;
     let original_size = std::fs::metadata(&input_path)
         .map(|m| m.len())
         .map_err(|e| format!("Metadata error: {}", e))?;
@@ -459,13 +925,19 @@ pub fn compress_pdf(input_path: String, output_path: String) -> AppResult<Compre
         0.0
     };
 
-    Ok(CompressResult { original_size, compressed_size, ratio })
+    Ok(CompressResult {
+        original_size,
+        compressed_size,
+        ratio,
+    })
 }
 
 // ==================== Text Watermark ====================
 
 #[tauri::command]
 pub fn add_text_watermark(req: WatermarkRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
+    validate_page_text(&req.text)?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
 
@@ -480,12 +952,19 @@ pub fn add_text_watermark(req: WatermarkRequest) -> AppResult<()> {
         (b"Type".to_vec(), Object::Name(b"Font".to_vec())),
         (b"Subtype".to_vec(), Object::Name(b"Type1".to_vec())),
         (b"BaseFont".to_vec(), Object::Name(b"Helvetica".to_vec())),
-        (b"Encoding".to_vec(), Object::Name(b"WinAnsiEncoding".to_vec())),
+        (
+            b"Encoding".to_vec(),
+            Object::Name(b"WinAnsiEncoding".to_vec()),
+        ),
     ])));
 
     for (_, page_id) in pages.iter() {
-        let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
-        let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+        let page = doc
+            .get_object(*page_id)
+            .map_err(|e| format!("Page error: {}", e))?;
+        let page_dict = page
+            .as_dict()
+            .map_err(|e| format!("Page dict error: {}", e))?;
         let (pw, ph) = get_page_size(page_dict);
 
         let opacity = req.opacity.min(1.0).max(0.0);
@@ -501,107 +980,36 @@ pub fn add_text_watermark(req: WatermarkRequest) -> AppResult<()> {
             (b"Type".to_vec(), Object::Name(b"ExtGState".to_vec())),
             (b"ca".to_vec(), Object::Real(opacity as f32)),
         ])));
+        let font_name = add_page_resource(
+            &mut doc,
+            *page_id,
+            b"Font",
+            b"F1",
+            Object::Reference(font_id),
+        )?;
+        let gs_name = add_page_resource(
+            &mut doc,
+            *page_id,
+            b"ExtGState",
+            b"GS1",
+            Object::Reference(gs_id),
+        )?;
 
         let neg_sin = -sin_a;
         let watermark_bytes = format!(
-            "q /GS1 gs BT /F1 {fs:.1} Tf {cos:.4} {sin:.4} {neg_sin:.4} {cos:.4} {cx:.1} {cy:.1} Tm {r:.3} {g:.3} {b:.3} rg ({escaped}) Tj ET Q",
+            "q /{gs_name} gs BT /{font_name} {fs:.1} Tf {cos:.4} {sin:.4} {neg_sin:.4} {cos:.4} {cx:.1} {cy:.1} Tm {r:.3} {g:.3} {b:.3} rg ({escaped}) Tj ET Q",
             fs = req.font_size, cos = cos_a, sin = sin_a, neg_sin = neg_sin, cx = cx, cy = cy,
-            r = r as f64 / 255.0, g = g as f64 / 255.0, b = b as f64 / 255.0, escaped = escaped
+            r = r as f64 / 255.0, g = g as f64 / 255.0, b = b as f64 / 255.0,
+            escaped = escaped, font_name = String::from_utf8_lossy(&font_name),
+            gs_name = String::from_utf8_lossy(&gs_name)
         ).into_bytes();
 
-        let watermark_id = doc.add_object(Object::Stream(lopdf::Stream::new(lopdf::Dictionary::new(), watermark_bytes)));
+        let watermark_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            watermark_bytes,
+        )));
 
-        // Phase 1: get or create resources (immutable read first)
-        // Handle: no Resources, Resources as reference, Resources as inline dict
-        let res_ref = {
-            let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
-            let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
-            match page_dict.get(b"Resources") {
-                Err(_) => {
-                    let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
-                    (res_id, true) // needs update on page
-                }
-                Ok(res_obj) => {
-                    if let Ok(r) = res_obj.as_reference() {
-                        (r, false) // already a reference, no update needed
-                    } else {
-                        // Inline dictionary — promote to standalone object
-                        let res_id = doc.add_object(res_obj.clone());
-                        (res_id, true) // needs update on page
-                    }
-                }
-            }
-        };
-
-        // Phase 2: add font + gs to resources
-        if let Some(res_obj) = doc.objects.get_mut(&res_ref.0) {
-            if let Ok(res_dict) = res_obj.as_dict_mut() {
-                if res_dict.get(b"Font").is_err() {
-                    res_dict.set("Font", Object::Dictionary(lopdf::Dictionary::new()));
-                }
-                if let Ok(font_d) = res_dict.get_mut(b"Font") {
-                    if let Ok(fd) = font_d.as_dict_mut() {
-                        fd.set("F1", Object::Reference(font_id));
-                    }
-                }
-                if res_dict.get(b"ExtGState").is_err() {
-                    res_dict.set("ExtGState", Object::Dictionary(lopdf::Dictionary::new()));
-                }
-                if let Ok(gs_d) = res_dict.get_mut(b"ExtGState") {
-                    if let Ok(gd) = gs_d.as_dict_mut() {
-                        gd.set("GS1", Object::Reference(gs_id));
-                    }
-                }
-            }
-        }
-
-        // Phase 3: set resources on page if newly created
-        if res_ref.1 {
-            if let Some(page_obj) = doc.objects.get_mut(page_id) {
-                if let Ok(dict) = page_obj.as_dict_mut() {
-                    dict.set("Resources", Object::Reference(res_ref.0));
-                }
-            }
-        }
-
-        // Phase 4: append watermark content (two-phase to avoid double borrow)
-        {
-            // Phase 4a: read current contents
-            let has_contents_ref: Option<ObjectId> = {
-                let page_obj = doc.objects.get(page_id).unwrap();
-                let dict = page_obj.as_dict().unwrap();
-                match dict.get(b"Contents") {
-                    Ok(c) => {
-                        if let Ok(r) = c.as_reference() {
-                            Some(r)
-                        } else if let Ok(arr) = c.as_array() {
-                            Some(doc.add_object(Object::Array(arr.clone())))
-                        } else {
-                            None
-                        }
-                    }
-                    Err(_) => None,
-                }
-            };
-
-            // Phase 4b: create new contents array (no borrow held)
-            let new_contents_ref = match has_contents_ref {
-                Some(existing_ref) => {
-                    let arr = Object::Array(vec![
-                        Object::Reference(existing_ref),
-                        Object::Reference(watermark_id),
-                    ]);
-                    doc.add_object(arr)
-                }
-                None => watermark_id,
-            };
-
-            // Phase 4c: set contents on page
-            let page_obj = doc.objects.get_mut(page_id).unwrap();
-            if let Ok(dict) = page_obj.as_dict_mut() {
-                dict.set("Contents", Object::Reference(new_contents_ref));
-            }
-        }
+        append_page_content(&mut doc, *page_id, watermark_id)?;
     }
 
     save_doc(&mut doc, &req.output_path)
@@ -611,6 +1019,7 @@ pub fn add_text_watermark(req: WatermarkRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn images_to_pdf(req: ImagesToPdfRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     if req.image_paths.is_empty() {
         return Err("No images provided".into());
     }
@@ -619,7 +1028,10 @@ pub fn images_to_pdf(req: ImagesToPdfRequest) -> AppResult<()> {
     let catalog_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
     let pages_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
         (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
-        (b"Count".to_vec(), Object::Integer(req.image_paths.len() as i64)),
+        (
+            b"Count".to_vec(),
+            Object::Integer(req.image_paths.len() as i64),
+        ),
         (b"Kids".to_vec(), Object::Array(vec![])),
     ])));
     if let Some(cat) = doc.objects.get_mut(&catalog_id) {
@@ -632,26 +1044,35 @@ pub fn images_to_pdf(req: ImagesToPdfRequest) -> AppResult<()> {
 
     let mut kids = Vec::new();
     for image_path in &req.image_paths {
-        let data = std::fs::read(image_path)
-            .map_err(|e| format!("Read '{}': {}", image_path, e))?;
+        let data =
+            std::fs::read(image_path).map_err(|e| format!("Read '{}': {}", image_path, e))?;
         let (image_id, w, h) = embed_image(&mut doc, &data, image_path)?;
 
         let content = format!("q {} 0 0 {} 0 0 cm /Im1 Do Q", w, h);
         let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
-            lopdf::Dictionary::new(), content.into_bytes(),
+            lopdf::Dictionary::new(),
+            content.into_bytes(),
         )));
-        let resources_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"XObject".to_vec(), Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                (b"Im1".to_vec(), Object::Reference(image_id)),
-            ]))),
-        ])));
+        let resources_id =
+            doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                b"XObject".to_vec(),
+                Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                    b"Im1".to_vec(),
+                    Object::Reference(image_id),
+                )])),
+            )])));
         let page_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
             (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
             (b"Parent".to_vec(), Object::Reference(pages_id)),
-            (b"MediaBox".to_vec(), Object::Array(vec![
-                Object::Integer(0), Object::Integer(0),
-                Object::Integer(w as i64), Object::Integer(h as i64),
-            ])),
+            (
+                b"MediaBox".to_vec(),
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(w as i64),
+                    Object::Integer(h as i64),
+                ]),
+            ),
             (b"Contents".to_vec(), Object::Reference(content_id)),
             (b"Resources".to_vec(), Object::Reference(resources_id)),
         ])));
@@ -671,33 +1092,38 @@ pub fn images_to_pdf(req: ImagesToPdfRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn reorder_pages(req: ReorderPagesRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
     let total = pages.len() as u32;
 
     if req.new_order.len() != total as usize {
-        return Err(format!("Expected {} page numbers, got {}", total, req.new_order.len()));
+        return Err(format!(
+            "Expected {} page numbers, got {}",
+            total,
+            req.new_order.len()
+        ));
     }
 
     let mut current_order: Vec<(u32, ObjectId)> = pages.iter().map(|(n, id)| (*n, *id)).collect();
     current_order.sort_by_key(|(n, _)| *n);
 
-    let mut new_kids = Vec::new();
+    let mut reordered_ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for page_num in &req.new_order {
         if *page_num < 1 || *page_num > total {
             return Err(format!("Invalid page number: {}", page_num));
         }
-        let (_, page_id) = current_order.iter().find(|(n, _)| *n == *page_num)
-            .ok_or(format!("Page {} not found", page_num))?;
-        new_kids.push(Object::Reference(*page_id));
-    }
-
-    let pages_ref = get_pages_ref(&doc)?;
-    if let Some(pages_obj) = doc.objects.get_mut(&pages_ref) {
-        if let Ok(dict) = pages_obj.as_dict_mut() {
-            dict.set("Kids", Object::Array(new_kids));
+        if !seen.insert(*page_num) {
+            return Err(format!("Duplicate page number: {}", page_num));
         }
+        let (_, page_id) = current_order
+            .iter()
+            .find(|(n, _)| *n == *page_num)
+            .ok_or(format!("Page {} not found", page_num))?;
+        reordered_ids.push(*page_id);
     }
+    flatten_page_tree(&mut doc, &reordered_ids)?;
 
     save_doc(&mut doc, &req.output_path)
 }
@@ -706,50 +1132,68 @@ pub fn reorder_pages(req: ReorderPagesRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn insert_pages(req: InsertPagesRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     let mut target = load_doc(&req.input_path)?;
     let mut source = load_doc(&req.source_path)?;
 
     let old_source_page_ids: Vec<ObjectId> = source.get_pages().values().copied().collect();
-    let mut sorted_old_ids: Vec<ObjectId> = source.objects.keys().copied().collect();
-    sorted_old_ids.sort();
-
+    flatten_page_tree(&mut source, &old_source_page_ids)?;
     let start_id = target.max_id + 1;
     source.renumber_objects_with(start_id);
 
-    let id_map: std::collections::BTreeMap<ObjectId, ObjectId> = sorted_old_ids
-        .iter().enumerate()
-        .map(|(i, old)| (*old, (start_id + i as u32, 0)))
-        .collect();
+    let source_page_ids: Vec<ObjectId> = source.get_pages().values().copied().collect();
+    let inherited_keys: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+    let mut source_page_inherited = Vec::with_capacity(source_page_ids.len());
+    for page_id in &source_page_ids {
+        let mut values = Vec::new();
+        for key in inherited_keys {
+            if let Some(value) = inherited_page_value(&source, *page_id, key)? {
+                values.push((key.to_vec(), value));
+            }
+        }
+        source_page_inherited.push(values);
+    }
 
-    let source_page_ids: Vec<ObjectId> = old_source_page_ids
-        .iter().map(|old| *id_map.get(old).unwrap_or(old)).collect();
-
+    let source_pages_ref = get_pages_ref(&source)?;
+    let source_catalog_ref = source
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .map_err(|e| format!("Source catalog error: {}", e))?;
     for (id, obj) in source.objects {
-        target.objects.insert(id, obj);
+        if id != source_pages_ref && id != source_catalog_ref {
+            target.objects.insert(id, obj);
+        }
     }
     if let Some(max_key) = target.objects.keys().max() {
         target.max_id = target.max_id.max(max_key.0);
     }
 
-    let target_count = target.get_pages().len();
+    let mut target_page_ids: Vec<ObjectId> = target.get_pages().values().copied().collect();
+    let target_count = target_page_ids.len();
     let pos = req.insert_position as usize;
     if pos > target_count {
-        return Err(format!("Insert position {} exceeds page count {}", pos, target_count));
+        return Err(format!(
+            "Insert position {} exceeds page count {}",
+            pos, target_count
+        ));
     }
 
-    let pages_ref = get_pages_ref(&target)?;
-    if let Some(pages_obj) = target.objects.get_mut(&pages_ref) {
-        if let Ok(dict) = pages_obj.as_dict_mut() {
-            if let Ok(kids) = dict.get_mut(b"Kids") {
-                if let Ok(arr) = kids.as_array_mut() {
-                    for (i, page_id) in source_page_ids.iter().enumerate() {
-                        arr.insert(pos + i, Object::Reference(*page_id));
-                    }
-                }
-            }
-            dict.set("Count", Object::Integer((target_count + source_page_ids.len()) as i64));
+    let pages_ref = flatten_page_tree(&mut target, &target_page_ids)?;
+    for (page_id, values) in source_page_ids.iter().zip(source_page_inherited) {
+        let page = target
+            .objects
+            .get_mut(page_id)
+            .ok_or("Inserted page object missing")?
+            .as_dict_mut()
+            .map_err(|e| format!("Inserted page dictionary error: {}", e))?;
+        for (key, value) in values {
+            page.set(key, value);
         }
+        page.set("Parent", Object::Reference(pages_ref));
     }
+    target_page_ids.splice(pos..pos, source_page_ids);
+    flatten_page_tree(&mut target, &target_page_ids)?;
 
     save_doc(&mut target, &req.output_path)
 }
@@ -758,109 +1202,39 @@ pub fn insert_pages(req: InsertPagesRequest) -> AppResult<()> {
 
 #[tauri::command]
 pub fn sign_pdf(req: SignPdfRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     let mut doc = load_doc(&req.input_path)?;
 
-    let sig_data = std::fs::read(&req.signature_image_path)
-        .map_err(|e| format!("Read signature: {}", e))?;
+    let sig_data =
+        std::fs::read(&req.signature_image_path).map_err(|e| format!("Read signature: {}", e))?;
     let (image_id, _w, _h) = embed_image(&mut doc, &sig_data, &req.signature_image_path)?;
 
     let pages = doc.get_pages();
-    let page_id = pages.get(&req.page)
+    let page_id = pages
+        .get(&req.page)
         .ok_or(format!("Page {} not found", req.page))?;
 
+    let image_name = add_page_resource(
+        &mut doc,
+        *page_id,
+        b"XObject",
+        b"SigImg",
+        Object::Reference(image_id),
+    )?;
     let content = format!(
-        "q {} 0 0 {} {} {} cm /SigImg Do Q",
-        req.width, req.height, req.x, req.y
+        "q {} 0 0 {} {} {} cm /{} Do Q",
+        req.width,
+        req.height,
+        req.x,
+        req.y,
+        String::from_utf8_lossy(&image_name)
     );
     let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
-        lopdf::Dictionary::new(), content.into_bytes(),
+        lopdf::Dictionary::new(),
+        content.into_bytes(),
     )));
 
-    // Get or create resources reference first
-    // Handle: no Resources, Resources as reference, Resources as inline dict
-    let res_ref = {
-        let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
-        let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
-        match page_dict.get(b"Resources") {
-            Err(_) => {
-                let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                    (b"XObject".to_vec(), Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                        (b"SigImg".to_vec(), Object::Reference(image_id)),
-                    ]))),
-                ])));
-                (res_id, true)
-            }
-            Ok(res_obj) => {
-                if let Ok(r) = res_obj.as_reference() {
-                    (r, false)
-                } else {
-                    // Inline dictionary — promote to standalone object
-                    let res_id = doc.add_object(res_obj.clone());
-                    (res_id, true)
-                }
-            }
-        }
-    };
-
-    if !res_ref.1 {
-        // Add XObject to existing resources
-        if let Some(res_obj) = doc.objects.get_mut(&res_ref.0) {
-            if let Ok(res_dict) = res_obj.as_dict_mut() {
-                let xobject = lopdf::Dictionary::from_iter(vec![
-                    (b"SigImg".to_vec(), Object::Reference(image_id)),
-                ]);
-                res_dict.set("XObject", Object::Dictionary(xobject));
-            }
-        }
-    }
-
-    // Set resources reference on page if newly created
-    if res_ref.1 {
-        if let Some(page_obj) = doc.objects.get_mut(page_id) {
-            if let Ok(dict) = page_obj.as_dict_mut() {
-                dict.set("Resources", Object::Reference(res_ref.0));
-            }
-        }
-    }
-
-    // Append content stream to page (two-phase to avoid double borrow)
-    {
-        // Phase 1: read current Contents
-        let has_contents_ref: Option<ObjectId> = {
-            let page_obj = doc.objects.get(page_id).unwrap();
-            let dict = page_obj.as_dict().unwrap();
-            match dict.get(b"Contents") {
-                Ok(c) => {
-                    if let Ok(r) = c.as_reference() {
-                        Some(r)
-                    } else if let Ok(arr) = c.as_array() {
-                        Some(doc.add_object(Object::Array(arr.clone())))
-                    } else {
-                        None
-                    }
-                }
-                Err(_) => None,
-            }
-        };
-
-        // Phase 2: create new contents array (no borrow held)
-        let new_contents_ref = match has_contents_ref {
-            Some(existing_ref) => {
-                let arr = Object::Array(vec![
-                    Object::Reference(existing_ref),
-                    Object::Reference(content_id),
-                ]);
-                doc.add_object(arr)
-            }
-            None => content_id,
-        };
-
-        // Phase 3: set contents on page
-        let page_obj = doc.objects.get_mut(page_id).unwrap();
-        if let Ok(dict) = page_obj.as_dict_mut() {
-            dict.set("Contents", Object::Reference(new_contents_ref));
-        }
-    }
+    append_page_content(&mut doc, *page_id, content_id)?;
 
     save_doc(&mut doc, &req.output_path)
 }
@@ -880,6 +1254,7 @@ pub fn check_tesseract_available() -> bool {
 
 #[tauri::command]
 pub fn ocr_extract_from_images(req: OcrRequest) -> AppResult<TextExtractResult> {
+    let task_dir = claim_ocr_dir(std::path::Path::new(&req.image_dir))?;
     if !check_tesseract_available() {
         return Err("Tesseract OCR is not installed. Please install it from https://github.com/tesseract-ocr/tesseract".into());
     }
@@ -887,16 +1262,17 @@ pub fn ocr_extract_from_images(req: OcrRequest) -> AppResult<TextExtractResult> 
     let mut full_text = String::new();
     let mut page_count = 0usize;
 
-    let mut entries: Vec<_> = std::fs::read_dir(&req.image_dir)
+    let mut entries: Vec<_> = std::fs::read_dir(&task_dir.0)
         .map_err(|e| format!("Read dir '{}': {}", req.image_dir, e))?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("png"))
-                .unwrap_or(false)
-        })
-        .collect();
+        .map(|entry| entry.map_err(|e| format!("Read OCR task entry: {}", e)))
+        .collect::<AppResult<Vec<_>>>()?;
+    entries.retain(|e| {
+        e.path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("png"))
+            .unwrap_or(false)
+    });
     entries.sort_by_key(|e| e.file_name());
 
     for entry in &entries {
@@ -911,29 +1287,56 @@ pub fn ocr_extract_from_images(req: OcrRequest) -> AppResult<TextExtractResult> 
             .output()
             .map_err(|e| format!("Tesseract error: {}", e))?;
 
-        if output.status.success() {
-            page_count += 1;
-            let text = String::from_utf8_lossy(&output.stdout);
-            full_text.push_str(&format!("\n--- Page {} ---\n", page_count));
-            full_text.push_str(&text);
-            full_text.push('\n');
+        if !output.status.success() {
+            return Err(format!(
+                "Tesseract failed for '{}': {}",
+                path.display(),
+                output.status
+            ));
         }
+        page_count += 1;
+        let text = String::from_utf8_lossy(&output.stdout);
+        full_text.push_str(&format!("\n--- Page {} ---\n", page_count));
+        full_text.push_str(&text);
+        full_text.push('\n');
     }
 
     if page_count == 0 {
         return Err("No text could be extracted from the images".into());
     }
 
-    Ok(TextExtractResult { text: full_text, pages: page_count })
+    Ok(TextExtractResult {
+        text: full_text,
+        pages: page_count,
+    })
 }
 
 // ==================== Temp Directory ====================
 
 #[tauri::command]
 pub fn get_temp_dir() -> AppResult<String> {
-    let dir = std::env::temp_dir().join("pdf_seeker_ocr");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Create temp dir: {}", e))?;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
+    let mut dirs = ocr_task_dirs()
+        .lock()
+        .map_err(|_| "OCR task registry is unavailable".to_string())?;
+    let root = std::env::temp_dir().join("pdf_seeker_ocr");
+    std::fs::create_dir_all(&root).map_err(|e| format!("Create OCR temp root: {}", e))?;
+    let mut created = None;
+    for _ in 0..32 {
+        let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = root.join(format!("task_{}_{}", std::process::id(), id));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                created = Some(dir);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Create OCR task directory: {}", e)),
+        }
+    }
+    let dir = created.ok_or("Could not create a unique OCR task directory")?;
+    dirs.insert(dir.clone());
     Ok(dir.to_string_lossy().to_string())
 }
 
@@ -941,12 +1344,17 @@ pub fn get_temp_dir() -> AppResult<String> {
 
 #[tauri::command]
 pub fn save_image_file(path: String, data: Vec<u8>) -> AppResult<()> {
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Create dir: {}", e))?;
+    let target = std::path::Path::new(&path);
+    let parent = target
+        .parent()
+        .ok_or("Image path must be inside an OCR task directory")?;
+    let dirs = ocr_task_dirs()
+        .lock()
+        .map_err(|_| "OCR task registry is unavailable".to_string())?;
+    if !dirs.contains(parent) {
+        return Err("Image path is not inside an active OCR task directory".into());
     }
-    std::fs::write(&path, &data)
-        .map_err(|e| format!("Write '{}': {}", path, e))
+    std::fs::write(&path, &data).map_err(|e| format!("Write '{}': {}", path, e))
 }
 
 // ==================== PDF Editing ====================
@@ -995,9 +1403,12 @@ pub struct AddHighlightRequest {
 
 #[tauri::command]
 pub fn add_text_to_page(req: AddTextRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
+    validate_page_text(&req.text)?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
-    let page_id = pages.get(&req.page)
+    let page_id = pages
+        .get(&req.page)
         .ok_or(format!("Page {} not found", req.page))?;
 
     let hex = req.color.trim_start_matches('#');
@@ -1009,101 +1420,50 @@ pub fn add_text_to_page(req: AddTextRequest) -> AppResult<()> {
         (b"Type".to_vec(), Object::Name(b"Font".to_vec())),
         (b"Subtype".to_vec(), Object::Name(b"Type1".to_vec())),
         (b"BaseFont".to_vec(), Object::Name(b"Helvetica".to_vec())),
-        (b"Encoding".to_vec(), Object::Name(b"WinAnsiEncoding".to_vec())),
+        (
+            b"Encoding".to_vec(),
+            Object::Name(b"WinAnsiEncoding".to_vec()),
+        ),
     ])));
+    let font_name = add_page_resource(
+        &mut doc,
+        *page_id,
+        b"Font",
+        b"F1",
+        Object::Reference(font_id),
+    )?;
 
     let escaped = escape_pdf_string(&req.text);
     let content = format!(
-        "BT /F1 {fs:.1} Tf {r:.3} {g:.3} {b:.3} rg {x:.1} {y:.1} Td ({escaped}) Tj ET",
+        "q BT /{font_name} {fs:.1} Tf {r:.3} {g:.3} {b:.3} rg {x:.1} {y:.1} Td ({escaped}) Tj ET Q",
         fs = req.font_size,
-        r = r as f64 / 255.0, g = g as f64 / 255.0, b = b as f64 / 255.0,
-        x = req.x, y = req.y, escaped = escaped
-    ).into_bytes();
+        r = r as f64 / 255.0,
+        g = g as f64 / 255.0,
+        b = b as f64 / 255.0,
+        x = req.x,
+        y = req.y,
+        escaped = escaped,
+        font_name = String::from_utf8_lossy(&font_name)
+    )
+    .into_bytes();
 
-    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(lopdf::Dictionary::new(), content)));
+    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+        lopdf::Dictionary::new(),
+        content,
+    )));
 
-    // Handle resources
-    let res_ref = {
-        let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
-        let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
-        match page_dict.get(b"Resources") {
-            Err(_) => {
-                let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
-                (res_id, true)
-            }
-            Ok(res_obj) => {
-                if let Ok(r) = res_obj.as_reference() {
-                    (r, false)
-                } else {
-                    let res_id = doc.add_object(res_obj.clone());
-                    (res_id, true)
-                }
-            }
-        }
-    };
-
-    // Add font to resources
-    if let Some(res_obj) = doc.objects.get_mut(&res_ref.0) {
-        if let Ok(res_dict) = res_obj.as_dict_mut() {
-            if res_dict.get(b"Font").is_err() {
-                res_dict.set("Font", Object::Dictionary(lopdf::Dictionary::new()));
-            }
-            if let Ok(font_d) = res_dict.get_mut(b"Font") {
-                if let Ok(fd) = font_d.as_dict_mut() {
-                    fd.set("F1", Object::Reference(font_id));
-                }
-            }
-        }
-    }
-
-    if res_ref.1 {
-        if let Some(page_obj) = doc.objects.get_mut(page_id) {
-            if let Ok(dict) = page_obj.as_dict_mut() {
-                dict.set("Resources", Object::Reference(res_ref.0));
-            }
-        }
-    }
-
-    // Append content
-    let has_contents_ref: Option<ObjectId> = {
-        let page_obj = doc.objects.get(page_id).unwrap();
-        let dict = page_obj.as_dict().unwrap();
-        match dict.get(b"Contents") {
-            Ok(c) => {
-                if let Ok(r) = c.as_reference() {
-                    Some(r)
-                } else if let Ok(arr) = c.as_array() {
-                    Some(doc.add_object(Object::Array(arr.clone())))
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        }
-    };
-    let new_contents_ref = match has_contents_ref {
-        Some(existing_ref) => {
-            let arr = Object::Array(vec![
-                Object::Reference(existing_ref),
-                Object::Reference(content_id),
-            ]);
-            doc.add_object(arr)
-        }
-        None => content_id,
-    };
-    let page_obj = doc.objects.get_mut(page_id).unwrap();
-    if let Ok(dict) = page_obj.as_dict_mut() {
-        dict.set("Contents", Object::Reference(new_contents_ref));
-    }
+    append_page_content(&mut doc, *page_id, content_id)?;
 
     save_doc(&mut doc, &req.output_path)
 }
 
 #[tauri::command]
 pub fn add_rectangle(req: AddRectangleRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
-    let page_id = pages.get(&req.page)
+    let page_id = pages
+        .get(&req.page)
         .ok_or(format!("Page {} not found", req.page))?;
 
     let hex = req.border_color.trim_start_matches('#');
@@ -1112,9 +1472,11 @@ pub fn add_rectangle(req: AddRectangleRequest) -> AppResult<()> {
     let bb = u8::from_str_radix(&hex.get(4..6).unwrap_or("00"), 16).unwrap_or(0);
 
     let mut content = format!(
-        "{bw:.1} w {br:.3} {bg:.3} {bb:.3} RG ",
+        "q {bw:.1} w {br:.3} {bg:.3} {bb:.3} RG ",
         bw = req.border_width,
-        br = br as f64 / 255.0, bg = bg as f64 / 255.0, bb = bb as f64 / 255.0
+        br = br as f64 / 255.0,
+        bg = bg as f64 / 255.0,
+        bb = bb as f64 / 255.0
     );
 
     if let Some(ref fill) = req.fill_color {
@@ -1124,10 +1486,12 @@ pub fn add_rectangle(req: AddRectangleRequest) -> AppResult<()> {
         let fb = u8::from_str_radix(&fh.get(4..6).unwrap_or("00"), 16).unwrap_or(0);
         content.push_str(&format!(
             "{fr:.3} {fg:.3} {fb:.3} rg ",
-            fr = fr as f64 / 255.0, fg = fg as f64 / 255.0, fb = fb as f64 / 255.0
+            fr = fr as f64 / 255.0,
+            fg = fg as f64 / 255.0,
+            fb = fb as f64 / 255.0
         ));
         content.push_str(&format!(
-            "{} {} {} {} re B Q",
+            "{} {} {} {} re B",
             req.x, req.y, req.width, req.height
         ));
     } else {
@@ -1136,47 +1500,25 @@ pub fn add_rectangle(req: AddRectangleRequest) -> AppResult<()> {
             req.x, req.y, req.width, req.height
         ));
     }
+    content.push_str(" Q");
 
     let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
-        lopdf::Dictionary::new(), content.into_bytes(),
+        lopdf::Dictionary::new(),
+        content.into_bytes(),
     )));
 
-    // Append content (no resources needed for basic shapes)
-    let has_contents_ref: Option<ObjectId> = {
-        let page_obj = doc.objects.get(page_id).unwrap();
-        let dict = page_obj.as_dict().unwrap();
-        match dict.get(b"Contents") {
-            Ok(c) => {
-                if let Ok(r) = c.as_reference() { Some(r) }
-                else if let Ok(arr) = c.as_array() { Some(doc.add_object(Object::Array(arr.clone()))) }
-                else { None }
-            }
-            Err(_) => None,
-        }
-    };
-    let new_contents_ref = match has_contents_ref {
-        Some(existing_ref) => {
-            let arr = Object::Array(vec![
-                Object::Reference(existing_ref),
-                Object::Reference(content_id),
-            ]);
-            doc.add_object(arr)
-        }
-        None => content_id,
-    };
-    let page_obj = doc.objects.get_mut(page_id).unwrap();
-    if let Ok(dict) = page_obj.as_dict_mut() {
-        dict.set("Contents", Object::Reference(new_contents_ref));
-    }
+    append_page_content(&mut doc, *page_id, content_id)?;
 
     save_doc(&mut doc, &req.output_path)
 }
 
 #[tauri::command]
 pub fn add_highlight(req: AddHighlightRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
-    let page_id = pages.get(&req.page)
+    let page_id = pages
+        .get(&req.page)
         .ok_or(format!("Page {} not found", req.page))?;
 
     let hex = req.color.trim_start_matches('#');
@@ -1187,88 +1529,42 @@ pub fn add_highlight(req: AddHighlightRequest) -> AppResult<()> {
     // Graphics state for transparency
     let gs_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
         (b"Type".to_vec(), Object::Name(b"ExtGState".to_vec())),
-        (b"ca".to_vec(), Object::Real(req.opacity.min(1.0).max(0.0) as f32)),
+        (
+            b"ca".to_vec(),
+            Object::Real(req.opacity.min(1.0).max(0.0) as f32),
+        ),
     ])));
 
     let rx = req.x;
     let ry = req.y;
     let rw = req.width;
     let rh = req.height;
+    let gs_name = add_page_resource(
+        &mut doc,
+        *page_id,
+        b"ExtGState",
+        b"GS1",
+        Object::Reference(gs_id),
+    )?;
     let content = format!(
-        "q /GS1 gs {r:.3} {g:.3} {b:.3} rg {rx} {ry} {rw} {rh} re f Q",
-        r = r as f64 / 255.0, g = g as f64 / 255.0, b = b as f64 / 255.0,
-        rx = rx, ry = ry, rw = rw, rh = rh
-    ).into_bytes();
+        "q /{gs_name} gs {r:.3} {g:.3} {b:.3} rg {rx} {ry} {rw} {rh} re f Q",
+        r = r as f64 / 255.0,
+        g = g as f64 / 255.0,
+        b = b as f64 / 255.0,
+        rx = rx,
+        ry = ry,
+        rw = rw,
+        rh = rh,
+        gs_name = String::from_utf8_lossy(&gs_name)
+    )
+    .into_bytes();
 
-    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(lopdf::Dictionary::new(), content)));
+    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+        lopdf::Dictionary::new(),
+        content,
+    )));
 
-    // Handle resources (for ExtGState)
-    let res_ref = {
-        let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
-        let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
-        match page_dict.get(b"Resources") {
-            Err(_) => {
-                let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
-                (res_id, true)
-            }
-            Ok(res_obj) => {
-                if let Ok(r) = res_obj.as_reference() { (r, false) }
-                else {
-                    let res_id = doc.add_object(res_obj.clone());
-                    (res_id, true)
-                }
-            }
-        }
-    };
-
-    if let Some(res_obj) = doc.objects.get_mut(&res_ref.0) {
-        if let Ok(res_dict) = res_obj.as_dict_mut() {
-            if res_dict.get(b"ExtGState").is_err() {
-                res_dict.set("ExtGState", Object::Dictionary(lopdf::Dictionary::new()));
-            }
-            if let Ok(gs_d) = res_dict.get_mut(b"ExtGState") {
-                if let Ok(gd) = gs_d.as_dict_mut() {
-                    gd.set("GS1", Object::Reference(gs_id));
-                }
-            }
-        }
-    }
-
-    if res_ref.1 {
-        if let Some(page_obj) = doc.objects.get_mut(page_id) {
-            if let Ok(dict) = page_obj.as_dict_mut() {
-                dict.set("Resources", Object::Reference(res_ref.0));
-            }
-        }
-    }
-
-    // Append content
-    let has_contents_ref: Option<ObjectId> = {
-        let page_obj = doc.objects.get(page_id).unwrap();
-        let dict = page_obj.as_dict().unwrap();
-        match dict.get(b"Contents") {
-            Ok(c) => {
-                if let Ok(r) = c.as_reference() { Some(r) }
-                else if let Ok(arr) = c.as_array() { Some(doc.add_object(Object::Array(arr.clone()))) }
-                else { None }
-            }
-            Err(_) => None,
-        }
-    };
-    let new_contents_ref = match has_contents_ref {
-        Some(existing_ref) => {
-            let arr = Object::Array(vec![
-                Object::Reference(existing_ref),
-                Object::Reference(content_id),
-            ]);
-            doc.add_object(arr)
-        }
-        None => content_id,
-    };
-    let page_obj = doc.objects.get_mut(page_id).unwrap();
-    if let Ok(dict) = page_obj.as_dict_mut() {
-        dict.set("Contents", Object::Reference(new_contents_ref));
-    }
+    append_page_content(&mut doc, *page_id, content_id)?;
 
     save_doc(&mut doc, &req.output_path)
 }
@@ -1290,6 +1586,7 @@ pub struct CropPagesRequest {
 /// MediaBox; the CropBox is overwritten for the selected pages only.
 #[tauri::command]
 pub fn crop_pages(req: CropPagesRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     if req.pages.is_empty() {
         return Err("No pages selected".into());
     }
@@ -1301,15 +1598,22 @@ pub fn crop_pages(req: CropPagesRequest) -> AppResult<()> {
     let all_pages = doc.get_pages();
 
     for &page_num in &req.pages {
-        let page_id = all_pages.get(&page_num)
+        let page_id = all_pages
+            .get(&page_num)
             .ok_or(format!("Page {} not found", page_num))?;
 
         // MediaBox of the page (page-level value; fall back to the default
         // used by get_page_size when inherited)
         let media = {
-            let page = doc.get_object(*page_id).map_err(|e| format!("Page error: {}", e))?;
-            let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
-            page_dict.get(b"MediaBox").ok()
+            let page = doc
+                .get_object(*page_id)
+                .map_err(|e| format!("Page error: {}", e))?;
+            let page_dict = page
+                .as_dict()
+                .map_err(|e| format!("Page dict error: {}", e))?;
+            page_dict
+                .get(b"MediaBox")
+                .ok()
                 .and_then(|mb| mb.as_array().ok())
                 .map(|arr| {
                     let g = |i: usize, d: f64| arr.get(i).and_then(obj_as_f64).unwrap_or(d);
@@ -1324,17 +1628,25 @@ pub fn crop_pages(req: CropPagesRequest) -> AppResult<()> {
         let cx1 = (req.x + req.width).min(media.2);
         let cy1 = (req.y + req.height).min(media.3);
         if cx1 - cx0 <= 0.0 || cy1 - cy0 <= 0.0 {
-            return Err(format!("Crop area for page {} is outside the MediaBox", page_num));
+            return Err(format!(
+                "Crop area for page {} is outside the MediaBox",
+                page_num
+            ));
         }
 
         let page_obj = doc.objects.get_mut(page_id).unwrap();
-        let dict = page_obj.as_dict_mut().map_err(|e| format!("Page dict error: {}", e))?;
-        dict.set("CropBox", Object::Array(vec![
-            Object::Real(cx0 as f32),
-            Object::Real(cy0 as f32),
-            Object::Real(cx1 as f32),
-            Object::Real(cy1 as f32),
-        ]));
+        let dict = page_obj
+            .as_dict_mut()
+            .map_err(|e| format!("Page dict error: {}", e))?;
+        dict.set(
+            "CropBox",
+            Object::Array(vec![
+                Object::Real(cx0 as f32),
+                Object::Real(cy0 as f32),
+                Object::Real(cx1 as f32),
+                Object::Real(cy1 as f32),
+            ]),
+        );
     }
 
     save_doc(&mut doc, &req.output_path)
@@ -1361,9 +1673,11 @@ pub struct AddAnnotationRequest {
 /// rendered with the viewer's standard sticky-note icon).
 #[tauri::command]
 pub fn add_annotation(req: AddAnnotationRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     let mut doc = load_doc(&req.input_path)?;
     let pages = doc.get_pages();
-    let page_id = *pages.get(&req.page)
+    let page_id = *pages
+        .get(&req.page)
         .ok_or(format!("Page {} not found", req.page))?;
 
     let hex = req.color.trim_start_matches('#');
@@ -1375,11 +1689,18 @@ pub fn add_annotation(req: AddAnnotationRequest) -> AppResult<()> {
         "highlight" => {
             let gs_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
                 (b"Type".to_vec(), Object::Name(b"ExtGState".to_vec())),
-                (b"ca".to_vec(), Object::Real(req.opacity.min(1.0).max(0.0) as f32)),
+                (
+                    b"ca".to_vec(),
+                    Object::Real(req.opacity.min(1.0).max(0.0) as f32),
+                ),
             ])));
             let content = format!(
                 "q /GS0 gs {r:.3} {g:.3} {b:.3} rg 0 0 {w:.1} {h:.1} re f Q",
-                r = r, g = g, b = b, w = req.width, h = req.height
+                r = r,
+                g = g,
+                b = b,
+                w = req.width,
+                h = req.height
             );
             let res = lopdf::Dictionary::from_iter(vec![(
                 b"ExtGState".to_vec(),
@@ -1389,28 +1710,50 @@ pub fn add_annotation(req: AddAnnotationRequest) -> AppResult<()> {
                 )])),
             )]);
             let ap_dict = lopdf::Dictionary::from_iter(vec![
-                (b"BBox".to_vec(), Object::Array(vec![
-                    Object::Integer(0), Object::Integer(0),
-                    Object::Real(req.width as f32), Object::Real(req.height as f32),
-                ])),
+                (
+                    b"BBox".to_vec(),
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Real(req.width as f32),
+                        Object::Real(req.height as f32),
+                    ]),
+                ),
                 (b"Resources".to_vec(), Object::Dictionary(res)),
             ]);
-            let id = doc.add_object(Object::Stream(lopdf::Stream::new(ap_dict, content.into_bytes())));
+            let id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                ap_dict,
+                content.into_bytes(),
+            )));
             (b"Highlight".to_vec(), Some(id))
         }
         "underline" => {
             let content = format!(
                 "q {r:.3} {g:.3} {b:.3} RG 1.5 w 0 1 m {w:.1} 1 l S Q",
-                r = r, g = g, b = b, w = req.width
+                r = r,
+                g = g,
+                b = b,
+                w = req.width
             );
             let ap_dict = lopdf::Dictionary::from_iter(vec![
-                (b"BBox".to_vec(), Object::Array(vec![
-                    Object::Integer(0), Object::Integer(0),
-                    Object::Real(req.width as f32), Object::Real(req.height.max(3.0) as f32),
-                ])),
-                (b"Resources".to_vec(), Object::Dictionary(lopdf::Dictionary::new())),
+                (
+                    b"BBox".to_vec(),
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Real(req.width as f32),
+                        Object::Real(req.height.max(3.0) as f32),
+                    ]),
+                ),
+                (
+                    b"Resources".to_vec(),
+                    Object::Dictionary(lopdf::Dictionary::new()),
+                ),
             ]);
-            let id = doc.add_object(Object::Stream(lopdf::Stream::new(ap_dict, content.into_bytes())));
+            let id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                ap_dict,
+                content.into_bytes(),
+            )));
             (b"Underline".to_vec(), Some(id))
         }
         "note" => {
@@ -1423,36 +1766,58 @@ pub fn add_annotation(req: AddAnnotationRequest) -> AppResult<()> {
     let mut annot = lopdf::Dictionary::from_iter(vec![
         (b"Type".to_vec(), Object::Name(b"Annot".to_vec())),
         (b"Subtype".to_vec(), Object::Name(subtype)),
-        (b"Rect".to_vec(), Object::Array(vec![
-            Object::Real(req.x as f32),
-            Object::Real(req.y as f32),
-            Object::Real((req.x + req.width) as f32),
-            Object::Real((req.y + req.height) as f32),
-        ])),
-        (b"C".to_vec(), Object::Array(vec![
-            Object::Real(r as f32), Object::Real(g as f32), Object::Real(b as f32),
-        ])),
+        (
+            b"Rect".to_vec(),
+            Object::Array(vec![
+                Object::Real(req.x as f32),
+                Object::Real(req.y as f32),
+                Object::Real((req.x + req.width) as f32),
+                Object::Real((req.y + req.height) as f32),
+            ]),
+        ),
+        (
+            b"C".to_vec(),
+            Object::Array(vec![
+                Object::Real(r as f32),
+                Object::Real(g as f32),
+                Object::Real(b as f32),
+            ]),
+        ),
         (b"F".to_vec(), Object::Integer(4)),
-        (b"T".to_vec(), Object::String(b"PDF Seeker".to_vec(), lopdf::StringFormat::Literal)),
+        (
+            b"T".to_vec(),
+            Object::String(b"PDF Seeker".to_vec(), lopdf::StringFormat::Literal),
+        ),
     ]);
     if !req.content.is_empty() {
-        annot.set(b"Contents", Object::String(req.content.clone().into_bytes(), lopdf::StringFormat::Literal));
+        annot.set(
+            b"Contents",
+            Object::String(encode_pdf_text(&req.content), lopdf::StringFormat::Literal),
+        );
     }
     if let Some(id) = ap_id {
-        annot.set(b"AP", Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
-            b"N".to_vec(),
-            Object::Reference(id),
-        )])));
+        annot.set(
+            b"AP",
+            Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                b"N".to_vec(),
+                Object::Reference(id),
+            )])),
+        );
     }
 
     let annot_id = doc.add_object(Object::Dictionary(annot));
 
     // Append to the page /Annots array (create or extend, inline or referenced)
     let existing_annots: Option<Object> = {
-        let page = doc.get_object(page_id).map_err(|e| format!("Page error: {}", e))?;
-        let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
+        let page = doc
+            .get_object(page_id)
+            .map_err(|e| format!("Page error: {}", e))?;
+        let page_dict = page
+            .as_dict()
+            .map_err(|e| format!("Page dict error: {}", e))?;
         match page_dict.get(b"Annots") {
-            Ok(Object::Reference(r)) => doc.get_object(*r)
+            Ok(Object::Reference(r)) => doc
+                .get_object(*r)
                 .map_err(|e| format!("Annots error: {}", e))?
                 .as_array()
                 .map(|a| Object::Array(a.clone()))
@@ -1488,6 +1853,20 @@ pub struct FormField {
 
 fn object_to_display_string(o: &Object) -> String {
     match o {
+        Object::String(bytes, _) if bytes.starts_with(&[0xFE, 0xFF]) => {
+            let units: Vec<u16> = bytes[2..]
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        Object::String(bytes, _) if bytes.starts_with(&[0xFF, 0xFE]) => {
+            let units: Vec<u16> = bytes[2..]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
         Object::String(bytes, _) => String::from_utf8_lossy(bytes).to_string(),
         Object::Name(n) => String::from_utf8_lossy(n).to_string(),
         Object::Integer(i) => i.to_string(),
@@ -1496,16 +1875,21 @@ fn object_to_display_string(o: &Object) -> String {
     }
 }
 
-fn field_type_name(field_dict: &lopdf::Dictionary) -> &'static str {
-    let flags = field_dict.get(b"Ff").ok()
-        .and_then(|o| o.as_i64().ok())
-        .unwrap_or(0);
-    match field_dict.get(b"FT").ok().and_then(|o| o.as_name().ok()) {
+fn field_type_from(field_type: Option<&[u8]>, flags: i64) -> &'static str {
+    match field_type {
         Some(b"Tx") => "text",
         Some(b"Btn") => {
-            if flags & 0x8000 != 0 { "radio" }     // bit 16: radio
-            else if flags & 0x10000 != 0 { "button" } // bit 17: pushbutton
-            else { "checkbox" }
+            if flags & 0x8000 != 0 {
+                "radio"
+            }
+            // bit 16: radio
+            else if flags & 0x10000 != 0 {
+                "button"
+            }
+            // bit 17: pushbutton
+            else {
+                "checkbox"
+            }
         }
         Some(b"Ch") => "choice",
         Some(b"Sig") => "signature",
@@ -1514,16 +1898,20 @@ fn field_type_name(field_dict: &lopdf::Dictionary) -> &'static str {
 }
 
 fn field_options(field_dict: &lopdf::Dictionary) -> Vec<String> {
-    field_dict.get(b"Opt").ok()
+    field_dict
+        .get(b"Opt")
+        .ok()
         .and_then(|o| o.as_array().ok())
         .map(|arr| {
-            arr.iter().filter_map(|opt| {
-                match opt {
-                    // Choice options may be [export_value, label] pairs
-                    Object::Array(pair) => pair.first().map(object_to_display_string),
-                    other => Some(object_to_display_string(other)),
-                }
-            }).collect()
+            arr.iter()
+                .filter_map(|opt| {
+                    match opt {
+                        // Choice options may be [export_value, label] pairs
+                        Object::Array(pair) => pair.first().map(object_to_display_string),
+                        other => Some(object_to_display_string(other)),
+                    }
+                })
+                .collect()
         })
         .unwrap_or_default()
 }
@@ -1551,6 +1939,8 @@ fn walk_fields(
     doc: &Document,
     entries: &[Object],
     prefix: &str,
+    inherited_type: Option<Vec<u8>>,
+    inherited_flags: i64,
     page_lookup: &std::collections::HashMap<ObjectId, u32>,
     out: &mut Vec<FormField>,
 ) {
@@ -1563,32 +1953,60 @@ fn walk_fields(
             Object::Dictionary(d) => d,
             _ => continue,
         };
+        let field_type = dict
+            .get(b"FT")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .map(Vec::from)
+            .or_else(|| inherited_type.clone());
+        let flags = dict
+            .get(b"Ff")
+            .ok()
+            .and_then(|o| o.as_i64().ok())
+            .unwrap_or(inherited_flags);
 
-        let own_name = dict.get(b"T").ok()
+        let own_name = dict
+            .get(b"T")
+            .ok()
             .map(object_to_display_string)
             .unwrap_or_default();
-        let qualified = if prefix.is_empty() { own_name.clone() } else { format!("{}.{}", prefix, own_name) };
+        let qualified = if prefix.is_empty() {
+            own_name.clone()
+        } else {
+            format!("{}.{}", prefix, own_name)
+        };
 
         // Sub-fields: kids that themselves have /T
-        let has_field_kids = dict.get(b"Kids").ok()
+        let has_field_kids = dict
+            .get(b"Kids")
+            .ok()
             .and_then(|o| o.as_array().ok())
-            .map(|kids| kids.iter().any(|k| {
-                let kd = match k {
-                    Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_dict().ok()),
-                    Object::Dictionary(d) => Some(d),
-                    _ => None,
-                };
-                kd.map(|d| d.get(b"T").is_ok()).unwrap_or(false)
-            }))
+            .map(|kids| {
+                kids.iter().any(|k| {
+                    let kd = match k {
+                        Object::Reference(r) => {
+                            doc.get_object(*r).ok().and_then(|o| o.as_dict().ok())
+                        }
+                        Object::Dictionary(d) => Some(d),
+                        _ => None,
+                    };
+                    kd.map(|d| d.get(b"T").is_ok()).unwrap_or(false)
+                })
+            })
             .unwrap_or(false);
 
         if has_field_kids {
-            let kids = dict.get(b"Kids").ok().and_then(|o| o.as_array().ok()).cloned().unwrap_or_default();
-            walk_fields(doc, &kids, &qualified, page_lookup, out);
+            let kids = dict
+                .get(b"Kids")
+                .ok()
+                .and_then(|o| o.as_array().ok())
+                .cloned()
+                .unwrap_or_default();
+            walk_fields(doc, &kids, &qualified, field_type, flags, page_lookup, out);
             continue;
         }
 
-        if dict.get(b"FT").is_err() {
+        if field_type.is_none() {
             continue; // not a terminal field
         }
 
@@ -1599,8 +2017,12 @@ fn walk_fields(
 
         out.push(FormField {
             name: qualified,
-            field_type: field_type_name(dict).to_string(),
-            value: dict.get(b"V").ok().map(object_to_display_string).unwrap_or_default(),
+            field_type: field_type_from(field_type.as_deref(), flags).to_string(),
+            value: dict
+                .get(b"V")
+                .ok()
+                .map(object_to_display_string)
+                .unwrap_or_default(),
             options: field_options(dict),
             page_index,
         });
@@ -1610,21 +2032,23 @@ fn walk_fields(
 #[tauri::command]
 pub fn get_form_fields(path: String) -> AppResult<Vec<FormField>> {
     let doc = load_doc(&path)?;
-    let (_, acroform) = get_acroform(&doc)
-        .ok_or("This PDF has no AcroForm (no fillable form fields)")?;
+    let (_, acroform) =
+        get_acroform(&doc).ok_or("This PDF has no AcroForm (no fillable form fields)")?;
 
     let mut page_lookup = std::collections::HashMap::new();
     for (num, id) in doc.get_pages() {
         page_lookup.insert(id, num);
     }
 
-    let entries = acroform.get(b"Fields").ok()
+    let entries = acroform
+        .get(b"Fields")
+        .ok()
         .and_then(|o| o.as_array().ok())
         .cloned()
         .ok_or("AcroForm has no /Fields array")?;
 
     let mut fields = Vec::new();
-    walk_fields(&doc, &entries, "", &page_lookup, &mut fields);
+    walk_fields(&doc, &entries, "", None, 0, &page_lookup, &mut fields);
     if fields.is_empty() {
         return Err("No form fields found".into());
     }
@@ -1653,6 +2077,8 @@ fn locate_terminal_fields(
     doc: &Document,
     entries: &[Object],
     prefix: &str,
+    inherited_type: Option<Vec<u8>>,
+    inherited_flags: i64,
     out: &mut Vec<(String, Option<ObjectId>, String)>,
 ) {
     for entry in entries {
@@ -1664,58 +2090,217 @@ fn locate_terminal_fields(
             Object::Dictionary(d) => (None, d),
             _ => continue,
         };
+        let field_type = dict
+            .get(b"FT")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .map(Vec::from)
+            .or_else(|| inherited_type.clone());
+        let flags = dict
+            .get(b"Ff")
+            .ok()
+            .and_then(|o| o.as_i64().ok())
+            .unwrap_or(inherited_flags);
 
-        let own_name = dict.get(b"T").ok().map(object_to_display_string).unwrap_or_default();
-        let qualified = if prefix.is_empty() { own_name.clone() } else { format!("{}.{}", prefix, own_name) };
+        let own_name = dict
+            .get(b"T")
+            .ok()
+            .map(object_to_display_string)
+            .unwrap_or_default();
+        let qualified = if prefix.is_empty() {
+            own_name.clone()
+        } else {
+            format!("{}.{}", prefix, own_name)
+        };
 
-        let has_field_kids = dict.get(b"Kids").ok()
+        let has_field_kids = dict
+            .get(b"Kids")
+            .ok()
             .and_then(|o| o.as_array().ok())
-            .map(|kids| kids.iter().any(|k| {
-                let kd = match k {
-                    Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_dict().ok()),
-                    Object::Dictionary(d) => Some(d),
-                    _ => None,
-                };
-                kd.map(|d| d.get(b"T").is_ok()).unwrap_or(false)
-            }))
+            .map(|kids| {
+                kids.iter().any(|k| {
+                    let kd = match k {
+                        Object::Reference(r) => {
+                            doc.get_object(*r).ok().and_then(|o| o.as_dict().ok())
+                        }
+                        Object::Dictionary(d) => Some(d),
+                        _ => None,
+                    };
+                    kd.map(|d| d.get(b"T").is_ok()).unwrap_or(false)
+                })
+            })
             .unwrap_or(false);
 
         if has_field_kids {
-            let kids = dict.get(b"Kids").ok().and_then(|o| o.as_array().ok()).cloned().unwrap_or_default();
-            locate_terminal_fields(doc, &kids, &qualified, out);
-        } else if dict.get(b"FT").is_ok() {
-            out.push((qualified, obj_id, field_type_name(dict).to_string()));
+            let kids = dict
+                .get(b"Kids")
+                .ok()
+                .and_then(|o| o.as_array().ok())
+                .cloned()
+                .unwrap_or_default();
+            locate_terminal_fields(doc, &kids, &qualified, field_type, flags, out);
+        } else if field_type.is_some() {
+            out.push((
+                qualified,
+                obj_id,
+                field_type_from(field_type.as_deref(), flags).to_string(),
+            ));
         }
     }
 }
 
+fn promote_field_entries(
+    doc: &mut Document,
+    entries: &mut [Object],
+    visited: &mut std::collections::HashSet<ObjectId>,
+) -> AppResult<()> {
+    for entry in entries {
+        match entry {
+            Object::Reference(id) => {
+                if !visited.insert(*id) {
+                    continue;
+                }
+                let mut dict = doc
+                    .get_object(*id)
+                    .and_then(Object::as_dict)
+                    .map(Clone::clone)
+                    .map_err(|e| format!("Field dictionary error: {}", e))?;
+                if let Ok(Object::Array(kids)) = dict.get(b"Kids") {
+                    let mut kids = kids.clone();
+                    promote_field_entries(doc, &mut kids, visited)?;
+                    dict.set("Kids", Object::Array(kids));
+                }
+                doc.objects.insert(*id, Object::Dictionary(dict));
+            }
+            Object::Dictionary(dict) => {
+                let mut dict = dict.clone();
+                if let Ok(Object::Array(kids)) = dict.get(b"Kids") {
+                    let mut kids = kids.clone();
+                    promote_field_entries(doc, &mut kids, visited)?;
+                    dict.set("Kids", Object::Array(kids));
+                }
+                *entry = Object::Reference(doc.add_object(Object::Dictionary(dict)));
+            }
+            _ => return Err("AcroForm field entries must be dictionaries or references".into()),
+        }
+    }
+    Ok(())
+}
+
+fn normalize_acroform_fields(doc: &mut Document, root_id: ObjectId) -> AppResult<Vec<Object>> {
+    let root_dict = doc
+        .get_object(root_id)
+        .and_then(Object::as_dict)
+        .map(Clone::clone)
+        .map_err(|e| format!("Catalog error: {}", e))?;
+    let acroform = root_dict
+        .get(b"AcroForm")
+        .map_err(|e| format!("AcroForm error: {}", e))?
+        .clone();
+    let (acroform_id, mut acroform_dict) = match acroform {
+        Object::Reference(id) => (
+            Some(id),
+            doc.get_object(id)
+                .and_then(Object::as_dict)
+                .map(Clone::clone)
+                .map_err(|e| format!("AcroForm error: {}", e))?,
+        ),
+        Object::Dictionary(dict) => (None, dict),
+        _ => return Err("AcroForm must be a dictionary or reference".into()),
+    };
+    let mut entries = acroform_dict
+        .get(b"Fields")
+        .and_then(Object::as_array)
+        .map(Clone::clone)
+        .map_err(|e| format!("AcroForm Fields error: {}", e))?;
+    promote_field_entries(doc, &mut entries, &mut std::collections::HashSet::new())?;
+    acroform_dict.set("Fields", Object::Array(entries.clone()));
+    match acroform_id {
+        Some(id) => {
+            doc.objects.insert(id, Object::Dictionary(acroform_dict));
+        }
+        None => {
+            let catalog = doc
+                .objects
+                .get_mut(&root_id)
+                .ok_or("Catalog object is missing")?
+                .as_dict_mut()
+                .map_err(|e| format!("Catalog error: {}", e))?;
+            catalog.set("AcroForm", Object::Dictionary(acroform_dict));
+        }
+    }
+    Ok(entries)
+}
+
+fn widget_appearance_states(doc: &Document, field_id: ObjectId) -> Vec<(ObjectId, Vec<u8>)> {
+    let Some(kids) = doc
+        .get_object(field_id)
+        .ok()
+        .and_then(|o| o.as_dict().ok())
+        .and_then(|dict| dict.get(b"Kids").ok())
+        .and_then(|o| o.as_array().ok())
+    else {
+        return Vec::new();
+    };
+    let mut states = Vec::new();
+    for kid in kids {
+        let Ok(widget_id) = kid.as_reference() else {
+            continue;
+        };
+        let Some(widget) = doc
+            .get_object(widget_id)
+            .ok()
+            .and_then(|o| o.as_dict().ok())
+        else {
+            continue;
+        };
+        let Some(appearance) = widget.get(b"AP").ok() else {
+            continue;
+        };
+        let appearance = match appearance {
+            Object::Reference(id) => doc.get_object(*id).ok(),
+            object => Some(object),
+        };
+        let Some(normal) = appearance
+            .and_then(|object| object.as_dict().ok())
+            .and_then(|appearance| appearance.get(b"N").ok())
+        else {
+            continue;
+        };
+        let normal = match normal {
+            Object::Reference(id) => doc.get_object(*id).ok(),
+            object => Some(object),
+        };
+        let Some(Object::Dictionary(states_dict)) = normal else {
+            continue;
+        };
+        for (name, _) in states_dict.iter() {
+            if name.as_slice() != b"Off" {
+                states.push((widget_id, name.clone()));
+            }
+        }
+    }
+    states
+}
+
 #[tauri::command]
 pub fn fill_form(req: FillFormRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     let mut doc = load_doc(&req.input_path)?;
-    let (root_ref, _) = get_acroform(&doc)
-        .ok_or("This PDF has no AcroForm (no fillable form fields)")?;
+    let (root_ref, _) =
+        get_acroform(&doc).ok_or("This PDF has no AcroForm (no fillable form fields)")?;
 
-    let entries = {
-        let root = doc.get_object(root_ref).map_err(|e| format!("Catalog error: {}", e))?;
-        let acroform = match root.as_dict().map_err(|e| format!("Catalog error: {}", e))?.get(b"AcroForm") {
-            Ok(Object::Reference(r)) => doc.get_object(*r)
-                .map_err(|e| format!("AcroForm error: {}", e))?
-                .as_dict()
-                .map_err(|e| format!("AcroForm error: {}", e))?
-                .get(b"Fields").ok()
-                .and_then(|o| o.as_array().ok())
-                .cloned()
-                .ok_or("AcroForm has no /Fields array")?,
-            Ok(_) => return Err("Unsupported inline AcroForm".into()),
-            Err(_) => return Err("AcroForm has no /Fields array".into()),
-        };
-        acroform
-    };
+    let entries = normalize_acroform_fields(&mut doc, root_ref)?;
 
     let mut located = Vec::new();
-    locate_terminal_fields(&doc, &entries, "", &mut located);
+    locate_terminal_fields(&doc, &entries, "", None, 0, &mut located);
 
-    let truthy = |v: &str| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on" | "checked");
+    let truthy = |v: &str| {
+        matches!(
+            v.to_lowercase().as_str(),
+            "true" | "1" | "yes" | "on" | "checked"
+        )
+    };
 
     let mut applied = 0;
     for value in &req.values {
@@ -1723,24 +2308,76 @@ pub fn fill_form(req: FillFormRequest) -> AppResult<()> {
             Some(l) => l,
             None => return Err(format!("Form field '{}' not found", value.name)),
         };
-        let obj_id = obj_id.ok_or(format!("Form field '{}' is not a reference and cannot be filled", value.name))?;
-
-        let field_obj = doc.objects.get_mut(&obj_id).unwrap();
-        let dict = field_obj.as_dict_mut().map_err(|e| format!("Field dict error: {}", e))?;
-        match ftype.as_str() {
-            "text" | "choice" => {
-                dict.set(b"V", Object::String(value.value.clone().into_bytes(), lopdf::StringFormat::Literal));
-            }
-            "checkbox" => {
-                let state = if truthy(&value.value) { b"Yes".to_vec() } else { b"Off".to_vec() };
-                dict.set(b"V", Object::Name(state.clone()));
-                dict.set(b"AS", Object::Name(state));
-            }
+        let obj_id = obj_id.ok_or(format!(
+            "Form field '{}' is not a reference and cannot be filled",
+            value.name
+        ))?;
+        let widget_states = if ftype == "checkbox" || ftype == "radio" {
+            widget_appearance_states(&doc, obj_id)
+        } else {
+            Vec::new()
+        };
+        let button_state = match ftype.as_str() {
+            "checkbox" if truthy(&value.value) => widget_states
+                .first()
+                .map(|(_, state)| state.clone())
+                .unwrap_or_else(|| b"Yes".to_vec()),
+            "checkbox" => b"Off".to_vec(),
             "radio" => {
-                dict.set(b"V", Object::Name(value.value.clone().into_bytes()));
-                dict.set(b"AS", Object::Name(value.value.clone().into_bytes()));
+                let selected = value.value.as_bytes();
+                if !widget_states.is_empty()
+                    && !widget_states.iter().any(|(_, state)| state == selected)
+                {
+                    return Err(format!(
+                        "Radio value '{}' is not an appearance state for field '{}'",
+                        value.value, value.name
+                    ));
+                }
+                selected.to_vec()
             }
-            other => return Err(format!("Field '{}' of type '{}' cannot be filled", value.name, other)),
+            _ => Vec::new(),
+        };
+        {
+            let field_obj = doc
+                .objects
+                .get_mut(&obj_id)
+                .ok_or("Form field object is missing")?;
+            let dict = field_obj
+                .as_dict_mut()
+                .map_err(|e| format!("Field dict error: {}", e))?;
+            match ftype.as_str() {
+                "text" | "choice" => dict.set(
+                    b"V",
+                    Object::String(encode_pdf_text(&value.value), lopdf::StringFormat::Literal),
+                ),
+                "checkbox" | "radio" => {
+                    dict.set(b"V", Object::Name(button_state.clone()));
+                    dict.set(b"AS", Object::Name(button_state.clone()));
+                }
+                other => {
+                    return Err(format!(
+                        "Field '{}' of type '{}' cannot be filled",
+                        value.name, other
+                    ))
+                }
+            }
+        }
+        let widget_ids: std::collections::HashSet<ObjectId> =
+            widget_states.iter().map(|(id, _)| *id).collect();
+        for widget_id in widget_ids {
+            let available: Vec<Vec<u8>> = widget_states
+                .iter()
+                .filter(|(id, _)| *id == widget_id)
+                .map(|(_, state)| state.clone())
+                .collect();
+            let state = if available.contains(&button_state) {
+                button_state.clone()
+            } else {
+                b"Off".to_vec()
+            };
+            if let Some(Object::Dictionary(widget)) = doc.objects.get_mut(&widget_id) {
+                widget.set(b"AS", Object::Name(state));
+            }
         }
         applied += 1;
     }
@@ -1753,7 +2390,11 @@ pub fn fill_form(req: FillFormRequest) -> AppResult<()> {
     // Two-phase: read how AcroForm is attached, then mutate without overlap.
     let acroform_ref = {
         let root_obj = doc.objects.get(&root_ref).unwrap();
-        root_obj.as_dict().unwrap().get(b"AcroForm").ok()
+        root_obj
+            .as_dict()
+            .unwrap()
+            .get(b"AcroForm")
+            .ok()
             .and_then(|o| o.as_reference().ok())
     };
     match acroform_ref {
@@ -1807,15 +2448,20 @@ pub struct ReplaceTextRequest {
 /// undo step reverts the whole operation.
 #[tauri::command]
 pub fn replace_text(req: ReplaceTextRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     if req.replacements.is_empty() {
         return Err("No replacements given".into());
+    }
+    for replacement in &req.replacements {
+        validate_page_text(&replacement.new_text)?;
     }
 
     let mut doc = load_doc(&req.input_path)?;
     let all_pages = doc.get_pages();
 
     // Group by page so each page gets a single appended stream
-    let mut by_page: std::collections::BTreeMap<u32, Vec<&TextReplacement>> = std::collections::BTreeMap::new();
+    let mut by_page: std::collections::BTreeMap<u32, Vec<&TextReplacement>> =
+        std::collections::BTreeMap::new();
     for rep in &req.replacements {
         if rep.cover_width <= 0.0 || rep.cover_height <= 0.0 {
             return Err("Replacement cover area must be non-empty".into());
@@ -1831,6 +2477,23 @@ pub fn replace_text(req: ReplaceTextRequest) -> AppResult<()> {
 
     for (page_num, reps) in by_page {
         let page_id = *all_pages.get(&page_num).unwrap();
+
+        let font_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"Font".to_vec())),
+            (b"Subtype".to_vec(), Object::Name(b"Type1".to_vec())),
+            (b"BaseFont".to_vec(), Object::Name(b"Helvetica".to_vec())),
+            (
+                b"Encoding".to_vec(),
+                Object::Name(b"WinAnsiEncoding".to_vec()),
+            ),
+        ])));
+        let font_name = add_page_resource(
+            &mut doc,
+            page_id,
+            b"Font",
+            b"F1",
+            Object::Reference(font_id),
+        )?;
 
         // Cover rects: white fill
         let mut content = String::from("q\n1 1 1 rg\n");
@@ -1848,17 +2511,28 @@ pub fn replace_text(req: ReplaceTextRequest) -> AppResult<()> {
             let (r, g, b) = match &rep.color {
                 Some(hex) => {
                     let h = hex.trim_start_matches('#');
-                    let cr = u8::from_str_radix(&h.get(0..2).unwrap_or("00"), 16).unwrap_or(0) as f64 / 255.0;
-                    let cg = u8::from_str_radix(&h.get(2..4).unwrap_or("00"), 16).unwrap_or(0) as f64 / 255.0;
-                    let cb = u8::from_str_radix(&h.get(4..6).unwrap_or("00"), 16).unwrap_or(0) as f64 / 255.0;
+                    let cr = u8::from_str_radix(&h.get(0..2).unwrap_or("00"), 16).unwrap_or(0)
+                        as f64
+                        / 255.0;
+                    let cg = u8::from_str_radix(&h.get(2..4).unwrap_or("00"), 16).unwrap_or(0)
+                        as f64
+                        / 255.0;
+                    let cb = u8::from_str_radix(&h.get(4..6).unwrap_or("00"), 16).unwrap_or(0)
+                        as f64
+                        / 255.0;
                     (cr, cg, cb)
                 }
                 None => (0.0, 0.0, 0.0),
             };
             content.push_str(&format!(
-                "/F1 {:.1} Tf {:.3} {:.3} {:.3} rg 1 0 0 1 {:.1} {:.1} Tm ({}) Tj\n",
-                rep.font_size, r, g, b,
-                rep.cover_x, rep.baseline_y,
+                "/{} {:.1} Tf {:.3} {:.3} {:.3} rg 1 0 0 1 {:.1} {:.1} Tm ({}) Tj\n",
+                String::from_utf8_lossy(&font_name),
+                rep.font_size,
+                r,
+                g,
+                b,
+                rep.cover_x,
+                rep.baseline_y,
                 escape_pdf_string(&rep.new_text)
             ));
         }
@@ -1869,79 +2543,7 @@ pub fn replace_text(req: ReplaceTextRequest) -> AppResult<()> {
             content.into_bytes(),
         )));
 
-        // Font resource (same pattern as add_text_to_page)
-        let font_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"Type".to_vec(), Object::Name(b"Font".to_vec())),
-            (b"Subtype".to_vec(), Object::Name(b"Type1".to_vec())),
-            (b"BaseFont".to_vec(), Object::Name(b"Helvetica".to_vec())),
-            (b"Encoding".to_vec(), Object::Name(b"WinAnsiEncoding".to_vec())),
-        ])));
-
-        let res_ref = {
-            let page = doc.get_object(page_id).map_err(|e| format!("Page error: {}", e))?;
-            let page_dict = page.as_dict().map_err(|e| format!("Page dict error: {}", e))?;
-            match page_dict.get(b"Resources") {
-                Err(_) => {
-                    let res_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
-                    (res_id, true)
-                }
-                Ok(res_obj) => {
-                    if let Ok(r) = res_obj.as_reference() { (r, false) }
-                    else {
-                        let res_id = doc.add_object(res_obj.clone());
-                        (res_id, true)
-                    }
-                }
-            }
-        };
-
-        if let Some(res_obj) = doc.objects.get_mut(&res_ref.0) {
-            if let Ok(res_dict) = res_obj.as_dict_mut() {
-                if res_dict.get(b"Font").is_err() {
-                    res_dict.set("Font", Object::Dictionary(lopdf::Dictionary::new()));
-                }
-                if let Ok(font_d) = res_dict.get_mut(b"Font") {
-                    if let Ok(fd) = font_d.as_dict_mut() {
-                        fd.set("F1", Object::Reference(font_id));
-                    }
-                }
-            }
-        }
-        if res_ref.1 {
-            if let Some(page_obj) = doc.objects.get_mut(&page_id) {
-                if let Ok(dict) = page_obj.as_dict_mut() {
-                    dict.set("Resources", Object::Reference(res_ref.0));
-                }
-            }
-        }
-
-        // Append to page Contents
-        let has_contents_ref: Option<ObjectId> = {
-            let page_obj = doc.objects.get(&page_id).unwrap();
-            let dict = page_obj.as_dict().unwrap();
-            match dict.get(b"Contents") {
-                Ok(c) => {
-                    if let Ok(r) = c.as_reference() { Some(r) }
-                    else if let Ok(arr) = c.as_array() { Some(doc.add_object(Object::Array(arr.clone()))) }
-                    else { None }
-                }
-                Err(_) => None,
-            }
-        };
-        let new_contents_ref = match has_contents_ref {
-            Some(existing_ref) => {
-                let arr = Object::Array(vec![
-                    Object::Reference(existing_ref),
-                    Object::Reference(content_id),
-                ]);
-                doc.add_object(arr)
-            }
-            None => content_id,
-        };
-        let page_obj = doc.objects.get_mut(&page_id).unwrap();
-        if let Ok(dict) = page_obj.as_dict_mut() {
-            dict.set("Contents", Object::Reference(new_contents_ref));
-        }
+        append_page_content(&mut doc, page_id, content_id)?;
     }
 
     save_doc(&mut doc, &req.output_path)
@@ -1987,6 +2589,92 @@ fn count_outline_items(items: &[OutlineItemInput]) -> i64 {
         .sum()
 }
 
+fn can_replace_outline_losslessly(doc: &Document, outlines_id: ObjectId) -> bool {
+    fn walk(
+        doc: &Document,
+        first: Option<ObjectId>,
+        last: Option<ObjectId>,
+        parent: ObjectId,
+        pages: &std::collections::HashSet<ObjectId>,
+        seen: &mut std::collections::HashSet<ObjectId>,
+    ) -> bool {
+        if first.is_none() != last.is_none() {
+            return false;
+        }
+        let Some(mut current) = first else {
+            return true;
+        };
+        let expected_last = last.unwrap();
+        let mut previous = None;
+        loop {
+            if !seen.insert(current) {
+                return false;
+            }
+            let Ok(Object::Dictionary(dict)) = doc.get_object(current) else {
+                return false;
+            };
+            if dict.iter().any(|(key, _)| {
+                !matches!(
+                    key.as_slice(),
+                    b"Title"
+                        | b"Parent"
+                        | b"Prev"
+                        | b"Next"
+                        | b"First"
+                        | b"Last"
+                        | b"Count"
+                        | b"Dest"
+                )
+            }) {
+                return false;
+            }
+            if !matches!(dict.get(b"Title"), Ok(Object::String(_, _)))
+                || dict.get(b"Parent").and_then(Object::as_reference).ok() != Some(parent)
+                || dict.get(b"Prev").and_then(Object::as_reference).ok() != previous
+            {
+                return false;
+            }
+            let Ok(Object::Array(destination)) = dict.get(b"Dest") else {
+                return false;
+            };
+            if !destination
+                .first()
+                .and_then(|object| object.as_reference().ok())
+                .map(|id| pages.contains(&id))
+                .unwrap_or(false)
+            {
+                return false;
+            }
+            let child_first = dict.get(b"First").and_then(Object::as_reference).ok();
+            let child_last = dict.get(b"Last").and_then(Object::as_reference).ok();
+            if !walk(doc, child_first, child_last, current, pages, seen) {
+                return false;
+            }
+            let next = dict.get(b"Next").and_then(Object::as_reference).ok();
+            if next.is_none() {
+                return current == expected_last;
+            }
+            previous = Some(current);
+            current = next.unwrap();
+        }
+    }
+
+    let Ok(Object::Dictionary(root)) = doc.get_object(outlines_id) else {
+        return false;
+    };
+    if root
+        .iter()
+        .any(|(key, _)| !matches!(key.as_slice(), b"Type" | b"First" | b"Last" | b"Count"))
+    {
+        return false;
+    }
+    let first = root.get(b"First").and_then(Object::as_reference).ok();
+    let last = root.get(b"Last").and_then(Object::as_reference).ok();
+    let pages: std::collections::HashSet<ObjectId> = doc.get_pages().values().copied().collect();
+    let mut seen = std::collections::HashSet::new();
+    walk(doc, first, last, outlines_id, &pages, &mut seen)
+}
+
 /// Create outline item objects for one nesting level, link siblings,
 /// recurse into children. Returns the object ids of this level.
 fn build_outline_items(
@@ -2004,7 +2692,10 @@ fn build_outline_items(
             .get(&item.page)
             .ok_or_else(|| format!("Page {} not found", item.page))?;
         let dict = lopdf::Dictionary::from_iter(vec![
-            (b"Title".to_vec(), Object::String(encode_pdf_text(&item.title), lopdf::StringFormat::Literal)),
+            (
+                b"Title".to_vec(),
+                Object::String(encode_pdf_text(&item.title), lopdf::StringFormat::Literal),
+            ),
             (b"Parent".to_vec(), Object::Reference(parent)),
             (
                 b"Dest".to_vec(),
@@ -2032,7 +2723,10 @@ fn build_outline_items(
             if let Some(first) = child_ids.first() {
                 dict.set(b"First", Object::Reference(*first));
                 dict.set(b"Last", Object::Reference(*child_ids.last().unwrap()));
-                dict.set(b"Count", Object::Integer(child_ids.len() as i64));
+                dict.set(
+                    b"Count",
+                    Object::Integer(count_outline_items(&items[i].children)),
+                );
             }
         }
     }
@@ -2041,12 +2735,31 @@ fn build_outline_items(
 
 #[tauri::command]
 pub fn set_outline(req: SetOutlineRequest) -> AppResult<()> {
+    let _write_lock = lock_pdf_writes()?;
     let mut doc = load_doc(&req.input_path)?;
+    let catalog_id = doc
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .map_err(|e| format!("Catalog error: {}", e))?;
+    if let Ok(outlines) = doc
+        .get_object(catalog_id)
+        .and_then(Object::as_dict)
+        .and_then(|dict| dict.get(b"Outlines"))
+    {
+        let outlines_id = outlines.as_reference().map_err(|_| {
+            "This PDF has inline bookmarks that the current request cannot preserve"
+        })?;
+        if !can_replace_outline_losslessly(&doc, outlines_id) {
+            return Err("This PDF has bookmarks that the current request cannot preserve".into());
+        }
+    }
     let pages = doc.get_pages();
 
-    let root_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-        (b"Type".to_vec(), Object::Name(b"Outlines".to_vec())),
-    ])));
+    let root_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+        b"Type".to_vec(),
+        Object::Name(b"Outlines".to_vec()),
+    )])));
 
     let top_ids = build_outline_items(&mut doc, &pages, &req.items, root_id)?;
 
@@ -2106,12 +2819,17 @@ mod tests {
         for _ in 0..num_pages {
             let page_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
                 (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
-                    (b"Parent".to_vec(), Object::Reference(pages_id)),
-                    (b"MediaBox".to_vec(), Object::Array(vec![
-                        Object::Integer(0), Object::Integer(0),
-                        Object::Integer(612), Object::Integer(792),
-                    ])),
-                ])));
+                (b"Parent".to_vec(), Object::Reference(pages_id)),
+                (
+                    b"MediaBox".to_vec(),
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                ),
+            ])));
             kids.push(Object::Reference(page_id));
         }
 
@@ -2130,6 +2848,621 @@ mod tests {
     }
 
     #[test]
+    fn test_repeated_mixed_edits_flatten_contents() {
+        let dir = TempDir::new().unwrap();
+        let path =
+            std::path::Path::new(&create_test_pdf(dir.path(), "contents.pdf", 1)).to_path_buf();
+        let mut doc = Document::load(&path).unwrap();
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let base_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            b"BT /F1 12 Tf (Original text) Tj ET".to_vec(),
+        )));
+        let nested_id = doc.add_object(Object::Array(vec![Object::Reference(base_id)]));
+        let direct_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            b"q 0 0 m 1 1 l S Q".to_vec(),
+        )));
+        doc.get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                "Contents",
+                Object::Array(vec![
+                    Object::Reference(nested_id),
+                    Object::Reference(direct_id),
+                ]),
+            );
+        doc.save(&path).unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        add_text_to_page(AddTextRequest {
+            input_path: path.clone(),
+            output_path: path.clone(),
+            text: "First".into(),
+            page: 1,
+            x: 10.0,
+            y: 20.0,
+            font_size: 12.0,
+            color: "000000".into(),
+        })
+        .unwrap();
+        add_highlight(AddHighlightRequest {
+            input_path: path.clone(),
+            output_path: path.clone(),
+            page: 1,
+            x: 10.0,
+            y: 20.0,
+            width: 80.0,
+            height: 12.0,
+            color: "ffff00".into(),
+            opacity: 0.4,
+        })
+        .unwrap();
+        add_rectangle(AddRectangleRequest {
+            input_path: path.clone(),
+            output_path: path.clone(),
+            page: 1,
+            x: 5.0,
+            y: 5.0,
+            width: 40.0,
+            height: 30.0,
+            border_color: "000000".into(),
+            fill_color: None,
+            border_width: 1.0,
+        })
+        .unwrap();
+
+        let doc = Document::load(&path).unwrap();
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let contents = doc
+            .get_object(page_id)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Contents")
+            .unwrap();
+        let streams = match contents {
+            Object::Array(items) => items,
+            other => panic!("Expected flat contents array, got {:?}", other),
+        };
+        assert_eq!(streams.len(), 5);
+        let content_bytes: Vec<u8> = doc
+            .get_page_contents(page_id)
+            .iter()
+            .flat_map(|id| {
+                doc.get_object(*id)
+                    .unwrap()
+                    .as_stream()
+                    .unwrap()
+                    .content
+                    .clone()
+            })
+            .collect();
+        let content_text = String::from_utf8_lossy(&content_bytes);
+        assert!(content_text.contains("Original text"));
+        assert!(content_text.contains("First"));
+        assert!(content_text.contains("re f"));
+        assert!(content_text.contains(" re S"));
+    }
+
+    #[test]
+    fn test_page_edit_copies_shared_resources_and_allocates_unique_names() {
+        let dir = TempDir::new().unwrap();
+        let path =
+            std::path::Path::new(&create_test_pdf(dir.path(), "resources.pdf", 2)).to_path_buf();
+        let mut doc = Document::load(&path).unwrap();
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+        let font_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
+        let xobject_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
+        let gs_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::new()));
+        let resources_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (
+                b"Font".to_vec(),
+                Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                    b"F1".to_vec(),
+                    Object::Reference(font_id),
+                )])),
+            ),
+            (
+                b"XObject".to_vec(),
+                Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                    b"Keep".to_vec(),
+                    Object::Reference(xobject_id),
+                )])),
+            ),
+            (
+                b"ExtGState".to_vec(),
+                Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                    b"GS1".to_vec(),
+                    Object::Reference(gs_id),
+                )])),
+            ),
+        ])));
+        for page_id in &pages {
+            doc.get_object_mut(*page_id)
+                .unwrap()
+                .as_dict_mut()
+                .unwrap()
+                .set("Resources", Object::Reference(resources_id));
+        }
+        doc.save(&path).unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        add_text_to_page(AddTextRequest {
+            input_path: path.clone(),
+            output_path: path.clone(),
+            text: "preserve".into(),
+            page: 1,
+            x: 10.0,
+            y: 20.0,
+            font_size: 12.0,
+            color: "000000".into(),
+        })
+        .unwrap();
+        add_highlight(AddHighlightRequest {
+            input_path: path.clone(),
+            output_path: path.clone(),
+            page: 1,
+            x: 10.0,
+            y: 20.0,
+            width: 80.0,
+            height: 12.0,
+            color: "ffff00".into(),
+            opacity: 0.4,
+        })
+        .unwrap();
+
+        let doc = Document::load(&path).unwrap();
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+        let page_resources = doc
+            .get_object(pages[0])
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Resources")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        assert_ne!(page_resources, resources_id);
+        assert_eq!(
+            doc.get_object(pages[1])
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"Resources")
+                .unwrap()
+                .as_reference()
+                .unwrap(),
+            resources_id
+        );
+        let resources = doc.get_object(page_resources).unwrap().as_dict().unwrap();
+        let fonts = resources.get(b"Font").unwrap().as_dict().unwrap();
+        assert!(fonts.has(b"F1"));
+        assert!(fonts.has(b"F11"));
+        assert!(resources
+            .get(b"XObject")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .has(b"Keep"));
+        let states = resources.get(b"ExtGState").unwrap().as_dict().unwrap();
+        assert!(states.has(b"GS1"));
+        assert!(states.has(b"GS11"));
+    }
+
+    #[test]
+    fn test_same_file_concurrent_edits_are_serialized() {
+        let dir = TempDir::new().unwrap();
+        let path = create_test_pdf(dir.path(), "concurrent.pdf", 1);
+        let mut handles = Vec::new();
+        for x in [10.0, 100.0] {
+            let input_path = path.clone();
+            let output_path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                add_rectangle(AddRectangleRequest {
+                    input_path,
+                    output_path,
+                    page: 1,
+                    x,
+                    y: 10.0,
+                    width: 50.0,
+                    height: 30.0,
+                    border_color: "000000".into(),
+                    fill_color: None,
+                    border_width: 1.0,
+                })
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let doc = Document::load(&path).unwrap();
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        assert_eq!(doc.get_page_contents(page_id).len(), 2);
+    }
+
+    #[test]
+    fn test_r08_inherited_float_geometry_keeps_legacy_watermark_semantics() {
+        let dir = TempDir::new().unwrap();
+        let src = create_test_pdf(dir.path(), "geometry.pdf", 1);
+        let mut doc = Document::load(&src).unwrap();
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let pages_id = get_pages_ref(&doc).unwrap();
+        doc.get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .remove(b"MediaBox");
+        let pages = doc.get_object_mut(pages_id).unwrap().as_dict_mut().unwrap();
+        pages.set(
+            "MediaBox",
+            Object::Array(vec![
+                Object::Real(12.5),
+                Object::Real(-7.25),
+                Object::Real(612.75),
+                Object::Real(784.5),
+            ]),
+        );
+        pages.set(
+            "CropBox",
+            Object::Array(vec![
+                Object::Real(20.0),
+                Object::Real(30.0),
+                Object::Real(500.0),
+                Object::Real(700.0),
+            ]),
+        );
+        pages.set("Rotate", Object::Integer(90));
+        doc.save(&src).unwrap();
+
+        let out = dir
+            .path()
+            .join("geometry-watermark.pdf")
+            .to_string_lossy()
+            .into_owned();
+        add_text_watermark(WatermarkRequest {
+            input_path: src,
+            output_path: out.clone(),
+            text: "sample".into(),
+            font_size: 12.0,
+            opacity: 0.5,
+            angle: 0.0,
+            color: "000000".into(),
+        })
+        .unwrap();
+        let output = Document::load(out).unwrap();
+        let page_id = *output.get_pages().get(&1).unwrap();
+        let stream_id = *output.get_page_contents(page_id).last().unwrap();
+        let stream = output.get_object(stream_id).unwrap().as_stream().unwrap();
+        let content = String::from_utf8_lossy(&stream.content);
+        assert!(content.contains("306.0 396.0 Tm"));
+        assert!(output
+            .get_object(page_id)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Rotate")
+            .is_err());
+        assert!(output
+            .get_object(get_pages_ref(&output).unwrap())
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"CropBox")
+            .is_ok());
+    }
+
+    #[test]
+    fn test_image_stream_filters_match_encoded_data_and_gray_jpeg() {
+        let mut doc = Document::with_version("1.4");
+        let rgba = img_crate::RgbaImage::from_pixel(64, 64, img_crate::Rgba([20, 40, 60, 80]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        img_crate::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut png, img_crate::ImageFormat::Png)
+            .unwrap();
+        let (rgba_id, _, _) = embed_image(&mut doc, &png.into_inner(), "alpha.png").unwrap();
+        let rgba_stream = doc.get_object(rgba_id).unwrap().as_stream().unwrap();
+        assert_eq!(
+            rgba_stream.dict.get(b"Filter").unwrap().as_name().unwrap(),
+            b"FlateDecode"
+        );
+        assert!(rgba_stream
+            .dict
+            .get(b"SMask")
+            .unwrap()
+            .as_reference()
+            .is_ok());
+        let alpha_id = rgba_stream
+            .dict
+            .get(b"SMask")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        assert_eq!(
+            doc.get_object(alpha_id)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .dict
+                .get(b"Filter")
+                .unwrap()
+                .as_name()
+                .unwrap(),
+            b"FlateDecode"
+        );
+
+        let gray = img_crate::GrayImage::from_pixel(64, 64, img_crate::Luma([128]));
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        img_crate::DynamicImage::ImageLuma8(gray)
+            .write_to(&mut jpeg, img_crate::ImageFormat::Jpeg)
+            .unwrap();
+        let (gray_id, _, _) = embed_image(&mut doc, &jpeg.into_inner(), "gray.jpg").unwrap();
+        let gray_stream = doc.get_object(gray_id).unwrap().as_stream().unwrap();
+        assert_eq!(
+            gray_stream
+                .dict
+                .get(b"ColorSpace")
+                .unwrap()
+                .as_name()
+                .unwrap(),
+            b"DeviceGray"
+        );
+        assert_eq!(
+            gray_stream.dict.get(b"Filter").unwrap().as_name().unwrap(),
+            b"DCTDecode"
+        );
+    }
+
+    #[test]
+    fn test_insert_pages_flattens_nested_tree_and_keeps_inherited_boxes() {
+        let dir = TempDir::new().unwrap();
+        let target_path =
+            std::path::Path::new(&create_test_pdf(dir.path(), "nested.pdf", 3)).to_path_buf();
+        let mut target = Document::load(&target_path).unwrap();
+        let page_ids: Vec<ObjectId> = target.get_pages().values().copied().collect();
+        let root_id = get_pages_ref(&target).unwrap();
+        for page_id in &page_ids {
+            target
+                .get_object_mut(*page_id)
+                .unwrap()
+                .as_dict_mut()
+                .unwrap()
+                .remove(b"MediaBox");
+        }
+        let group_a = target.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
+            (b"Parent".to_vec(), Object::Reference(root_id)),
+            (b"Count".to_vec(), Object::Integer(2)),
+            (b"Kids".to_vec(), Object::Array(vec![])),
+            (
+                b"MediaBox".to_vec(),
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(200),
+                    Object::Integer(300),
+                ]),
+            ),
+        ])));
+        let inner_a = target.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
+            (b"Parent".to_vec(), Object::Reference(group_a)),
+            (b"Count".to_vec(), Object::Integer(2)),
+            (
+                b"Kids".to_vec(),
+                Object::Array(vec![
+                    Object::Reference(page_ids[0]),
+                    Object::Reference(page_ids[1]),
+                ]),
+            ),
+        ])));
+        target
+            .get_object_mut(group_a)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Kids", Object::Array(vec![Object::Reference(inner_a)]));
+        let group_b = target.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
+            (b"Parent".to_vec(), Object::Reference(root_id)),
+            (b"Count".to_vec(), Object::Integer(1)),
+            (
+                b"Kids".to_vec(),
+                Object::Array(vec![Object::Reference(page_ids[2])]),
+            ),
+            (
+                b"MediaBox".to_vec(),
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(300),
+                    Object::Integer(400),
+                ]),
+            ),
+        ])));
+        for page_id in &page_ids[..2] {
+            target
+                .get_object_mut(*page_id)
+                .unwrap()
+                .as_dict_mut()
+                .unwrap()
+                .set("Parent", Object::Reference(inner_a));
+        }
+        target
+            .get_object_mut(page_ids[2])
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Parent", Object::Reference(group_b));
+        let root = target
+            .get_object_mut(root_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap();
+        root.set(
+            "Kids",
+            Object::Array(vec![Object::Reference(group_a), Object::Reference(group_b)]),
+        );
+        root.set("Count", Object::Integer(3));
+        target.save(&target_path).unwrap();
+        let source_path = create_test_pdf(dir.path(), "insert-source.pdf", 1);
+        let output_path = dir
+            .path()
+            .join("inserted.pdf")
+            .to_string_lossy()
+            .into_owned();
+
+        insert_pages(InsertPagesRequest {
+            input_path: target_path.to_string_lossy().into_owned(),
+            source_path,
+            output_path: output_path.clone(),
+            insert_position: 1,
+        })
+        .unwrap();
+
+        let output = Document::load(&output_path).unwrap();
+        let pages: Vec<ObjectId> = output.get_pages().values().copied().collect();
+        assert_eq!(pages.len(), 4);
+        assert_eq!(pages[0], page_ids[0]);
+        assert_eq!(pages[2], page_ids[1]);
+        assert_eq!(pages[3], page_ids[2]);
+        let root_id = get_pages_ref(&output).unwrap();
+        let root = output.get_object(root_id).unwrap().as_dict().unwrap();
+        assert_eq!(root.get(b"Count").unwrap().as_i64().unwrap(), 4);
+        assert_eq!(root.get(b"Kids").unwrap().as_array().unwrap().len(), 4);
+        for page_id in &pages {
+            assert_eq!(
+                output
+                    .get_object(*page_id)
+                    .unwrap()
+                    .as_dict()
+                    .unwrap()
+                    .get(b"Parent")
+                    .unwrap()
+                    .as_reference()
+                    .unwrap(),
+                root_id
+            );
+        }
+        let boxes: Vec<Vec<i64>> = pages
+            .iter()
+            .map(|id| {
+                output
+                    .get_object(*id)
+                    .unwrap()
+                    .as_dict()
+                    .unwrap()
+                    .get(b"MediaBox")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item.as_i64().unwrap())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(boxes[0][2], 200);
+        assert_eq!(boxes[2][2], 200);
+        assert_eq!(boxes[3][2], 300);
+    }
+
+    #[test]
+    fn test_reorder_rejects_duplicate_without_changing_input() {
+        let dir = TempDir::new().unwrap();
+        let path = create_test_pdf(dir.path(), "reorder.pdf", 3);
+        let before = std::fs::read(&path).unwrap();
+        let result = reorder_pages(ReorderPagesRequest {
+            input_path: path.clone(),
+            output_path: path.clone(),
+            new_order: vec![1, 1, 3],
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn test_atomic_pdf_write_failure_preserves_target() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("protected.pdf");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("original"), b"original bytes").unwrap();
+        let mut doc = Document::with_version("1.4");
+        let result = save_doc(&mut doc, path.to_str().unwrap());
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(path.join("original")).unwrap(),
+            b"original bytes"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn test_atomic_pdf_temporary_write_failure_preserves_target() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("write-failure.pdf");
+        std::fs::write(&path, b"original pdf bytes").unwrap();
+        let mut doc = Document::with_version("1.4");
+        let result = save_doc_with(&mut doc, path.to_str().unwrap(), |_, temp| {
+            std::fs::write(temp, b"partial pdf bytes")?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "injected write failure",
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original pdf bytes");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn test_generated_pdf_renders_with_independent_poppler() {
+        if std::process::Command::new("pdftoppm")
+            .arg("-v")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let source = create_test_pdf(dir.path(), "poppler-source.pdf", 1);
+        let pdf = dir
+            .path()
+            .join("poppler-output.pdf")
+            .to_string_lossy()
+            .into_owned();
+        add_rectangle(AddRectangleRequest {
+            input_path: source,
+            output_path: pdf.clone(),
+            page: 1,
+            x: 40.0,
+            y: 40.0,
+            width: 120.0,
+            height: 80.0,
+            border_color: "000000".into(),
+            fill_color: Some("ff0000".into()),
+            border_width: 2.0,
+        })
+        .unwrap();
+
+        let prefix = dir.path().join("rendered");
+        let status = std::process::Command::new("pdftoppm")
+            .args(["-f", "1", "-singlefile", "-png", "-r", "72"])
+            .arg(&pdf)
+            .arg(&prefix)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let image = img_crate::open(prefix.with_extension("png"))
+            .unwrap()
+            .to_rgb8();
+        assert!(image
+            .pixels()
+            .any(|pixel| pixel[0] > 200 && pixel[1] < 80 && pixel[2] < 80));
+    }
+
+    #[test]
     fn test_merge_two_pdfs() {
         let dir = TempDir::new().unwrap();
         let p1 = create_test_pdf(dir.path(), "a.pdf", 2);
@@ -2141,6 +3474,65 @@ mod tests {
 
         let doc = Document::load(&out_str).unwrap();
         assert_eq!(doc.get_pages().len(), 5);
+    }
+
+    #[test]
+    fn test_merge_uses_page_order_after_renumbering_generation_ids() {
+        let dir = TempDir::new().unwrap();
+        let target = create_test_pdf(dir.path(), "merge-target.pdf", 1);
+        let source = create_test_pdf(dir.path(), "merge-source.pdf", 3);
+        let mut doc = Document::load(&source).unwrap();
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+        let root_id = get_pages_ref(&doc).unwrap();
+        let mut reordered = Vec::new();
+        for (index, old_id) in pages.iter().enumerate() {
+            let new_id = (old_id.0, 2);
+            let mut object = doc.objects.remove(old_id).unwrap();
+            object.as_dict_mut().unwrap().set(
+                "MediaBox",
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer((100 * (index + 1)) as i64),
+                    Object::Integer(500),
+                ]),
+            );
+            doc.objects.insert(new_id, object);
+            reordered.push(Object::Reference(new_id));
+        }
+        reordered.reverse();
+        doc.get_object_mut(root_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Kids", Object::Array(reordered));
+        doc.save(&source).unwrap();
+
+        let output = dir
+            .path()
+            .join("merged-reversed.pdf")
+            .to_string_lossy()
+            .into_owned();
+        merge_pdfs(vec![target, source], output.clone()).unwrap();
+        let merged = Document::load(output).unwrap();
+        let widths: Vec<i64> = merged
+            .get_pages()
+            .values()
+            .map(|id| {
+                merged
+                    .get_object(*id)
+                    .unwrap()
+                    .as_dict()
+                    .unwrap()
+                    .get(b"MediaBox")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()[2]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(widths, vec![612, 300, 200, 100]);
     }
 
     #[test]
@@ -2335,7 +3727,10 @@ mod tests {
         assert_eq!(annots.len(), 1);
         let annot_ref = annots[0].as_reference().unwrap();
         let annot = doc.get_object(annot_ref).unwrap().as_dict().unwrap();
-        assert_eq!(annot.get(b"Subtype").unwrap().as_name().unwrap(), b"Highlight");
+        assert_eq!(
+            annot.get(b"Subtype").unwrap().as_name().unwrap(),
+            b"Highlight"
+        );
         let rect = annot.get(b"Rect").unwrap().as_array().unwrap();
         let vals: Vec<f64> = rect.iter().map(|o| obj_as_f64(o).unwrap()).collect();
         assert!((vals[0] - 100.0).abs() < 0.1);
@@ -2362,7 +3757,7 @@ mod tests {
             height: 24.0,
             color: "#ffd54f".into(),
             opacity: 1.0,
-            content: "Check this".into(),
+            content: "检查这个".into(),
         })
         .unwrap();
         add_annotation(AddAnnotationRequest {
@@ -2384,15 +3779,42 @@ mod tests {
         let annots = get_first_page_annots(&doc);
         assert_eq!(annots.len(), 2);
 
-        let note = doc.get_object(annots[0].as_reference().unwrap()).unwrap().as_dict().unwrap();
+        let note = doc
+            .get_object(annots[0].as_reference().unwrap())
+            .unwrap()
+            .as_dict()
+            .unwrap();
         assert_eq!(note.get(b"Subtype").unwrap().as_name().unwrap(), b"Text");
         match note.get(b"Contents").unwrap() {
-            Object::String(bytes, _) => assert_eq!(bytes, b"Check this"),
+            Object::String(bytes, _) => assert_eq!(bytes, &encode_pdf_text("检查这个")),
             o => panic!("Unexpected Contents: {:?}", o),
         }
 
-        let ul = doc.get_object(annots[1].as_reference().unwrap()).unwrap().as_dict().unwrap();
+        let ul = doc
+            .get_object(annots[1].as_reference().unwrap())
+            .unwrap()
+            .as_dict()
+            .unwrap();
         assert_eq!(ul.get(b"Subtype").unwrap().as_name().unwrap(), b"Underline");
+    }
+
+    #[test]
+    fn test_cjk_page_text_is_rejected_without_modifying_the_source() {
+        let dir = TempDir::new().unwrap();
+        let path = create_test_pdf(dir.path(), "cjk.pdf", 1);
+        let before = std::fs::read(&path).unwrap();
+        let result = add_text_to_page(AddTextRequest {
+            input_path: path.clone(),
+            output_path: path.clone(),
+            text: "中文".into(),
+            page: 1,
+            x: 20.0,
+            y: 20.0,
+            font_size: 12.0,
+            color: "000000".into(),
+        });
+        assert!(result.unwrap_err().contains("no licensed CJK font"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -2436,10 +3858,15 @@ mod tests {
         let page_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
             (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
             (b"Parent".to_vec(), Object::Reference(pages_id)),
-            (b"MediaBox".to_vec(), Object::Array(vec![
-                Object::Integer(0), Object::Integer(0),
-                Object::Integer(612), Object::Integer(792),
-            ])),
+            (
+                b"MediaBox".to_vec(),
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(612),
+                    Object::Integer(792),
+                ]),
+            ),
         ])));
         if let Some(pages_obj) = doc.objects.get_mut(&pages_id) {
             if let Ok(d) = pages_obj.as_dict_mut() {
@@ -2450,13 +3877,22 @@ mod tests {
 
         let text_field_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
             (b"FT".to_vec(), Object::Name(b"Tx".to_vec())),
-            (b"T".to_vec(), Object::String(b"fullname".to_vec(), lopdf::StringFormat::Literal)),
-            (b"V".to_vec(), Object::String(b"old value".to_vec(), lopdf::StringFormat::Literal)),
+            (
+                b"T".to_vec(),
+                Object::String(b"fullname".to_vec(), lopdf::StringFormat::Literal),
+            ),
+            (
+                b"V".to_vec(),
+                Object::String(b"old value".to_vec(), lopdf::StringFormat::Literal),
+            ),
             (b"P".to_vec(), Object::Reference(page_id)),
         ])));
         let checkbox_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
             (b"FT".to_vec(), Object::Name(b"Btn".to_vec())),
-            (b"T".to_vec(), Object::String(b"subscribe".to_vec(), lopdf::StringFormat::Literal)),
+            (
+                b"T".to_vec(),
+                Object::String(b"subscribe".to_vec(), lopdf::StringFormat::Literal),
+            ),
             (b"V".to_vec(), Object::Name(b"Off".to_vec())),
             (b"AS".to_vec(), Object::Name(b"Off".to_vec())),
             (b"P".to_vec(), Object::Reference(page_id)),
@@ -2464,22 +3900,77 @@ mod tests {
         let radio_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
             (b"FT".to_vec(), Object::Name(b"Btn".to_vec())),
             (b"Ff".to_vec(), Object::Integer(0x8000)), // radio flag
-            (b"T".to_vec(), Object::String(b"color".to_vec(), lopdf::StringFormat::Literal)),
+            (
+                b"T".to_vec(),
+                Object::String(b"color".to_vec(), lopdf::StringFormat::Literal),
+            ),
             (b"V".to_vec(), Object::Name(b"red".to_vec())),
-            (b"Opt".to_vec(), Object::Array(vec![
-                Object::String(b"red".to_vec(), lopdf::StringFormat::Literal),
-                Object::String(b"green".to_vec(), lopdf::StringFormat::Literal),
-            ])),
+            (
+                b"Opt".to_vec(),
+                Object::Array(vec![
+                    Object::String(b"red".to_vec(), lopdf::StringFormat::Literal),
+                    Object::String(b"green".to_vec(), lopdf::StringFormat::Literal),
+                ]),
+            ),
             (b"P".to_vec(), Object::Reference(page_id)),
         ])));
 
-        let acroform_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-            (b"Fields".to_vec(), Object::Array(vec![
+        let mut widget_ids = Vec::new();
+        for (field_id, state) in [
+            (checkbox_id, b"Subscribed".to_vec()),
+            (radio_id, b"red".to_vec()),
+            (radio_id, b"green".to_vec()),
+        ] {
+            let off_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                lopdf::Dictionary::new(),
+                Vec::new(),
+            )));
+            let on_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+                lopdf::Dictionary::new(),
+                Vec::new(),
+            )));
+            let normal_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+                (b"Off".to_vec(), Object::Reference(off_id)),
+                (state.clone(), Object::Reference(on_id)),
+            ])));
+            let appearance_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(
+                vec![(b"N".to_vec(), Object::Reference(normal_id))],
+            )));
+            let widget_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+                (b"Type".to_vec(), Object::Name(b"Annot".to_vec())),
+                (b"Subtype".to_vec(), Object::Name(b"Widget".to_vec())),
+                (b"Parent".to_vec(), Object::Reference(field_id)),
+                (b"P".to_vec(), Object::Reference(page_id)),
+                (b"AS".to_vec(), Object::Name(b"Off".to_vec())),
+                (b"AP".to_vec(), Object::Reference(appearance_id)),
+            ])));
+            if let Some(Object::Dictionary(field)) = doc.objects.get_mut(&field_id) {
+                let kids = field
+                    .get(b"Kids")
+                    .ok()
+                    .and_then(|o| o.as_array().ok())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut kids = kids;
+                kids.push(Object::Reference(widget_id));
+                field.set("Kids", Object::Array(kids));
+            }
+            widget_ids.push(Object::Reference(widget_id));
+        }
+        doc.get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Annots", Object::Array(widget_ids));
+
+        let acroform_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+            b"Fields".to_vec(),
+            Object::Array(vec![
                 Object::Reference(text_field_id),
                 Object::Reference(checkbox_id),
                 Object::Reference(radio_id),
-            ])),
-        ])));
+            ]),
+        )])));
         if let Some(cat) = doc.objects.get_mut(&catalog_id) {
             if let Ok(d) = cat.as_dict_mut() {
                 d.set("AcroForm", Object::Reference(acroform_id));
@@ -2524,18 +4015,84 @@ mod tests {
             input_path: src,
             output_path: out_str.clone(),
             values: vec![
-                FormFieldValue { name: "fullname".into(), value: "Ada Lovelace".into() },
-                FormFieldValue { name: "subscribe".into(), value: "true".into() },
-                FormFieldValue { name: "color".into(), value: "green".into() },
+                FormFieldValue {
+                    name: "fullname".into(),
+                    value: "Ada Lovelace".into(),
+                },
+                FormFieldValue {
+                    name: "subscribe".into(),
+                    value: "true".into(),
+                },
+                FormFieldValue {
+                    name: "color".into(),
+                    value: "green".into(),
+                },
             ],
         })
         .unwrap();
 
         // Verify via get_form_fields roundtrip
         let fields = get_form_fields(out_str.clone()).unwrap();
-        assert_eq!(fields.iter().find(|f| f.name == "fullname").unwrap().value, "Ada Lovelace");
-        assert_eq!(fields.iter().find(|f| f.name == "subscribe").unwrap().value, "Yes");
-        assert_eq!(fields.iter().find(|f| f.name == "color").unwrap().value, "green");
+        assert_eq!(
+            fields.iter().find(|f| f.name == "fullname").unwrap().value,
+            "Ada Lovelace"
+        );
+        assert_eq!(
+            fields.iter().find(|f| f.name == "subscribe").unwrap().value,
+            "Subscribed"
+        );
+        assert_eq!(
+            fields.iter().find(|f| f.name == "color").unwrap().value,
+            "green"
+        );
+
+        let doc = Document::load(&out).unwrap();
+        let fields: Vec<ObjectId> = {
+            let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+            let acro = doc
+                .get_object(root)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"AcroForm")
+                .unwrap()
+                .as_reference()
+                .unwrap();
+            doc.get_object(acro)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"Fields")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o.as_reference().unwrap())
+                .collect()
+        };
+        for (index, expected) in [
+            (1usize, b"Subscribed".as_slice()),
+            (2usize, b"green".as_slice()),
+        ] {
+            let field = doc.get_object(fields[index]).unwrap().as_dict().unwrap();
+            let selected = field.get(b"V").unwrap().as_name().unwrap();
+            assert_eq!(selected, expected);
+            let widgets = field.get(b"Kids").unwrap().as_array().unwrap();
+            let mut selected_widgets = 0;
+            for widget in widgets {
+                let widget = doc
+                    .get_object(widget.as_reference().unwrap())
+                    .unwrap()
+                    .as_dict()
+                    .unwrap();
+                let appearance_state = widget.get(b"AS").unwrap().as_name().unwrap();
+                if appearance_state != b"Off" {
+                    assert_eq!(appearance_state, expected);
+                    selected_widgets += 1;
+                }
+            }
+            assert_eq!(selected_widgets, 1);
+        }
 
         // NeedAppearances set on the AcroForm
         let doc = Document::load(&out_str).unwrap();
@@ -2543,7 +4100,63 @@ mod tests {
         let root = doc.get_object(root_ref).unwrap().as_dict().unwrap();
         let acro_ref = root.get(b"AcroForm").unwrap().as_reference().unwrap();
         let acro = doc.get_object(acro_ref).unwrap().as_dict().unwrap();
-        assert!(matches!(acro.get(b"NeedAppearances"), Ok(Object::Boolean(true))));
+        assert!(matches!(
+            acro.get(b"NeedAppearances"),
+            Ok(Object::Boolean(true))
+        ));
+    }
+
+    #[test]
+    fn test_fill_inline_acroform_and_direct_field_with_utf16_text() {
+        let dir = TempDir::new().unwrap();
+        let src = create_form_test_pdf(dir.path(), "inline-form.pdf");
+        let mut doc = Document::load(&src).unwrap();
+        let root_id = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let acro_id = doc
+            .get_object(root_id)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"AcroForm")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let mut acro = doc.get_object(acro_id).unwrap().as_dict().unwrap().clone();
+        let mut fields = acro.get(b"Fields").unwrap().as_array().unwrap().clone();
+        let first_id = fields[0].as_reference().unwrap();
+        fields[0] =
+            Object::Dictionary(doc.get_object(first_id).unwrap().as_dict().unwrap().clone());
+        acro.set("Fields", Object::Array(fields));
+        doc.get_object_mut(root_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("AcroForm", Object::Dictionary(acro));
+        doc.save(&src).unwrap();
+
+        let out = dir
+            .path()
+            .join("inline-form-filled.pdf")
+            .to_string_lossy()
+            .into_owned();
+        fill_form(FillFormRequest {
+            input_path: src,
+            output_path: out.clone(),
+            values: vec![FormFieldValue {
+                name: "fullname".into(),
+                value: "艾达 Lovelace".into(),
+            }],
+        })
+        .unwrap();
+        let fields = get_form_fields(out).unwrap();
+        assert_eq!(
+            fields
+                .iter()
+                .find(|field| field.name == "fullname")
+                .unwrap()
+                .value,
+            "艾达 Lovelace"
+        );
     }
 
     #[test]
@@ -2553,7 +4166,10 @@ mod tests {
         let result = fill_form(FillFormRequest {
             input_path: src,
             output_path: dir.path().join("nope.pdf").to_string_lossy().to_string(),
-            values: vec![FormFieldValue { name: "x".into(), value: "y".into() }],
+            values: vec![FormFieldValue {
+                name: "x".into(),
+                value: "y".into(),
+            }],
         });
         assert!(result.is_err());
     }
@@ -2607,27 +4223,23 @@ mod tests {
         let doc = Document::load(&out_str).unwrap();
         assert_eq!(doc.get_pages().len(), 1);
         let page_id = *doc.get_pages().get(&1).unwrap();
-        let contents = doc.get_object(page_id).unwrap().as_dict().unwrap()
-            .get(b"Contents").unwrap().clone();
-        let stream_ids: Vec<ObjectId> = match contents {
-            Object::Reference(r) => match doc.get_object(r).unwrap() {
-                Object::Array(arr) => arr.iter().filter_map(|o| o.as_reference().ok()).collect(),
-                Object::Stream(_) => vec![r],
-                _ => vec![],
-            },
-            _ => vec![],
-        };
+        let stream_ids = doc.get_page_contents(page_id);
         let mut found_cover = false;
         let mut found_text = false;
         for sid in stream_ids {
             if let Ok(stream) = doc.get_object(sid).unwrap().as_stream() {
                 // decompressed_content() errors on streams without /Filter;
                 // fall back to the raw content in that case
-                let raw = stream.decompressed_content()
+                let raw = stream
+                    .get_plain_content()
                     .unwrap_or_else(|_| stream.content.clone());
                 let data = String::from_utf8_lossy(&raw).to_string();
-                if data.contains("re f") { found_cover = true; }
-                if data.contains("(Bye PDF) Tj") { found_text = true; }
+                if data.contains("re f") {
+                    found_cover = true;
+                }
+                if data.contains("(Bye PDF) Tj") {
+                    found_text = true;
+                }
             }
         }
         assert!(found_cover, "cover rectangle missing");
@@ -2687,11 +4299,23 @@ mod tests {
                     title: "第一章 概述".into(),
                     page: 1,
                     children: vec![
-                        OutlineItemInput { title: "1.1 背景".into(), page: 2, children: vec![] },
-                        OutlineItemInput { title: "1.2 目标".into(), page: 3, children: vec![] },
+                        OutlineItemInput {
+                            title: "1.1 背景".into(),
+                            page: 2,
+                            children: vec![],
+                        },
+                        OutlineItemInput {
+                            title: "1.2 目标".into(),
+                            page: 3,
+                            children: vec![],
+                        },
                     ],
                 },
-                OutlineItemInput { title: "Chapter 2".into(), page: 3, children: vec![] },
+                OutlineItemInput {
+                    title: "Chapter 2".into(),
+                    page: 3,
+                    children: vec![],
+                },
             ],
         })
         .unwrap();
@@ -2733,7 +4357,10 @@ mod tests {
         assert_eq!(first.get(b"Count").unwrap(), &Object::Integer(2));
         let child1_ref = first.get(b"First").unwrap().as_reference().unwrap();
         let child1 = doc.get_object(child1_ref).unwrap().as_dict().unwrap();
-        assert_eq!(child1.get(b"Parent").unwrap(), &Object::Reference(first_ref));
+        assert_eq!(
+            child1.get(b"Parent").unwrap(),
+            &Object::Reference(first_ref)
+        );
         assert_eq!(
             child1.get(b"Next").unwrap().as_reference().unwrap(),
             first.get(b"Last").unwrap().as_reference().unwrap()
@@ -2742,7 +4369,10 @@ mod tests {
         // Last top-level item: /Prev back to first, no /Next
         let last_ref = outlines.get(b"Last").unwrap().as_reference().unwrap();
         let last = doc.get_object(last_ref).unwrap().as_dict().unwrap();
-        assert_eq!(last.get(b"Prev").unwrap().as_reference().unwrap(), first_ref);
+        assert_eq!(
+            last.get(b"Prev").unwrap().as_reference().unwrap(),
+            first_ref
+        );
         assert!(last.get(b"Next").is_err());
     }
 
@@ -2755,7 +4385,11 @@ mod tests {
         set_outline(SetOutlineRequest {
             input_path: input.clone(),
             output_path: out.to_string_lossy().to_string(),
-            items: vec![OutlineItemInput { title: "A".into(), page: 1, children: vec![] }],
+            items: vec![OutlineItemInput {
+                title: "A".into(),
+                page: 1,
+                children: vec![],
+            }],
         })
         .unwrap();
         set_outline(SetOutlineRequest {
@@ -2789,7 +4423,11 @@ mod tests {
         let result = set_outline(SetOutlineRequest {
             input_path: input,
             output_path: out.to_string_lossy().to_string(),
-            items: vec![OutlineItemInput { title: "X".into(), page: 99, children: vec![] }],
+            items: vec![OutlineItemInput {
+                title: "X".into(),
+                page: 99,
+                children: vec![],
+            }],
         });
         assert!(result.is_err());
     }
