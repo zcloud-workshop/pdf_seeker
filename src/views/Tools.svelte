@@ -3,7 +3,7 @@
   import { currentView, currentFilePath, isDark, openTab } from "@/stores";
   import { ask, open, save } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
-  import { readFile, writeTextFile, writeFile } from "@tauri-apps/plugin-fs";
+  import { readFile, writeTextFile } from "@tauri-apps/plugin-fs";
   import { Button, Input, Label } from "@/components/ui";
   import {
     Merge as Icon_Merge,
@@ -45,6 +45,7 @@
   import { loadPdf, renderPageToCanvas, type PdfDocumentProxy } from "@/pdf-engine";
   import { tick, onDestroy } from "svelte";
   import {
+    assertFileUnchanged,
     beginFileWrite,
     clearRedoStack,
     endFileWrite,
@@ -56,7 +57,11 @@
     popUndoSnapshot,
     pushRedoSnapshot,
     pushUndoSnapshot,
+    refreshFileFingerprint,
+    sessionFingerprint,
+    setSessionFingerprint,
   } from "@/document/session.svelte.ts";
+  import { restoreSnapshot } from "@/document/restore";
   import { parsePageSelection, parseRangeGroups } from "@/document/pageRanges";
   import { clampInt, intOr, isTruthyExportValue, numOr } from "@/document/input";
 
@@ -1419,8 +1424,11 @@
     busy = true;
     resultMsg = "";
     let before: Uint8Array | null = null;
+    let expected = sessionFingerprint(path);
     try {
+      await assertFileUnchanged(path);
       before = new Uint8Array(await readFile(path));
+      expected = sessionFingerprint(path);
       // The target stays the captured path even if the user switches files
       // mid-task; only UI application is skipped for a different file (R07).
       await invoke(command, { req: { ...req, inputPath: path, outputPath: path } });
@@ -1428,17 +1436,20 @@
       // keeps the history untouched so it can be retried.
       pushUndoSnapshot(path, before);
       clearRedoStack(path);
+      await refreshFileFingerprint(path);
       resultMsg = successMsg;
       resultOk = true;
       if (!fileSwitched(path)) await loadThumbnails();
     } catch (e) {
       resultMsg = String(e);
       resultOk = false;
-      // The command may have partially written the file before failing —
-      // restore the pre-edit bytes so disk matches the untouched history.
+      // The backend save is atomic, so a failed command normally leaves the
+      // file untouched; restore the pre-edit bytes anyway (07-A: through the
+      // locked atomic path, never a direct writeFile) so disk matches the
+      // untouched history.
       if (before) {
         try {
-          await writeFile(path, before);
+          await restoreSnapshot(path, before, expected);
         } catch {
           /* keep the original error */
         }
@@ -1456,13 +1467,17 @@
     resultMsg = "";
     let current: Uint8Array | null = null;
     try {
+      await assertFileUnchanged(path);
       current = new Uint8Array(await readFile(path));
       const prev = peekUndoSnapshot(path);
       if (!prev) return;
       // Abandon the undo if the user switched files before anything was
       // written — never write one document on behalf of another view (R07).
       if (fileSwitched(path)) return;
-      await writeFile(path, prev);
+      // 07-A: restores go through the backend write transaction (lock +
+      // fingerprint check + atomic replace), never a direct writeFile.
+      const fp = await restoreSnapshot(path, prev, sessionFingerprint(path));
+      setSessionFingerprint(path, fp);
       // History moves only after the write succeeded (R06).
       popUndoSnapshot(path);
       pushRedoSnapshot(path, current);
@@ -1474,11 +1489,12 @@
     } catch (e) {
       resultMsg = String(e);
       resultOk = false;
-      // writeFile may have partially truncated the file — restore the bytes
-      // that were on disk when the undo started.
+      // The atomic restore either fully succeeded or left the file untouched;
+      // this rollback only covers a mid-flight failure of a previous partial
+      // write and keeps the bytes that were on disk when the undo started.
       if (current) {
         try {
-          await writeFile(path, current);
+          await restoreSnapshot(path, current, sessionFingerprint(path));
         } catch {
           /* keep the original error */
         }
@@ -1496,11 +1512,13 @@
     resultMsg = "";
     let current: Uint8Array | null = null;
     try {
+      await assertFileUnchanged(path);
       current = new Uint8Array(await readFile(path));
       const next = peekRedoSnapshot(path);
       if (!next) return;
       if (fileSwitched(path)) return;
-      await writeFile(path, next);
+      const fp = await restoreSnapshot(path, next, sessionFingerprint(path));
+      setSessionFingerprint(path, fp);
       popRedoSnapshot(path);
       pushUndoSnapshot(path, current);
       if (!fileSwitched(path)) {
@@ -1513,7 +1531,7 @@
       resultOk = false;
       if (current) {
         try {
-          await writeFile(path, current);
+          await restoreSnapshot(path, current, sessionFingerprint(path));
         } catch {
           /* keep the original error */
         }
