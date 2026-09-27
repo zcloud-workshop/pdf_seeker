@@ -1,0 +1,6 @@
+# pnpm 11 reads its settings from this file, not from the package.json
+# "pnpm" field. esbuild needs its postinstall to link the platform
+# binary; es5-ext builds optional runtime optimizations.
+allowBuilds:
+  es5-ext: true
+  esbuild: true
