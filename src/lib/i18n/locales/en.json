@@ -13,9 +13,12 @@
   },
   "toolbar": {
     "openFile": "Open File",
-    "saveFile": "Save",
-    "export": "Export",
-    "settings": "Settings"
+    "settings": "Settings",
+    "toggleSidebar": "Toggle sidebar",
+    "fullscreen": "Enter fullscreen",
+    "exitFullscreen": "Exit fullscreen",
+    "themeLightSaved": "Switch to light theme and save preference",
+    "themeDarkSaved": "Switch to dark theme and save preference"
   },
   "viewer": {
     "noFile": "No file opened",
@@ -75,12 +78,15 @@
     "s3TestConnection": "Test Connection",
     "s3Connected": "Connection successful",
     "s3Failed": "Connection failed",
-    "s3MaxVersions": "Max Versions to Keep",
-    "s3VersionTtl": "Version Retention Days",
+    "s3Testing": "Testing...",
+    "s3Enabled": "Enabled",
+    "s3Disabled": "Disabled",
+    "s3MaxVersions": "Maximum Versions to Show",
     "save": "Save",
     "saved": "Settings saved",
+    "configRecovered": "The invalid local config was preserved. Settings are using defaults until you save or restore a backup:",
     "syncTitle": "Cloud Sync",
-    "syncHint": "Back up your settings (incl. S3 connection and recent files) to the current S3 bucket and restore them on other devices. Note: the backup contains plaintext credentials — use a private bucket.",
+    "syncHint": "Back up preferences and S3 connection details to the current bucket. Access keys, session tokens, and recent paths are excluded. Credentials on this device are preserved when restoring a matching connection.",
     "syncAuto": "Auto backup (upload on save)",
     "syncLastBackup": "Last backup",
     "syncBackupNow": "Back up now",
@@ -89,7 +95,7 @@
     "syncNoVersions": "No cloud backups yet (bucket versioning must be enabled to keep history)",
     "syncLatest": "Latest",
     "syncRestore": "Restore",
-    "syncRestoreConfirm": "This overwrites all local settings (including the current S3 connection) with the cloud backup. Continue?",
+    "syncRestoreConfirm": "Restore settings from this backup? Local recent paths stay on this device, and credentials are preserved only for a matching connection.",
     "syncRestoreDone": "Config restored from cloud",
     "syncBackupDone": "Backup uploaded"
   },
@@ -103,7 +109,18 @@
     "empty": "Empty folder",
     "uploading": "Uploading",
     "downloading": "Downloading",
-    "noConfig": "Configure S3 storage in Settings to enable cloud features"
+    "noConfig": "Configure S3 storage in Settings to enable cloud features",
+    "refresh": "Refresh",
+    "folderName": "Folder name",
+    "createFolder": "Create folder",
+    "close": "Close",
+    "noVersions": "No versions found",
+    "loadFailed": "Could not load this folder",
+    "downloadError": "Download failed",
+    "delete": "Delete",
+    "deleteConfirm": "Delete this exact object?",
+    "deleteVersion": "Delete version",
+    "deleteVersionConfirm": "Delete this exact version?"
   },
   "tools": {
     "merge": "Merge",
@@ -176,11 +193,14 @@
     "title": "Software Update",
     "autoCheck": "Check for updates on startup",
     "checkNow": "Check for updates",
+    "checking": "Checking...",
+    "downloading": "Downloading update",
+    "installing": "Finishing update...",
     "available": "Update available",
     "upToDate": "You are on the latest version",
     "devSkip": "Update checks are skipped in dev builds",
     "declined": "Update skipped",
-    "error": "Update check failed (network or endpoint unavailable)",
+    "error": "Update failed",
     "restartPrompt": "Update installed. Relaunch the app now?"
   }
 }
