@@ -1,16 +1,6 @@
 import * as pdfjsLib from "pdfjs-dist";
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
 
-// Extend PDFPageProxy to include getTextContent which exists at runtime
-declare module "pdfjs-dist" {
-  interface PDFPageProxy {
-    getTextContent(params?: { includeMarkedContent?: boolean; disableNormalization?: boolean }): Promise<{
-      items: Array<{ str: string; dir: string; width: number; height: number; transform: number[]; fontName: string; hasEOL: boolean }>;
-      styles: Record<string, { fontFamily: string; ascent: number; descent: number; vertical: boolean }>;
-    }>;
-  }
-}
-
 // Bundle the worker via Vite's ?url import
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
