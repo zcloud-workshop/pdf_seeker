@@ -4,8 +4,6 @@
   import { Button, Tooltip } from "@/components/ui";
   import {
     FolderOpen,
-    Save,
-    Download,
     Moon,
     Sun,
     Maximize,
@@ -22,6 +20,8 @@
     sidebarCollapsed,
   } from "@/stores";
   import { invoke } from "@tauri-apps/api/core";
+  import { setThemePreference, themeSaveError } from "@/settings";
+  let themeSaving = $state(false);
 
   async function handleOpen() {
     const selected = await open({
@@ -38,10 +38,16 @@
     }
   }
 
-  function toggleTheme() {
-    const next = !$isDark;
-    isDark.set(next);
-    document.documentElement.classList.toggle("dark", next);
+  async function toggleTheme() {
+    if (themeSaving) return;
+    themeSaving = true;
+    try {
+      await setThemePreference($isDark ? "light" : "dark");
+    } catch {
+      // The tooltip displays the persistence error.
+    } finally {
+      themeSaving = false;
+    }
   }
 
   function toggleFullscreen() {
@@ -62,7 +68,7 @@
 <header
   class="flex items-center h-12 px-3 border-b border-border bg-card gap-1 shrink-0 select-none"
 >
-  <Tooltip message="Toggle Sidebar">
+  <Tooltip message={t("toolbar.toggleSidebar")}>
     <Button variant="ghost" size="icon" onclick={() => sidebarCollapsed.update((v) => !v)}>
       {#if $sidebarCollapsed}
         <PanelLeft size={18} />
@@ -79,18 +85,6 @@
     </Button>
   </Tooltip>
 
-  <Tooltip message={t("toolbar.saveFile")}>
-    <Button variant="ghost" size="icon" disabled>
-      <Save size={16} />
-    </Button>
-  </Tooltip>
-
-  <Tooltip message={t("toolbar.export")}>
-    <Button variant="ghost" size="icon" disabled>
-      <Download size={16} />
-    </Button>
-  </Tooltip>
-
   <div class="flex-1"></div>
 
   {#if $currentFileName}
@@ -102,7 +96,9 @@
     </span>
   {/if}
 
-  <Tooltip message={$isFullscreen ? "Exit Fullscreen" : "Fullscreen (F11)"}>
+  <Tooltip
+    message={$isFullscreen ? t("toolbar.exitFullscreen") : t("toolbar.fullscreen")}
+  >
     <Button variant="ghost" size="icon" onclick={toggleFullscreen}>
       {#if $isFullscreen}
         <Minimize size={18} />
@@ -112,8 +108,10 @@
     </Button>
   </Tooltip>
 
-  <Tooltip message={$isDark ? t("settings.themeLight") : t("settings.themeDark")}>
-    <Button variant="ghost" size="icon" onclick={toggleTheme}>
+  <Tooltip
+    message={$themeSaveError ?? ($isDark ? t("toolbar.themeLightSaved") : t("toolbar.themeDarkSaved"))}
+  >
+    <Button variant="ghost" size="icon" onclick={toggleTheme} disabled={themeSaving}>
       {#if $isDark}
         <Sun size={18} />
       {:else}
