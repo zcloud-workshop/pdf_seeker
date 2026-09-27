@@ -31,7 +31,7 @@
     Check,
     X,
   } from "lucide-svelte";
-  import { readFile, writeFile } from "@tauri-apps/plugin-fs";
+  import { readFile } from "@tauri-apps/plugin-fs";
   import { invoke } from "@tauri-apps/api/core";
   import {
     loadPdf,
@@ -40,7 +40,25 @@
   } from "@/pdf-engine";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onDestroy } from "svelte";
-  import { getSession, peekSession } from "@/document/session.svelte.ts";
+  import {
+    assertFileUnchanged,
+    beginFileWrite,
+    clearRedoStack,
+    endFileWrite,
+    getSession,
+    isFileWriteBusy,
+    peekRedoSnapshot,
+    peekSession,
+    peekUndoSnapshot,
+    popRedoSnapshot,
+    popUndoSnapshot,
+    pushRedoSnapshot,
+    pushUndoSnapshot,
+    refreshFileFingerprint,
+    sessionFingerprint,
+    setSessionFingerprint,
+  } from "@/document/session.svelte.ts";
+  import { restoreSnapshot } from "@/document/restore";
   import {
     claimViewerFocus,
     isViewerFocusOwner,
@@ -170,13 +188,12 @@
     editingOutline = false;
     if (!sameFile) {
       // Fresh document: adopt the per-file session view state (R12). A
-      // same-file refresh keeps the current position instead.
+      // same-file refresh keeps the current position instead. R11: the
+      // unified session history survives a same-file reload after a bookmark
+      // save, so undo stays available without a component-local snapshot.
       const s = getSession(path);
       zoom = s.view.zoom > 0 ? s.view.zoom : 1;
       pageNo = Math.max(1, s.view.page);
-      // R11: the outline undo snapshot only dies on a real file change,
-      // never on the same-file reload that follows a bookmark save.
-      outlineUndoSnapshot = null;
     }
     try {
       const data = await readFile(path);
@@ -198,7 +215,9 @@
       if (gen !== docGeneration) return;
       outlineNodes = outline;
       savedOutlineJson = JSON.stringify(outline);
-      if (!sameFile) outlineUndoSnapshot = null;
+      // 07-A: record the on-disk fingerprint as the baseline for external
+      // modification checks ahead of the next write.
+      await refreshFileFingerprint(path);
     } catch (e) {
       if (gen !== docGeneration) return;
       errorMsg = String(e);
@@ -493,7 +512,6 @@
   let newBookmarkTitle = $state("");
   let outlineSaving = $state(false);
   let outlineError = $state("");
-  let outlineUndoSnapshot = $state<Uint8Array | null>(null);
   let savedOutlineJson = "[]";
   let outlineIdSeq = 1;
 
@@ -698,15 +716,24 @@
         `Saving would delete them; full outline editing lands with the 07-C protocol.`;
       return;
     }
+    // 07-A: bookmark saves share the per-file write mutex with edits/undo so
+    // they can never interleave with another write to the same file.
+    if (!beginFileWrite(tab.path)) return;
     outlineSaving = true;
     outlineError = "";
     try {
-      const snapshot = await readFile(tab.path);
+      await assertFileUnchanged(tab.path);
+      const snapshot = new Uint8Array(await readFile(tab.path));
       const items = toInputItems(outlineNodes);
       await invoke("set_outline", {
         req: { inputPath: tab.path, outputPath: tab.path, items },
       });
-      outlineUndoSnapshot = new Uint8Array(snapshot);
+      // 07-A: the pre-save snapshot joins the file's unified history, so
+      // Cmd+Z in any view (not just a local one-level bookmark undo) can
+      // restore it through the backend transaction.
+      pushUndoSnapshot(tab.path, snapshot);
+      clearRedoStack(tab.path);
+      await refreshFileFingerprint(tab.path);
       editingOutline = false;
       selectedNodeId = null;
       renamingId = null;
@@ -715,18 +742,54 @@
       outlineError = String(e);
     } finally {
       outlineSaving = false;
+      endFileWrite(tab.path);
     }
   }
 
-  async function undoOutlineEdit() {
-    if (!outlineUndoSnapshot || outlineSaving) return;
-    const snap = outlineUndoSnapshot;
-    outlineUndoSnapshot = null;
+  // 07-A: undo/redo now operate on the file's unified session history (edits
+  // from Tools and bookmark saves alike) and restore bytes through the
+  // backend's locked, atomic commit instead of a direct writeFile.
+  async function undoFileEdit() {
+    if (!peekUndoSnapshot(tab.path) || !beginFileWrite(tab.path)) return;
+    outlineSaving = true;
+    outlineError = "";
     try {
-      await writeFile(tab.path, snap);
+      await assertFileUnchanged(tab.path);
+      const current = new Uint8Array(await readFile(tab.path));
+      const prev = peekUndoSnapshot(tab.path);
+      if (!prev) return;
+      const fp = await restoreSnapshot(tab.path, prev, sessionFingerprint(tab.path));
+      setSessionFingerprint(tab.path, fp);
+      popUndoSnapshot(tab.path);
+      pushRedoSnapshot(tab.path, current);
       await loadDocument(tab.path);
-    } catch {
-      outlineUndoSnapshot = snap;
+    } catch (e) {
+      outlineError = String(e);
+    } finally {
+      outlineSaving = false;
+      endFileWrite(tab.path);
+    }
+  }
+
+  async function redoFileEdit() {
+    if (!peekRedoSnapshot(tab.path) || !beginFileWrite(tab.path)) return;
+    outlineSaving = true;
+    outlineError = "";
+    try {
+      await assertFileUnchanged(tab.path);
+      const current = new Uint8Array(await readFile(tab.path));
+      const next = peekRedoSnapshot(tab.path);
+      if (!next) return;
+      const fp = await restoreSnapshot(tab.path, next, sessionFingerprint(tab.path));
+      setSessionFingerprint(tab.path, fp);
+      popRedoSnapshot(tab.path);
+      pushUndoSnapshot(tab.path, current);
+      await loadDocument(tab.path);
+    } catch (e) {
+      outlineError = String(e);
+    } finally {
+      outlineSaving = false;
+      endFileWrite(tab.path);
     }
   }
 
@@ -782,14 +845,24 @@
         break;
       case "z":
       case "Z":
-        if (
-          (e.ctrlKey || e.metaKey) &&
-          !e.shiftKey &&
-          !outlineSaving &&
-          outlineUndoSnapshot
-        ) {
-          e.preventDefault();
-          undoOutlineEdit();
+        // 07-A: undo/redo ride the file's unified session history; gate on
+        // the shared write mutex so they never race an in-flight write.
+        if (e.ctrlKey || e.metaKey) {
+          const canUndoFile =
+            !outlineSaving &&
+            !isFileWriteBusy(tab.path) &&
+            !!peekUndoSnapshot(tab.path);
+          const canRedoFile =
+            !outlineSaving &&
+            !isFileWriteBusy(tab.path) &&
+            !!peekRedoSnapshot(tab.path);
+          if (!e.shiftKey && canUndoFile) {
+            e.preventDefault();
+            undoFileEdit();
+          } else if (e.shiftKey && canRedoFile) {
+            e.preventDefault();
+            redoFileEdit();
+          }
         }
         break;
       case "F11":
@@ -1145,7 +1218,7 @@
           {#if outlineError}
             <p class="text-[11px] text-destructive break-all">{outlineError}</p>
           {/if}
-          {#if outlineUndoSnapshot}
+          {#if (peekSession(tab.path)?.undoCount ?? 0) > 0}
             <p class="text-[10px] text-muted-foreground">{t("viewer.outlineUndoHint")}</p>
           {/if}
         </div>
