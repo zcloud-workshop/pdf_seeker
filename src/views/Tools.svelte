@@ -1,7 +1,7 @@
 <script lang="ts">
   import { t } from "@/i18n/index.svelte.ts";
   import { currentView, currentFilePath, isDark, openTab } from "@/stores";
-  import { open, save } from "@tauri-apps/plugin-dialog";
+  import { ask, open, save } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import { readFile, writeTextFile, writeFile } from "@tauri-apps/plugin-fs";
   import { Button, Input, Label } from "@/components/ui";
@@ -43,7 +43,22 @@
   } from "lucide-svelte";
   import { open as openShell } from "@tauri-apps/plugin-shell";
   import { loadPdf, renderPageToCanvas, type PdfDocumentProxy } from "@/pdf-engine";
-  import { tick } from "svelte";
+  import { tick, onDestroy } from "svelte";
+  import {
+    beginFileWrite,
+    clearRedoStack,
+    endFileWrite,
+    isFileWriteBusy,
+    peekSession,
+    peekRedoSnapshot,
+    peekUndoSnapshot,
+    popRedoSnapshot,
+    popUndoSnapshot,
+    pushRedoSnapshot,
+    pushUndoSnapshot,
+  } from "@/document/session.svelte.ts";
+  import { parsePageSelection, parseRangeGroups } from "@/document/pageRanges";
+  import { clampInt, intOr, isTruthyExportValue, numOr } from "@/document/input";
 
   type ToolId =
     | "merge" | "split" | "rotate" | "reorder" | "delete" | "extractPages"
@@ -56,6 +71,18 @@
   let busy = $state(false);
   let resultMsg = $state("");
   let resultOk = $state(false);
+
+  // R12: undo/redo capability follows the per-file history in the session
+  // store, not which tool panel happens to be open.
+  const fileSession = $derived(peekSession($currentFilePath));
+  const canUndo = $derived((fileSession?.undoCount ?? 0) > 0);
+  const canRedo = $derived((fileSession?.redoCount ?? 0) > 0);
+
+  /** True when the active file changed since `path` was captured — stale
+   * async results must not touch UI state for a different file (R07). */
+  function fileSwitched(path: string): boolean {
+    return $currentFilePath !== path;
+  }
 
   // --- Thumbnail preview state ---
   let thumbDoc = $state<PdfDocumentProxy | null>(null);
@@ -89,6 +116,7 @@
       case "annotate": annotPage = p; break;
       case "sign": signPage = p; break;
       case "table": tablePage = p; break;
+      case "watermark": watermarkPage = p; break;
     }
   }
 
@@ -127,24 +155,44 @@
 
   // ==================== Thumbnail preview ====================
 
+  /** Async lifecycle guard for thumbnail loads (R14): bumped on every load
+   * and on destroy; stale results destroy their document and return. */
+  let thumbGeneration = 0;
+
+  function disposeThumbDoc() {
+    if (thumbDoc) {
+      thumbDoc.destroy();
+      thumbDoc = null;
+    }
+  }
+
   async function loadThumbnails() {
     const path = $currentFilePath;
     if (!path) return;
+    const gen = ++thumbGeneration;
     thumbLoading = true;
     try {
       const data = await readFile(path);
+      if (gen !== thumbGeneration || fileSwitched(path)) return;
       const doc = await loadPdf(new Uint8Array(data));
+      if (gen !== thumbGeneration || fileSwitched(path)) {
+        doc.destroy();
+        return;
+      }
+      disposeThumbDoc();
       thumbDoc = doc;
       previewPageCount = doc.numPages;
       deletedPages = new Set();
       pageOrder = Array.from({ length: doc.numPages }, (_, i) => i + 1);
       pageDims = [];
       for (let i = 1; i <= doc.numPages; i++) {
+        if (gen !== thumbGeneration) return;
         const p = await doc.getPage(i);
         const vp = p.getViewport({ scale: 1 });
         pageDims.push({ w: vp.width, h: vp.height });
       }
       await tick();
+      if (gen !== thumbGeneration) return;
       if (isEditingTool(activeTool)) {
         await renderThumbStrip();
         await renderLargePreview();
@@ -152,10 +200,12 @@
         await renderThumbnails();
       }
     } catch (_) {
-      thumbDoc = null;
-      previewPageCount = 0;
+      if (gen === thumbGeneration) {
+        disposeThumbDoc();
+        previewPageCount = 0;
+      }
     } finally {
-      thumbLoading = false;
+      if (gen === thumbGeneration) thumbLoading = false;
     }
   }
 
@@ -188,6 +238,21 @@
         await renderPageToCanvas(thumbDoc, i + 1, canvases[i] as HTMLCanvasElement, 0.15);
       } catch (_) {}
     }
+  }
+
+  // R14: the large preview renders onto a single canvas; concurrent pdfjs
+  // render tasks on one canvas context throw. Serialize requests and let the
+  // newest one win — superseded renders become no-ops before they start.
+  let largeRenderSeq = 0;
+  let largeRenderChain: Promise<void> = Promise.resolve();
+
+  function scheduleLargeRender() {
+    const seq = ++largeRenderSeq;
+    largeRenderChain = largeRenderChain
+      .then(() => {
+        if (seq === largeRenderSeq) return renderLargePreview();
+      })
+      .catch(() => {});
   }
 
   async function renderLargePreview() {
@@ -344,11 +409,11 @@
     void editHlPage; void editHlX; void editHlY; void editHlW; void editHlH; void editHlColor; void editHlOpacity;
     void cropPage; void cropX; void cropY; void cropW; void cropH;
     void annotPage; void annotType; void annotX; void annotY; void annotW; void annotH; void annotColor; void annotOpacity;
-    void watermarkText; void watermarkFontSize; void watermarkAngle; void watermarkOpacity; void watermarkColor;
+    void watermarkText; void watermarkPage; void watermarkFontSize; void watermarkAngle; void watermarkOpacity; void watermarkColor;
     void signImagePath; void signPage; void signX; void signY; void signWidth; void signHeight;
     void previewPage;
 
-    renderLargePreview();
+    scheduleLargeRender();
   });
 
   // ==================== Mouse Selection on Large Canvas ====================
@@ -655,28 +720,18 @@
     deletePagesInput = "";
   }
 
-  function parsePageRanges(input: string): number[] {
-    const pages: number[] = [];
-    for (const part of input.split(",")) {
-      const trimmed = part.trim();
-      if (!trimmed) continue;
-      const rangeMatch = trimmed.match(/^(\d+)-(\d+)$/);
-      if (rangeMatch) {
-        const s = parseInt(rangeMatch[1]);
-        const e = parseInt(rangeMatch[2]);
-        if (s <= e) {
-          for (let i = s; i <= e; i++) pages.push(i);
-        }
-      } else {
-        const num = parseInt(trimmed);
-        if (!isNaN(num) && num > 0) pages.push(num);
-      }
-    }
-    return [...new Set(pages)].sort((a, b) => a - b);
-  }
+  let deletePagesError = $state("");
 
   function applyDeleteInput() {
-    deletedPages = new Set(parsePageRanges(deletePagesInput));
+    // R15: strict parse with bounds + expansion budget; invalid input keeps
+    // the previous selection and shows an immediate error.
+    const res = parsePageSelection(deletePagesInput, previewPageCount || undefined);
+    if (res.error) {
+      deletePagesError = res.error;
+      return;
+    }
+    deletePagesError = "";
+    deletedPages = new Set(res.pages);
   }
 
   async function executeDeletePages() {
@@ -719,6 +774,7 @@
         "extract_text",
         { path },
       );
+      if (fileSwitched(path)) return;
       extractedText = data.text;
       resultMsg = `Extracted ${data.pages} page(s), ${data.text.length} chars`;
       resultOk = true;
@@ -750,10 +806,21 @@
 
   let splitMode = $state<"single" | "range">("single");
   let splitRanges = $state("");
+  let splitError = $state("");
 
   async function executeSplit() {
     const path = $currentFilePath;
     if (!path) return;
+    splitError = "";
+    if (splitMode === "range") {
+      // R15: validate syntax/budget up front (bounds too when the page count
+      // is known); the backend re-validates against the document.
+      const res = parseRangeGroups(splitRanges, previewPageCount || undefined);
+      if (res.error) {
+        splitError = res.error;
+        return;
+      }
+    }
     busy = true;
     resultMsg = "";
     try {
@@ -787,8 +854,16 @@
     extractPagesInput = [...selectedExtractPages].sort((a, b) => a - b).join(", ");
   }
 
+  let extractPagesError = $state("");
+
   function applyExtractInput() {
-    selectedExtractPages = new Set(parsePageRanges(extractPagesInput));
+    const res = parsePageSelection(extractPagesInput, previewPageCount || undefined);
+    if (res.error) {
+      extractPagesError = res.error;
+      return;
+    }
+    extractPagesError = "";
+    selectedExtractPages = new Set(res.pages);
   }
 
   async function executeExtractPages() {
@@ -852,6 +927,7 @@
   // ==================== Watermark ====================
 
   let watermarkText = $state("WATERMARK");
+  let watermarkPage = $state(1);
   let watermarkFontSize = $state(48);
   let watermarkOpacity = $state(0.3);
   let watermarkAngle = $state(-45);
@@ -933,46 +1009,102 @@
 
   let pdf2imgPageRange = $state<"all" | "custom">("all");
   let pdf2imgPages = $state("");
+  let pdf2imgError = $state("");
 
   async function executePdf2Img() {
     const path = $currentFilePath;
     if (!path) return;
+    pdf2imgError = "";
     busy = true;
     resultMsg = "";
+    let doc: PdfDocumentProxy | null = null;
     try {
       const selected = await open({ directory: true });
       if (!selected) return;
       const outputDir = String(selected);
 
       const data = await readFile(path);
-      const doc = await loadPdf(new Uint8Array(data));
+      doc = await loadPdf(new Uint8Array(data));
 
       let pagesToConvert: number[];
       if (pdf2imgPageRange === "all") {
         pagesToConvert = Array.from({ length: doc.numPages }, (_, i) => i + 1);
       } else {
-        pagesToConvert = parsePageRanges(pdf2imgPages);
+        // R15: strict parse — invalid input aborts instead of quietly
+        // exporting a truncated subset.
+        const res = parsePageSelection(pdf2imgPages, doc.numPages);
+        if (res.error || !res.pages) {
+          pdf2imgError = res.error ?? "No pages selected";
+          return;
+        }
+        pagesToConvert = res.pages;
       }
 
+      // R28: check for same-name outputs up front and make the user decide
+      // instead of silently overwriting.
       const baseName = (path.split(/[\\/]/).pop() || "page").replace(/\.pdf$/i, "");
-      for (const pageNum of pagesToConvert) {
-        const canvas = document.createElement("canvas");
-        await renderPageToCanvas(doc, pageNum, canvas, 2);
-        const blob = await new Promise<Blob | null>((resolve) =>
-          canvas.toBlob((b) => resolve(b), "image/png"),
+      const targetNames = new Set(pagesToConvert.map((n) => `${baseName}_page_${n}.png`));
+      let existing: string[] = [];
+      try {
+        const listed = await invoke<string[]>("list_dir_files", {
+          dir: outputDir,
+          extensions: ["png"],
+        });
+        existing = listed.filter((p) => targetNames.has(p.split(/[\\/]/).pop() ?? ""));
+      } catch {
+        // Listing failed — surface backend errors on write instead of blocking.
+      }
+      if (existing.length > 0) {
+        const overwrite = await ask(
+          `${existing.length} file(s) with the same name already exist in the target folder. Overwrite them?`,
+          { title: "Export as PNG", kind: "warning" },
         );
-        if (!blob) continue;
-        const arrayBuffer = await blob.arrayBuffer();
-        const fileName = `${baseName}_page_${pageNum}.png`;
-        await invoke("save_image_file", { path: `${outputDir}/${fileName}`, data: Array.from(new Uint8Array(arrayBuffer)) });
+        if (!overwrite) {
+          resultMsg = `Export cancelled — ${existing.length} conflicting file(s) in target folder`;
+          resultOk = false;
+          return;
+        }
       }
 
-      resultMsg = `Exported ${pagesToConvert.length} page(s) as PNG`;
-      resultOk = true;
+      const savedPages: number[] = [];
+      const failedPages: number[] = [];
+      for (const pageNum of pagesToConvert) {
+        try {
+          const canvas = document.createElement("canvas");
+          await renderPageToCanvas(doc, pageNum, canvas, 2);
+          const blob = await new Promise<Blob | null>((resolve) =>
+            canvas.toBlob((b) => resolve(b), "image/png"),
+          );
+          canvas.width = 0;
+          canvas.height = 0;
+          if (!blob) throw new Error("PNG encoding failed");
+          const arrayBuffer = await blob.arrayBuffer();
+          const fileName = `${baseName}_page_${pageNum}.png`;
+          await invoke("save_image_file", {
+            path: `${outputDir}/${fileName}`,
+            data: Array.from(new Uint8Array(arrayBuffer)),
+          });
+          savedPages.push(pageNum);
+        } catch {
+          failedPages.push(pageNum);
+        }
+      }
+
+      // R28: report what actually happened, never a blanket success count.
+      if (failedPages.length === 0) {
+        resultMsg = `Exported ${savedPages.length} page(s) as PNG`;
+        resultOk = true;
+      } else {
+        resultMsg =
+          `Exported ${savedPages.length} of ${pagesToConvert.length} page(s); ` +
+          `failed: ${failedPages.join(", ")}`;
+        resultOk = savedPages.length > 0;
+      }
     } catch (e) {
       resultMsg = String(e);
       resultOk = false;
     } finally {
+      doc?.destroy();
       busy = false;
     }
   }
@@ -1013,6 +1145,10 @@
   let ocrLanguage = $state("eng");
   let ocrAvailable = $state<boolean | null>(null);
   let ocrText = $state("");
+  /** Per-page status lines for skipped/failed pages (R13: visible state). */
+  let ocrPageNotes = $state<string[]>([]);
+  /** Task identity: a new run (or a file switch) invalidates older ones. */
+  let ocrTaskSeq = 0;
 
   async function checkOcr() {
     try {
@@ -1022,72 +1158,129 @@
     }
   }
 
+  function ocrStale(taskId: number, path: string): boolean {
+    return taskId !== ocrTaskSeq || fileSwitched(path);
+  }
+
   async function executeOcr() {
     const path = $currentFilePath;
     if (!path) return;
+    const taskId = ++ocrTaskSeq;
     busy = true;
     resultMsg = "";
     ocrText = "";
+    ocrPageNotes = [];
+    let doc: PdfDocumentProxy | null = null;
     try {
       const data = await readFile(path);
-      const doc = await loadPdf(new Uint8Array(data));
+      if (ocrStale(taskId, path)) return;
+      doc = await loadPdf(new Uint8Array(data));
+      if (ocrStale(taskId, path)) return;
 
-      // Phase 1: Try pdfjs-dist built-in text extraction (lightweight, no external deps)
-      let totalText = "";
-      let textFound = false;
+      // R13: decide per page — real text layers are extracted directly;
+      // image-only pages are collected for the Tesseract phase so mixed
+      // documents do not lose their scanned pages.
+      const textByPage = new Map<number, string>();
+      const scannedPages: number[] = [];
       for (let i = 1; i <= doc.numPages; i++) {
+        if (ocrStale(taskId, path)) return;
         const page = await doc.getPage(i);
         const content = await page.getTextContent();
         const pageText = content.items
-          .map((item: any) => item.str)
-          .filter((s: string) => s.trim())
+          .map((item) => ("str" in item ? item.str : ""))
+          .filter((s) => s.trim())
           .join(" ");
-        if (pageText.trim()) {
-          textFound = true;
-          totalText += `\n--- Page ${i} ---\n${pageText}\n`;
+        if (pageText.trim()) textByPage.set(i, pageText);
+        else scannedPages.push(i);
+      }
+
+      const ocrByPage = new Map<number, string>();
+      if (scannedPages.length > 0) {
+        if (ocrAvailable === null) await checkOcr();
+        if (ocrStale(taskId, path)) return;
+        if (ocrAvailable) {
+          // One task = one fresh backend temp dir; page files carry their
+          // ORIGINAL (zero-padded) page number so order survives the IPC.
+          const tempDir = await invoke<string>("get_temp_dir", {});
+          const savedPages: number[] = [];
+          for (const pageNum of scannedPages) {
+            if (ocrStale(taskId, path)) return;
+            try {
+              const canvas = document.createElement("canvas");
+              await renderPageToCanvas(doc, pageNum, canvas, 2);
+              const blob = await new Promise<Blob | null>((resolve) =>
+                canvas.toBlob((b) => resolve(b), "image/png"),
+              );
+              canvas.width = 0;
+              canvas.height = 0;
+              if (!blob) throw new Error("PNG encoding failed");
+              const ab = await blob.arrayBuffer();
+              const paddedNum = String(pageNum).padStart(6, "0");
+              await invoke("save_image_file", {
+                path: `${tempDir}/ocr_page_${paddedNum}.png`,
+                data: Array.from(new Uint8Array(ab)),
+              });
+              savedPages.push(pageNum);
+            } catch (err) {
+              ocrPageNotes.push(`Page ${pageNum}: rendering failed (${String(err)})`);
+            }
+          }
+          if (ocrStale(taskId, path)) return;
+          if (savedPages.length > 0) {
+            const ocrResult = await invoke<{ text: string; pages: number }>(
+              "ocr_extract_from_images",
+              { req: { imageDir: tempDir, language: ocrLanguage } },
+            );
+            if (ocrStale(taskId, path)) return;
+            // The backend numbers segments by sorted file order; savedPages
+            // is ascending, so the k-th segment is the k-th saved page.
+            const segments = ocrResult.text.split(/^--- Page \d+ ---$/m).slice(1);
+            for (let k = 0; k < savedPages.length && k < segments.length; k++) {
+              ocrByPage.set(savedPages[k], segments[k].trim());
+            }
+            if (segments.length < savedPages.length) {
+              ocrPageNotes.push(
+                `Tesseract returned ${segments.length} of ${savedPages.length} rendered page(s)`,
+              );
+            }
+          }
+        } else {
+          // R13: missing Tesseract limits only scanned pages — text pages
+          // still export, and every skipped page is reported.
+          for (const p of scannedPages) {
+            ocrPageNotes.push(`Page ${p}: scanned page skipped — install Tesseract for OCR`);
+          }
         }
       }
 
-      if (textFound && totalText.trim().length > 10) {
-        // Sufficient text extracted via pdfjs-dist, no Tesseract needed
-        ocrText = totalText;
-        resultMsg = `Extracted ${doc.numPages} page(s), ${totalText.length} chars (built-in)`;
+      // Compose the final text in true page order with honest counts (R28).
+      let text = "";
+      let missing = 0;
+      for (let i = 1; i <= doc.numPages; i++) {
+        text += `\n--- Page ${i} ---\n`;
+        const t = textByPage.get(i) ?? ocrByPage.get(i);
+        if (t && t.trim()) text += `${t}\n`;
+        else missing++;
+      }
+      ocrText = text.trimStart();
+      const extracted = doc.numPages - missing;
+      if (missing === 0) {
+        resultMsg =
+          `Extracted ${doc.numPages} page(s), ${ocrText.length} chars` +
+          (scannedPages.length > 0 ? " (text + Tesseract)" : " (built-in)");
         resultOk = true;
       } else {
-        // Phase 2: Fall back to Tesseract OCR for scanned/image PDFs
-        if (ocrAvailable === null) await checkOcr();
-        if (!ocrAvailable) {
-          ocrText = totalText;
-          resultMsg = "This PDF contains mostly images. Install Tesseract for OCR: https://github.com/tesseract-ocr/tesseract";
-          resultOk = totalText.length > 0;
-          return;
-        }
-
-        const tempDir = await invoke<string>("get_temp_dir", {});
-        for (let i = 1; i <= doc.numPages; i++) {
-          const canvas = document.createElement("canvas");
-          await renderPageToCanvas(doc, i, canvas, 2);
-          const blob = await new Promise<Blob | null>((resolve) =>
-            canvas.toBlob((b) => resolve(b), "image/png"),
-          );
-          if (!blob) continue;
-          const ab = await blob.arrayBuffer();
-          const paddedNum = String(i).padStart(4, "0");
-          await invoke("save_image_file", { path: `${tempDir}/ocr_page_${paddedNum}.png`, data: Array.from(new Uint8Array(ab)) });
-        }
-
-        const ocrResult = await invoke<{ text: string; pages: number }>("ocr_extract_from_images", {
-          req: { imageDir: tempDir, language: ocrLanguage },
-        });
-        ocrText = ocrResult.text;
-        resultMsg = `OCR extracted ${ocrResult.pages} page(s), ${ocrResult.text.length} chars (Tesseract)`;
-        resultOk = true;
+        resultMsg = `Extracted ${extracted} of ${doc.numPages} page(s); ${missing} page(s) had no extractable text`;
+        resultOk = extracted > 0;
       }
     } catch (e) {
-      resultMsg = String(e);
-      resultOk = false;
+      if (!ocrStale(taskId, path)) {
+        resultMsg = String(e);
+        resultOk = false;
+      }
     } finally {
-      busy = false;
+      doc?.destroy();
+      if (taskId === ocrTaskSeq) busy = false;
     }
   }
 
@@ -1119,9 +1312,11 @@
     busy = true;
     resultMsg = "";
     tableCsv = "";
+    let doc: PdfDocumentProxy | null = null;
     try {
       const data = await readFile(path);
-      const doc = await loadPdf(new Uint8Array(data));
+      doc = await loadPdf(new Uint8Array(data));
+      if (fileSwitched(path)) return;
       const page = await doc.getPage(Math.min(tablePage, doc.numPages));
       tablePage = Math.min(tablePage, doc.numPages);
       const content = await page.getTextContent();
@@ -1194,6 +1389,7 @@
       resultMsg = String(e);
       resultOk = false;
     } finally {
+      doc?.destroy();
       busy = false;
     }
   }
@@ -1212,88 +1408,138 @@
   }
 
   // ==================== Edit tools: Undo / Redo ====================
-  // In-place editing with byte snapshots of the current file.
-
-  const MAX_UNDO = 30;
-  let undoStack = $state<Uint8Array[]>([]);
-  let redoStack = $state<Uint8Array[]>([]);
-
-  const canUndo = $derived(undoStack.length > 0);
-  const canRedo = $derived(redoStack.length > 0);
-
-  $effect(() => {
-    // Reset history when the edited file changes
-    if ($currentFilePath) {
-      undoStack = [];
-      redoStack = [];
-    }
-  });
+  // In-place editing with byte snapshots of the current file. History lives
+  // in the per-file session (R12) so it survives Tools → Viewer → Tools;
+  // edits/undo/redo share a per-file write mutex (R06).
 
   async function applyEditInPlace(command: string, req: Record<string, unknown>, successMsg: string) {
     const path = $currentFilePath;
     if (!path) return;
+    if (!beginFileWrite(path)) return;
     busy = true;
     resultMsg = "";
-    let pushed = false;
+    let before: Uint8Array | null = null;
     try {
-      const snapshot = await readFile(path);
-      undoStack.push(snapshot);
-      pushed = true;
-      if (undoStack.length > MAX_UNDO) undoStack.shift();
-      redoStack = [];
+      before = new Uint8Array(await readFile(path));
+      // The target stays the captured path even if the user switches files
+      // mid-task; only UI application is skipped for a different file (R07).
       await invoke(command, { req: { ...req, inputPath: path, outputPath: path } });
+      // R06: history moves only after a successful write — a failed edit
+      // keeps the history untouched so it can be retried.
+      pushUndoSnapshot(path, before);
+      clearRedoStack(path);
       resultMsg = successMsg;
       resultOk = true;
-      await loadThumbnails();
+      if (!fileSwitched(path)) await loadThumbnails();
     } catch (e) {
-      // Restore the pre-edit snapshot if the command may have partially written the file
-      if (pushed) {
-        const snap = undoStack.pop()!;
-        try { await writeFile(path, snap); } catch { /* keep the original error */ }
-      }
       resultMsg = String(e);
       resultOk = false;
+      // The command may have partially written the file before failing —
+      // restore the pre-edit bytes so disk matches the untouched history.
+      if (before) {
+        try {
+          await writeFile(path, before);
+        } catch {
+          /* keep the original error */
+        }
+      }
     } finally {
+      endFileWrite(path);
       busy = false;
     }
   }
 
   async function undoEdit() {
     const path = $currentFilePath;
-    if (!path || undoStack.length === 0) return;
+    if (!path || !canUndo || !beginFileWrite(path)) return;
+    busy = true;
+    resultMsg = "";
+    let current: Uint8Array | null = null;
     try {
-      redoStack.push(await readFile(path));
-      const prev = undoStack.pop()!;
+      current = new Uint8Array(await readFile(path));
+      const prev = peekUndoSnapshot(path);
+      if (!prev) return;
+      // Abandon the undo if the user switched files before anything was
+      // written — never write one document on behalf of another view (R07).
+      if (fileSwitched(path)) return;
       await writeFile(path, prev);
-      await loadThumbnails();
-      resultMsg = "Undone";
-      resultOk = true;
+      // History moves only after the write succeeded (R06).
+      popUndoSnapshot(path);
+      pushRedoSnapshot(path, current);
+      if (!fileSwitched(path)) {
+        await loadThumbnails();
+        resultMsg = "Undone";
+        resultOk = true;
+      }
     } catch (e) {
       resultMsg = String(e);
       resultOk = false;
+      // writeFile may have partially truncated the file — restore the bytes
+      // that were on disk when the undo started.
+      if (current) {
+        try {
+          await writeFile(path, current);
+        } catch {
+          /* keep the original error */
+        }
+      }
+    } finally {
+      endFileWrite(path);
+      busy = false;
     }
   }
 
   async function redoEdit() {
     const path = $currentFilePath;
-    if (!path || redoStack.length === 0) return;
+    if (!path || !canRedo || !beginFileWrite(path)) return;
+    busy = true;
+    resultMsg = "";
+    let current: Uint8Array | null = null;
     try {
-      undoStack.push(await readFile(path));
-      const next = redoStack.pop()!;
+      current = new Uint8Array(await readFile(path));
+      const next = peekRedoSnapshot(path);
+      if (!next) return;
+      if (fileSwitched(path)) return;
       await writeFile(path, next);
-      await loadThumbnails();
-      resultMsg = "Redone";
-      resultOk = true;
+      popRedoSnapshot(path);
+      pushUndoSnapshot(path, current);
+      if (!fileSwitched(path)) {
+        await loadThumbnails();
+        resultMsg = "Redone";
+        resultOk = true;
+      }
     } catch (e) {
       resultMsg = String(e);
       resultOk = false;
+      if (current) {
+        try {
+          await writeFile(path, current);
+        } catch {
+          /* keep the original error */
+        }
+      }
+    } finally {
+      endFileWrite(path);
+      busy = false;
     }
   }
 
   function onEditKeydown(e: KeyboardEvent) {
-    if (!isEditingTool(activeTool)) return;
+    // R12: undo capability comes from the file's history, not from the open
+    // tool; but native text editing shortcuts must never be swallowed.
+    const target = e.target as HTMLElement | null;
+    if (
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      target?.isContentEditable
+    )
+      return;
     const mod = e.metaKey || e.ctrlKey;
     if (!mod || e.key.toLowerCase() !== "z") return;
+    const path = $currentFilePath;
+    if (!path) return;
+    // R06: ignore undo/redo while a write is in flight
+    if (busy || isFileWriteBusy(path)) return;
     e.preventDefault();
     if (e.shiftKey) redoEdit();
     else undoEdit();
@@ -1422,6 +1668,9 @@
   };
   let formFields = $state<FormFieldInfo[]>([]);
   let formValues = $state<Record<string, string>>({});
+  /** Values as loaded from the file — only fields the user changed are
+   * submitted, so clearing ("" vs untouched) is distinguishable (R10). */
+  let formInitial = $state<Record<string, string>>({});
   let formLoaded = $state(false);
 
   async function loadFormFields() {
@@ -1431,21 +1680,23 @@
     resultMsg = "";
     try {
       const fields = await invoke<FormFieldInfo[]>("get_form_fields", { path });
+      if (fileSwitched(path)) return;
       formFields = fields;
       const initial: Record<string, string> = {};
       for (const f of fields) {
-        if (f.fieldType === "checkbox") {
-          initial[f.name] = f.value === "Yes" || f.value === "true" ? "true" : "false";
-        } else {
-          initial[f.name] = f.value ?? "";
-        }
+        // R10: keep the raw export value; check state is derived via
+        // isTruthyExportValue instead of coercing unknown values to Yes.
+        initial[f.name] = f.value ?? "";
       }
-      formValues = initial;
+      formValues = { ...initial };
+      formInitial = { ...initial };
       formLoaded = true;
       resultMsg = `Loaded ${fields.length} form field(s)`;
       resultOk = true;
     } catch (e) {
+      if (fileSwitched(path)) return;
       formFields = [];
+      formInitial = {};
       formLoaded = true;
       resultMsg = String(e);
       resultOk = false;
@@ -1457,20 +1708,27 @@
   async function executeFillForm() {
     const path = $currentFilePath;
     if (!path) return;
+    // R10: submit only modified fields — untouched values (including
+    // checkbox export values this UI cannot express) stay as-is in the file,
+    // while a deliberate clear ("" ≠ initial) is submitted.
+    const values = formFields
+      .map((f) => ({ name: f.name, value: formValues[f.name] ?? "" }))
+      .filter((v) => formValues[v.name] !== formInitial[v.name]);
+    if (values.length === 0) {
+      resultMsg = "No modified fields to fill";
+      resultOk = false;
+      return;
+    }
     busy = true;
     resultMsg = "";
     try {
       const out = await save({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
       if (!out) return;
       const outPath = out as string;
-      // Skip untouched text fields (empty) so existing values are preserved
-      const values = formFields
-        .map((f) => ({ name: f.name, value: formValues[f.name] ?? "" }))
-        .filter((v) => v.value !== "");
       await invoke("fill_form", {
         req: { inputPath: path, outputPath: outPath, values },
       });
-      resultMsg = `Form filled → ${outPath.split(/[\\/]/).pop()}`;
+      resultMsg = `Filled ${values.length} field(s) → ${outPath.split(/[\\/]/).pop()}`;
       resultOk = true;
     } catch (e) {
       resultMsg = String(e);
@@ -1504,9 +1762,11 @@
     if (!path || !query) return;
     replaceSearching = true;
     resultMsg = "";
+    let doc: PdfDocumentProxy | null = null;
     try {
       const data = await readFile(path);
-      const doc = await loadPdf(new Uint8Array(data));
+      doc = await loadPdf(new Uint8Array(data));
+      if (fileSwitched(path)) return;
       const q = query.toLowerCase();
       const matches: TextMatch[] = [];
 
@@ -1571,6 +1831,7 @@
       resultMsg = String(e);
       resultOk = false;
     } finally {
+      doc?.destroy();
       replaceSearching = false;
     }
   }
@@ -1767,18 +2028,68 @@
     resultMsg = "";
     extractedText = "";
     ocrText = "";
+    ocrPageNotes = [];
+    ocrTaskSeq++; // supersede any in-flight OCR task (R13)
     compressResult = null;
     const def = toolDefs.find((t) => t.id === id);
     if (def?.hasPreview && $currentFilePath) {
       loadThumbnails();
     } else {
-      thumbDoc = null;
+      disposeThumbDoc();
       previewPageCount = 0;
     }
     if (id === "pdf2text" && $currentFilePath) executePdf2Text();
     if (id === "ocr") checkOcr();
     if (id === "plugins") loadPlugins();
   }
+
+  // R07: a file switch clears ALL document-scoped tool state and loads what
+  // the current tool needs — a tool opened before any file picks the file up
+  // the moment one is opened, and stale results never leak across files.
+  let lastToolFilePath: string | null = null;
+  $effect(() => {
+    const path = $currentFilePath;
+    if (path === lastToolFilePath) return;
+    lastToolFilePath = path;
+    ocrTaskSeq++;
+    disposeThumbDoc();
+    previewPageCount = 0;
+    pageDims = [];
+    deletedPages = new Set();
+    selectedExtractPages = new Set();
+    deletePagesInput = "";
+    deletePagesError = "";
+    extractPagesInput = "";
+    extractPagesError = "";
+    pageOrder = [];
+    extractedText = "";
+    ocrText = "";
+    ocrPageNotes = [];
+    compressResult = null;
+    tableCsv = "";
+    replaceMatches = [];
+    formFields = [];
+    formValues = {};
+    formInitial = {};
+    formLoaded = false;
+    resultMsg = "";
+    if (path && activeTool) {
+      const def = toolDefs.find((t) => t.id === activeTool);
+      if (def?.hasPreview) loadThumbnails();
+      if (activeTool === "pdf2text") executePdf2Text();
+      if (activeTool === "form") loadFormFields();
+      if (activeTool === "ocr" && ocrAvailable === null) checkOcr();
+    }
+  });
+
+  // R14: release the thumbnail document and invalidate in-flight renders
+  // when the Tools view is destroyed (view switches).
+  onDestroy(() => {
+    ocrTaskSeq++;
+    thumbGeneration++;
+    largeRenderSeq++;
+    disposeThumbDoc();
+  });
 
   function getThumbClasses(pageNum: number): string {
     const base =
@@ -1819,6 +2130,7 @@
     activeTool === "crop" ? cropPage :
     activeTool === "annotate" ? annotPage :
     activeTool === "sign" ? signPage :
+    activeTool === "watermark" ? watermarkPage :
     1
   );
 
@@ -1849,6 +2161,31 @@
       <span class="text-sm font-medium text-foreground">
         {t(toolDefs.find((t) => t.id === activeTool)?.labelKey ?? "")}
       </span>
+      <div class="flex-1"></div>
+      <!-- R12: undo/redo follows the file's edit history, not the open tool
+           panel — available for replaceText and every other editing tool. -->
+      {#if canUndo || canRedo}
+        <div class="flex items-center gap-1">
+          <button
+            class="flex items-center gap-1 px-2 py-1 rounded border border-border text-xs hover:bg-accent disabled:opacity-40"
+            disabled={!canUndo || busy}
+            onclick={undoEdit}
+            title="Undo (Ctrl/Cmd+Z)"
+          >
+            <Icon_Undo2 size={13} />
+            Undo
+          </button>
+          <button
+            class="flex items-center gap-1 px-2 py-1 rounded border border-border text-xs hover:bg-accent disabled:opacity-40"
+            disabled={!canRedo || busy}
+            onclick={redoEdit}
+            title="Redo (Ctrl/Cmd+Shift+Z)"
+          >
+            <Icon_Redo2 size={13} />
+            Redo
+          </button>
+        </div>
+      {/if}
     {:else}
       <h1 class="text-base font-semibold text-foreground">
         {t("nav.tools")}
@@ -2101,6 +2438,9 @@
                     class="flex-1"
                   />
                 </div>
+                {#if deletePagesError}
+                  <p class="text-xs text-destructive">{deletePagesError}</p>
+                {/if}
                 <div class="flex items-center gap-2 text-xs text-muted-foreground">
                   <span
                     >Click thumbnails or type page numbers (supports ranges).</span
@@ -2256,6 +2596,9 @@
                     class="flex-1"
                   />
                 </div>
+                {#if splitError}
+                  <p class="text-xs text-destructive">{splitError}</p>
+                {/if}
               {/if}
               <Button onclick={executeSplit} disabled={busy || (splitMode === "range" && !splitRanges.trim())}>
                 {#if busy}
@@ -2298,6 +2641,9 @@
                     class="flex-1"
                   />
                 </div>
+                {#if extractPagesError}
+                  <p class="text-xs text-destructive">{extractPagesError}</p>
+                {/if}
                 <div class="flex items-center gap-2 text-xs text-muted-foreground">
                   <span>Click thumbnails or type page numbers.</span>
                   {#if selectedExtractPages.size > 0}
@@ -2389,15 +2735,15 @@
               <div class="grid grid-cols-2 gap-3">
                 <div class="space-y-1">
                   <Label>Font Size</Label>
-                  <Input type="number" value={watermarkFontSize} onchange={(e) => (watermarkFontSize = parseFloat((e.target as HTMLInputElement).value) || 48)} />
+                  <Input type="number" value={watermarkFontSize} onchange={(e) => (watermarkFontSize = numOr((e.target as HTMLInputElement).value, 48))} />
                 </div>
                 <div class="space-y-1">
                   <Label>Angle</Label>
-                  <Input type="number" value={watermarkAngle} onchange={(e) => (watermarkAngle = parseFloat((e.target as HTMLInputElement).value) || -45)} />
+                  <Input type="number" value={watermarkAngle} onchange={(e) => (watermarkAngle = numOr((e.target as HTMLInputElement).value, -45))} />
                 </div>
                 <div class="space-y-1">
                   <Label>Opacity (0-1)</Label>
-                  <Input type="number" step="0.05" min="0" max="1" value={watermarkOpacity} onchange={(e) => (watermarkOpacity = parseFloat((e.target as HTMLInputElement).value) || 0.3)} />
+                  <Input type="number" step="0.05" min="0" max="1" value={watermarkOpacity} onchange={(e) => (watermarkOpacity = numOr((e.target as HTMLInputElement).value, 0.3))} />
                 </div>
                 <div class="space-y-1">
                   <Label>Color</Label>
@@ -2501,6 +2847,9 @@
                   onchange={(e) => (pdf2imgPages = (e.target as HTMLInputElement).value)}
                   placeholder="e.g. 1,3,5-7"
                 />
+                {#if pdf2imgError}
+                  <p class="text-xs text-destructive">{pdf2imgError}</p>
+                {/if}
               {/if}
               <Button onclick={executePdf2Img} disabled={busy}>
                 {#if busy}
@@ -2537,24 +2886,24 @@
               <div class="grid grid-cols-2 gap-3">
                 <div class="space-y-1">
                   <Label>Page</Label>
-                  <Input type="number" min="1" value={signPage} onchange={(e) => (signPage = parseInt((e.target as HTMLInputElement).value) || 1)} />
+                  <Input type="number" min="1" value={signPage} onchange={(e) => (signPage = clampInt(intOr((e.target as HTMLInputElement).value, 1), 1, previewPageCount || 1))} />
                 </div>
                 <div class="space-y-1"></div>
                 <div class="space-y-1">
                   <Label>X Position</Label>
-                  <Input type="number" value={signX} onchange={(e) => (signX = parseFloat((e.target as HTMLInputElement).value) || 0)} />
+                  <Input type="number" value={signX} onchange={(e) => (signX = numOr((e.target as HTMLInputElement).value, 0))} />
                 </div>
                 <div class="space-y-1">
                   <Label>Y Position</Label>
-                  <Input type="number" value={signY} onchange={(e) => (signY = parseFloat((e.target as HTMLInputElement).value) || 0)} />
+                  <Input type="number" value={signY} onchange={(e) => (signY = numOr((e.target as HTMLInputElement).value, 0))} />
                 </div>
                 <div class="space-y-1">
                   <Label>Width</Label>
-                  <Input type="number" value={signWidth} onchange={(e) => (signWidth = parseFloat((e.target as HTMLInputElement).value) || 150)} />
+                  <Input type="number" value={signWidth} onchange={(e) => (signWidth = numOr((e.target as HTMLInputElement).value, 150))} />
                 </div>
                 <div class="space-y-1">
                   <Label>Height</Label>
-                  <Input type="number" value={signHeight} onchange={(e) => (signHeight = parseFloat((e.target as HTMLInputElement).value) || 50)} />
+                  <Input type="number" value={signHeight} onchange={(e) => (signHeight = numOr((e.target as HTMLInputElement).value, 50))} />
                 </div>
               </div>
               <Button onclick={executeSign} disabled={busy || !signImagePath}>
@@ -2596,10 +2945,10 @@
               </div>
               {#if ocrAvailable === false}
                 <p class="text-xs text-muted-foreground">
-                  Install Tesseract OCR from <a href="https://github.com/tesseract-ocr/tesseract" target="_blank" rel="noopener" class="underline text-primary">github.com/tesseract-ocr/tesseract</a>
+                  Tesseract is not installed — pages with a text layer are still extracted; scanned pages are skipped and listed below. Install from <a href="https://github.com/tesseract-ocr/tesseract" target="_blank" rel="noopener" class="underline text-primary">github.com/tesseract-ocr/tesseract</a>
                 </p>
               {/if}
-              <Button onclick={executeOcr} disabled={busy || ocrAvailable === false}>
+              <Button onclick={executeOcr} disabled={busy}>
                 {#if busy}
                   <Icon_Loader2 size={14} class="animate-spin" />
                 {:else}
@@ -2607,6 +2956,13 @@
                   Run OCR
                 {/if}
               </Button>
+              {#if ocrPageNotes.length > 0}
+                <div class="p-2 rounded-lg border border-border bg-muted/40 text-xs space-y-0.5 max-h-40 overflow-auto">
+                  {#each ocrPageNotes as note (note)}
+                    <p class="text-muted-foreground">{note}</p>
+                  {/each}
+                </div>
+              {/if}
               {#if ocrText}
                 <textarea
                   readonly
@@ -2662,7 +3018,7 @@
                     min="1"
                     max={previewPageCount || 1}
                     value={tablePage}
-                    onchange={(e) => (tablePage = parseInt((e.target as HTMLInputElement).value) || 1)}
+                    onchange={(e) => (tablePage = clampInt(intOr((e.target as HTMLInputElement).value, 1), 1, previewPageCount || 1))}
                   />
                 </div>
                 <Button onclick={executeTable} disabled={busy}>
@@ -2722,11 +3078,11 @@
               <div class="grid grid-cols-3 gap-3">
                 <div class="space-y-1">
                   <Label>Page</Label>
-                  <Input type="number" min="1" value={editTextPage} onchange={(e) => (editTextPage = parseInt((e.target as HTMLInputElement).value) || 1)} />
+                  <Input type="number" min="1" value={editTextPage} onchange={(e) => (editTextPage = clampInt(intOr((e.target as HTMLInputElement).value, 1), 1, previewPageCount || 1))} />
                 </div>
                 <div class="space-y-1">
                   <Label>Font Size</Label>
-                  <Input type="number" value={editFontSize} onchange={(e) => (editFontSize = parseFloat((e.target as HTMLInputElement).value) || 12)} />
+                  <Input type="number" value={editFontSize} onchange={(e) => (editFontSize = numOr((e.target as HTMLInputElement).value, 12))} />
                 </div>
                 <div class="space-y-1">
                   <Label>Color</Label>
@@ -2740,11 +3096,11 @@
               <div class="grid grid-cols-2 gap-3">
                 <div class="space-y-1">
                   <Label>X</Label>
-                  <Input type="number" value={editTextX} onchange={(e) => (editTextX = parseFloat((e.target as HTMLInputElement).value) || 0)} />
+                  <Input type="number" value={editTextX} onchange={(e) => (editTextX = numOr((e.target as HTMLInputElement).value, 0))} />
                 </div>
                 <div class="space-y-1">
                   <Label>Y</Label>
-                  <Input type="number" value={editTextY} onchange={(e) => (editTextY = parseFloat((e.target as HTMLInputElement).value) || 0)} />
+                  <Input type="number" value={editTextY} onchange={(e) => (editTextY = numOr((e.target as HTMLInputElement).value, 0))} />
                 </div>
               </div>
               <Button onclick={executeEditText} disabled={busy || !editText.trim()}>
@@ -2771,12 +3127,12 @@
                 <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong>
               </p>
               <div class="grid grid-cols-2 gap-3">
-                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={editRectPage} onchange={(e) => (editRectPage = parseInt((e.target as HTMLInputElement).value) || 1)} /></div>
-                <div class="space-y-1"><Label>Border Width</Label><Input type="number" value={editRectBorderW} onchange={(e) => (editRectBorderW = parseFloat((e.target as HTMLInputElement).value) || 1)} /></div>
-                <div class="space-y-1"><Label>X</Label><Input type="number" value={editRectX} onchange={(e) => (editRectX = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
-                <div class="space-y-1"><Label>Y</Label><Input type="number" value={editRectY} onchange={(e) => (editRectY = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
-                <div class="space-y-1"><Label>Width</Label><Input type="number" value={editRectW} onchange={(e) => (editRectW = parseFloat((e.target as HTMLInputElement).value) || 200)} /></div>
-                <div class="space-y-1"><Label>Height</Label><Input type="number" value={editRectH} onchange={(e) => (editRectH = parseFloat((e.target as HTMLInputElement).value) || 50)} /></div>
+                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={editRectPage} onchange={(e) => (editRectPage = clampInt(intOr((e.target as HTMLInputElement).value, 1), 1, previewPageCount || 1))} /></div>
+                <div class="space-y-1"><Label>Border Width</Label><Input type="number" value={editRectBorderW} onchange={(e) => (editRectBorderW = numOr((e.target as HTMLInputElement).value, 1))} /></div>
+                <div class="space-y-1"><Label>X</Label><Input type="number" value={editRectX} onchange={(e) => (editRectX = numOr((e.target as HTMLInputElement).value, 0))} /></div>
+                <div class="space-y-1"><Label>Y</Label><Input type="number" value={editRectY} onchange={(e) => (editRectY = numOr((e.target as HTMLInputElement).value, 0))} /></div>
+                <div class="space-y-1"><Label>Width</Label><Input type="number" value={editRectW} onchange={(e) => (editRectW = numOr((e.target as HTMLInputElement).value, 200))} /></div>
+                <div class="space-y-1"><Label>Height</Label><Input type="number" value={editRectH} onchange={(e) => (editRectH = numOr((e.target as HTMLInputElement).value, 50))} /></div>
               </div>
               <div class="flex items-center gap-4">
                 <div class="space-y-1">
@@ -2824,12 +3180,12 @@
                 <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong>
               </p>
               <div class="grid grid-cols-2 gap-3">
-                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={editHlPage} onchange={(e) => (editHlPage = parseInt((e.target as HTMLInputElement).value) || 1)} /></div>
-                <div class="space-y-1"><Label>Opacity (0-1)</Label><Input type="number" step="0.05" min="0" max="1" value={editHlOpacity} onchange={(e) => (editHlOpacity = parseFloat((e.target as HTMLInputElement).value) || 0.4)} /></div>
-                <div class="space-y-1"><Label>X</Label><Input type="number" value={editHlX} onchange={(e) => (editHlX = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
-                <div class="space-y-1"><Label>Y</Label><Input type="number" value={editHlY} onchange={(e) => (editHlY = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
-                <div class="space-y-1"><Label>Width</Label><Input type="number" value={editHlW} onchange={(e) => (editHlW = parseFloat((e.target as HTMLInputElement).value) || 200)} /></div>
-                <div class="space-y-1"><Label>Height</Label><Input type="number" value={editHlH} onchange={(e) => (editHlH = parseFloat((e.target as HTMLInputElement).value) || 20)} /></div>
+                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={editHlPage} onchange={(e) => (editHlPage = clampInt(intOr((e.target as HTMLInputElement).value, 1), 1, previewPageCount || 1))} /></div>
+                <div class="space-y-1"><Label>Opacity (0-1)</Label><Input type="number" step="0.05" min="0" max="1" value={editHlOpacity} onchange={(e) => (editHlOpacity = numOr((e.target as HTMLInputElement).value, 0.4))} /></div>
+                <div class="space-y-1"><Label>X</Label><Input type="number" value={editHlX} onchange={(e) => (editHlX = numOr((e.target as HTMLInputElement).value, 0))} /></div>
+                <div class="space-y-1"><Label>Y</Label><Input type="number" value={editHlY} onchange={(e) => (editHlY = numOr((e.target as HTMLInputElement).value, 0))} /></div>
+                <div class="space-y-1"><Label>Width</Label><Input type="number" value={editHlW} onchange={(e) => (editHlW = numOr((e.target as HTMLInputElement).value, 200))} /></div>
+                <div class="space-y-1"><Label>Height</Label><Input type="number" value={editHlH} onchange={(e) => (editHlH = numOr((e.target as HTMLInputElement).value, 20))} /></div>
               </div>
               <div class="space-y-1">
                 <Label>Color</Label>
@@ -2861,17 +3217,17 @@
                 <strong>{$currentFilePath.split(/[\\/]/).pop()}</strong>
               </p>
               <div class="grid grid-cols-2 gap-3">
-                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={cropPage} onchange={(e) => (cropPage = parseInt((e.target as HTMLInputElement).value) || 1)} /></div>
+                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={cropPage} onchange={(e) => (cropPage = clampInt(intOr((e.target as HTMLInputElement).value, 1), 1, previewPageCount || 1))} /></div>
                 <div class="space-y-1 flex items-end">
                   <label class="flex items-center gap-2 text-sm cursor-pointer">
                     <input type="checkbox" bind:checked={cropAllPages} class="accent-blue-500" />
                     Apply to all pages
                   </label>
                 </div>
-                <div class="space-y-1"><Label>X</Label><Input type="number" value={cropX} onchange={(e) => (cropX = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
-                <div class="space-y-1"><Label>Y</Label><Input type="number" value={cropY} onchange={(e) => (cropY = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
-                <div class="space-y-1"><Label>Width</Label><Input type="number" value={cropW} onchange={(e) => (cropW = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
-                <div class="space-y-1"><Label>Height</Label><Input type="number" value={cropH} onchange={(e) => (cropH = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>X</Label><Input type="number" value={cropX} onchange={(e) => (cropX = numOr((e.target as HTMLInputElement).value, 0))} /></div>
+                <div class="space-y-1"><Label>Y</Label><Input type="number" value={cropY} onchange={(e) => (cropY = numOr((e.target as HTMLInputElement).value, 0))} /></div>
+                <div class="space-y-1"><Label>Width</Label><Input type="number" value={cropW} onchange={(e) => (cropW = numOr((e.target as HTMLInputElement).value, 0))} /></div>
+                <div class="space-y-1"><Label>Height</Label><Input type="number" value={cropH} onchange={(e) => (cropH = numOr((e.target as HTMLInputElement).value, 0))} /></div>
               </div>
               <Button onclick={executeCrop} disabled={busy || cropW <= 0 || cropH <= 0}>
                 {#if busy}<Icon_Loader2 size={14} class="animate-spin" />{:else}<Icon_Crop size={14} class="mr-1.5" />{cropAllPages ? "Crop All Pages" : "Crop Page"}{/if}
@@ -2906,14 +3262,14 @@
                 {/each}
               </div>
               <div class="grid grid-cols-2 gap-3">
-                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={annotPage} onchange={(e) => (annotPage = parseInt((e.target as HTMLInputElement).value) || 1)} /></div>
+                <div class="space-y-1"><Label>Page</Label><Input type="number" min="1" value={annotPage} onchange={(e) => (annotPage = clampInt(intOr((e.target as HTMLInputElement).value, 1), 1, previewPageCount || 1))} /></div>
                 {#if annotType === "highlight"}
-                  <div class="space-y-1"><Label>Opacity (0-1)</Label><Input type="number" step="0.05" min="0" max="1" value={annotOpacity} onchange={(e) => (annotOpacity = parseFloat((e.target as HTMLInputElement).value) || 0.4)} /></div>
+                  <div class="space-y-1"><Label>Opacity (0-1)</Label><Input type="number" step="0.05" min="0" max="1" value={annotOpacity} onchange={(e) => (annotOpacity = numOr((e.target as HTMLInputElement).value, 0.4))} /></div>
                 {/if}
-                <div class="space-y-1"><Label>X</Label><Input type="number" value={annotX} onchange={(e) => (annotX = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
-                <div class="space-y-1"><Label>Y</Label><Input type="number" value={annotY} onchange={(e) => (annotY = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
-                <div class="space-y-1"><Label>Width</Label><Input type="number" value={annotW} onchange={(e) => (annotW = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
-                <div class="space-y-1"><Label>Height</Label><Input type="number" value={annotH} onchange={(e) => (annotH = parseFloat((e.target as HTMLInputElement).value) || 0)} /></div>
+                <div class="space-y-1"><Label>X</Label><Input type="number" value={annotX} onchange={(e) => (annotX = numOr((e.target as HTMLInputElement).value, 0))} /></div>
+                <div class="space-y-1"><Label>Y</Label><Input type="number" value={annotY} onchange={(e) => (annotY = numOr((e.target as HTMLInputElement).value, 0))} /></div>
+                <div class="space-y-1"><Label>Width</Label><Input type="number" value={annotW} onchange={(e) => (annotW = numOr((e.target as HTMLInputElement).value, 0))} /></div>
+                <div class="space-y-1"><Label>Height</Label><Input type="number" value={annotH} onchange={(e) => (annotH = numOr((e.target as HTMLInputElement).value, 0))} /></div>
               </div>
               <div class="space-y-1">
                 <Label>Color</Label>
@@ -2976,19 +3332,24 @@
                       <input
                         type="checkbox"
                         class="accent-blue-500"
-                        checked={formValues[f.name] === "true"}
+                        checked={isTruthyExportValue(formValues[f.name] ?? "")}
                         onchange={(e) => (formValues[f.name] = (e.target as HTMLInputElement).checked ? "true" : "false")}
                       />
                       {f.name}
+                      {#if formValues[f.name] && formValues[f.name] === formInitial[f.name] && !isTruthyExportValue(formValues[f.name])}
+                        <span class="text-[10px] text-muted-foreground">(unknown export value "{formValues[f.name]}" — left unchanged unless toggled)</span>
+                      {/if}
                     </label>
                   {:else if f.fieldType === "radio" || f.fieldType === "choice"}
+                    {@const current = formValues[f.name] ?? ""}
+                    {@const options = !current || f.options.includes(current) ? f.options : [...f.options, current]}
                     <div class="space-y-1">
                       <Label>{f.name}</Label>
                       <select
                         bind:value={formValues[f.name]}
                         class="flex w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                       >
-                        {#each f.options as opt (opt)}
+                        {#each options as opt (opt)}
                           <option value={opt}>{opt}</option>
                         {/each}
                       </select>
@@ -3228,24 +3589,6 @@
                 {t("tools.preview")} — {previewPage} / {previewPageCount}
               </span>
               <div class="flex items-center gap-2">
-                <button
-                  class="flex items-center gap-1 px-2 py-1 rounded border border-border text-xs hover:bg-accent disabled:opacity-40"
-                  disabled={!canUndo || busy}
-                  onclick={undoEdit}
-                  title="Undo (Ctrl/Cmd+Z)"
-                >
-                  <Icon_Undo2 size={13} />
-                  Undo
-                </button>
-                <button
-                  class="flex items-center gap-1 px-2 py-1 rounded border border-border text-xs hover:bg-accent disabled:opacity-40"
-                  disabled={!canRedo || busy}
-                  onclick={redoEdit}
-                  title="Redo (Ctrl/Cmd+Shift+Z)"
-                >
-                  <Icon_Redo2 size={13} />
-                  Redo
-                </button>
                 {#if thumbLoading}
                   <Icon_Loader2 size={14} class="animate-spin text-muted-foreground" />
                 {/if}
@@ -3327,9 +3670,10 @@
                 : "none"}
             >
               {#each Array(previewPageCount) as _, i}
-                <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
                 <div
                   class={getThumbClasses(i + 1)}
+                  role="button"
+                  tabindex="0"
                   draggable={activeTool === "reorder"}
                   ondragstart={(e) => { if (activeTool === "reorder") onReorderDragStart(e, i); }}
                   ondragover={(e) => { if (activeTool === "reorder") onReorderDragOver(e, i); }}
@@ -3339,6 +3683,16 @@
                   onclick={() => {
                     if (activeTool === "delete") toggleDeletePage(i + 1);
                     if (activeTool === "extractPages") toggleExtractPage(i + 1);
+                    // R27: the table tool tells users to click a thumbnail to
+                    // pick the page — make the click actually select it.
+                    if (activeTool === "table") setPreviewPage(i + 1);
+                  }}
+                  onkeydown={(e) => {
+                    if (e.key !== "Enter" && e.key !== " ") return;
+                    e.preventDefault();
+                    if (activeTool === "delete") toggleDeletePage(i + 1);
+                    if (activeTool === "extractPages") toggleExtractPage(i + 1);
+                    if (activeTool === "table") setPreviewPage(i + 1);
                   }}
                 >
                   {#if activeTool === "rotate"}
