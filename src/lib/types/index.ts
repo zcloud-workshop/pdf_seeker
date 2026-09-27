@@ -28,4 +28,5 @@ export interface S3Config {
 export interface AppConfig {
   general: GeneralConfig;
   s3: S3Config | null;
+  recovery_notice?: string | null;
 }
