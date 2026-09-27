@@ -1,5 +1,7 @@
 <script lang="ts">
   import "@/i18n/index.svelte.ts";
+  import { onMount } from "svelte";
+  import { listenForSystemTheme } from "@/settings";
   import type { Component } from "svelte";
   import { Sidebar, Toolbar, TabBar } from "@/components/layout";
   import { currentView } from "@/stores";
@@ -10,6 +12,8 @@
   import Storage from "$views/Storage.svelte";
   import Settings from "$views/Settings.svelte";
   import type { ViewName } from "@/stores";
+
+  onMount(listenForSystemTheme);
 
   const views: Record<ViewName, Component> = {
     home: Home,
