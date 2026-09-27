@@ -4,6 +4,7 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { writable } from "svelte/store";
 import { t } from "@/i18n/index.svelte.ts";
+import { anyWriteBusy } from "@/document/session.svelte.ts";
 
 export type UpdateStatus =
   | "up-to-date"
@@ -91,6 +92,11 @@ async function checkForUpdatesOnce(): Promise<UpdateStatus> {
       if (!confirmed) {
         setStatus("declined");
         result = "declined";
+      } else if (anyWriteBusy()) {
+        // 07-A: never swap the app binary or restart while a PDF write is in
+        // flight — relaunching mid-write abandons the task.
+        setStatus("error", t("updater.busyEditing"));
+        result = "error";
       } else {
         setStatus("downloading");
         await update.downloadAndInstall(updateDownloadProgress);
@@ -99,9 +105,23 @@ async function checkForUpdatesOnce(): Promise<UpdateStatus> {
           title: t("updater.title"),
           kind: "info",
         });
-        if (restart) await relaunch();
-        setStatus("installed");
-        result = "installed";
+        let busyAbort = false;
+        if (restart) {
+          // A write may have started while the update downloaded — check
+          // again before taking the app down (07-A).
+          if (anyWriteBusy()) {
+            busyAbort = true;
+          } else {
+            await relaunch();
+          }
+        }
+        if (busyAbort) {
+          setStatus("error", t("updater.busyEditing"));
+          result = "error";
+        } else {
+          setStatus("installed");
+          result = "installed";
+        }
       }
     }
   } catch (error) {
