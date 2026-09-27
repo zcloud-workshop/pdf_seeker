@@ -13,9 +13,12 @@
   },
   "toolbar": {
     "openFile": "打开文件",
-    "saveFile": "保存",
-    "export": "导出",
-    "settings": "设置"
+    "settings": "设置",
+    "toggleSidebar": "切换侧边栏",
+    "fullscreen": "进入全屏",
+    "exitFullscreen": "退出全屏",
+    "themeLightSaved": "切换到浅色主题并保存偏好",
+    "themeDarkSaved": "切换到深色主题并保存偏好"
   },
   "viewer": {
     "noFile": "未打开文件",
@@ -75,12 +78,15 @@
     "s3TestConnection": "测试连接",
     "s3Connected": "连接成功",
     "s3Failed": "连接失败",
-    "s3MaxVersions": "最大保留版本数",
-    "s3VersionTtl": "版本保留天数",
+    "s3Testing": "正在测试...",
+    "s3Enabled": "已启用",
+    "s3Disabled": "已停用",
+    "s3MaxVersions": "最多显示版本数",
     "save": "保存",
     "saved": "设置已保存",
+    "configRecovered": "本地配置文件无效，已保留原文件。保存或恢复备份前，当前设置使用默认值：",
     "syncTitle": "云同步",
-    "syncHint": "将配置（含 S3 连接与最近文件）备份到当前 S3 存储桶，可跨设备恢复。注意：备份包含明文密钥，请使用私有存储桶。",
+    "syncHint": "将偏好设置和 S3 连接信息备份到当前存储桶。访问密钥、会话令牌和最近路径不会写入备份；恢复到相同连接时保留本机凭证。",
     "syncAuto": "自动备份（保存设置时上传）",
     "syncLastBackup": "上次备份",
     "syncBackupNow": "立即备份",
@@ -89,7 +95,7 @@
     "syncNoVersions": "暂无云端备份（需要存储桶开启版本控制才能保留历史）",
     "syncLatest": "最新",
     "syncRestore": "恢复",
-    "syncRestoreConfirm": "将用云端备份覆盖本地全部设置（包括当前 S3 连接配置），确定继续？",
+    "syncRestoreConfirm": "从此备份恢复设置？本机最近路径会保留；仅连接信息匹配时保留本机凭证。",
     "syncRestoreDone": "已从云端恢复配置",
     "syncBackupDone": "备份已上传到云端"
   },
@@ -103,7 +109,18 @@
     "empty": "空文件夹",
     "uploading": "上传中",
     "downloading": "下载中",
-    "noConfig": "请在设置中配置 S3 存储以启用云功能"
+    "noConfig": "请在设置中配置 S3 存储以启用云功能",
+    "refresh": "刷新",
+    "folderName": "文件夹名称",
+    "createFolder": "新建文件夹",
+    "close": "关闭",
+    "noVersions": "没有版本",
+    "loadFailed": "无法加载此文件夹",
+    "downloadError": "下载失败",
+    "delete": "删除",
+    "deleteConfirm": "确定删除此对象？",
+    "deleteVersion": "删除版本",
+    "deleteVersionConfirm": "确定删除此版本？"
   },
   "tools": {
     "merge": "合并",
@@ -176,11 +193,14 @@
     "title": "软件更新",
     "autoCheck": "启动时自动检查更新",
     "checkNow": "立即检查更新",
+    "checking": "正在检查...",
+    "downloading": "正在下载更新",
+    "installing": "正在完成更新...",
     "available": "发现新版本",
     "upToDate": "当前已是最新版本",
     "devSkip": "开发模式下不检查更新",
     "declined": "已跳过此次更新",
-    "error": "检查更新失败（网络或更新源不可用）",
+    "error": "更新失败",
     "restartPrompt": "更新已安装，立即重启应用？"
   }
 }
