@@ -20,20 +20,21 @@ pub fn add_recent_file(
     path: String,
 ) -> AppResult<Vec<String>> {
     let mut cfg = config.lock().map_err(lock_err)?;
-    let max = cfg.general.recent_files_max;
-    let files = &mut cfg.general.recent_files;
+    let mut candidate = cfg.clone();
+    let max = candidate.general.recent_files_max;
+    let files = &mut candidate.general.recent_files;
     files.retain(|f| f != &path);
     files.insert(0, path);
     files.truncate(max);
     let result = files.clone();
-    crate::config::save_config_with_handle(&app, &cfg)?;
+    crate::config::commit_config_with_handle(&app, &mut cfg, candidate)?;
     Ok(result)
 }
 
 #[tauri::command]
 pub fn clear_recent_files(app: AppHandle, config: State<'_, Mutex<AppConfig>>) -> AppResult<()> {
     let mut cfg = config.lock().map_err(lock_err)?;
-    cfg.general.recent_files.clear();
-    crate::config::save_config_with_handle(&app, &cfg)?;
-    Ok(())
+    let mut candidate = cfg.clone();
+    candidate.general.recent_files.clear();
+    crate::config::commit_config_with_handle(&app, &mut cfg, candidate)
 }
