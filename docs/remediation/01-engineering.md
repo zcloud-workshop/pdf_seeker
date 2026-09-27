@@ -104,10 +104,19 @@ capability 最小化(`src-tauri/capabilities/default.json`):
 
 ### 5.5 测试与验证结果
 
-- 前端: `pnpm run test` → 8 passed; `pnpm run check` → 0 errors 5 warnings(Tooltip/Tools/Storage, 归属 03/05); `pnpm run build` → 成功.
-- Rust: `cargo test --manifest-path src-tauri/Cargo.toml --locked`(依赖已缓存时加 `--offline`)→ 41 passed / 0 failed, 其中 fs_utils 新增 5 个单测(排序/大小写、空与不存在根、深度超限报错、目录软链循环与外链不跟随、文件软链按链接名); security/s3/pdf_ops/plugins 既有 36 个测试同轮全绿.
+- 前端: `pnpm run test` → vitest 8 passed(tests/remediation-01)+ 03 自带 harness 21/21 + 04 node:test 套件全绿; `pnpm run check` → 0 errors(初轮 5 warnings, 03/05 合并后余 3); `pnpm run build` → 成功.
+- Rust: `cargo test --manifest-path src-tauri/Cargo.toml --locked`(依赖已缓存时加 `--offline`)→ 合并基线上 48 passed / 0 failed(含 fs_utils 新增 5 个单测: 排序/大小写、空与不存在根、深度超限报错、目录软链循环与外链不跟随、文件软链按链接名).
 - 启动冒烟: `pnpm tauri dev` 以新 CSP/capability 正常完成编译并拉起 `target/debug/pdf_seeker`, 运行 70 秒无 panic/报错后手动终止. webview 内逐功能点检仍留待人工/07-E.
-- CI: `ci.yml`(pull_request + push main)与 `release.yml`(tag/dispatch)YAML 已用本地解析验证; GitHub Actions 实际运行待 PR/tag 触发后观察.
+- CI: `ci.yml`(pull_request + push main)与 `release.yml`(tag/dispatch)YAML 已用本地解析验证; PR #8 的 Actions 首跑暴露了 §5.7 记录的入口冲突, 修复分支已验证并重跑.
+
+### 5.7 测试入口与既有包 runner 的合并 (PR #8 后跟进)
+
+PR #8 合入后, 03/04 的 PR 也在 main(它们的实施在 01 之前开始, 均自带零依赖 runner: 03 用 node 类型剥离自写 harness(`node tests/remediation-03/run.ts`), 04 用 node:test + esbuild 打包(`node tests/remediation-04/run.mjs`), 并在文件头注明工具链统一归属 01). 合并结果暴露两个问题, 已在 `codex/remediation-01-fix` 修复:
+
+1. `vitest.config.ts` 的 `tests/**/*.test.ts` 把非 vitest 的 `.test.ts` 一并收走, vitest 收集 0 个用例判失败. 修复: exclude `tests/remediation-03/**`、`tests/remediation-04/**`; 这两个包的文件按其自带入口执行, 不改写它们的测试实现.
+2. pnpm 严格 node_modules 布局下, 04 的 `run.mjs` 直接 `import "esbuild"` 不再可解析(npm 扁平布局曾使其恰好可见). 修复: 按依赖卫生显式声明 `esbuild@0.25.12` 为 devDependency(版本与 lockfile 中 vite 所用一致, 不新增拷贝).
+
+统一入口现状: `pnpm test` = `vitest run && node tests/remediation-03/run.ts && node tests/remediation-04/run.mjs`, ci.yml 与 release validate 均经此单一命令覆盖全部前端测试. 04 注明"01 落地后这些文件应迁入统一入口", 该迁移属其测试实现, 由 04 自行决定时机, 本包不代改.
 
 ### 5.6 未完成与移交
 

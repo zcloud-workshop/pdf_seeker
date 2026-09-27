@@ -12,7 +12,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "vitest run",
+    "test": "vitest run && node tests/remediation-03/run.ts && node tests/remediation-04/run.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -30,6 +30,7 @@
     "autoprefixer": "^10.4.20",
     "bits-ui": "^1.0.0",
     "clsx": "^2.1.1",
+    "esbuild": "0.25.12",
     "lucide-svelte": "^0.468.0",
     "postcss": "^8.4.49",
     "svelte": "^5.16.0",
