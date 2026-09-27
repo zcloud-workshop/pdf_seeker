@@ -7,16 +7,91 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1.0). Leave empty to auto-generate by run number"
-        required: false
-        default: ""
+        description: "Existing tag to release (e.g. v0.4.1)"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
+env:
+  # The tag being released: the actually pushed tag for tag events, or
+  # the explicitly requested tag for manual runs. Never derived from the
+  # run number.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
 jobs:
+  validate:
+    name: Gate (tag, versions, checks, tests, build)
+    runs-on: ubuntu-22.04
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - name: Checkout (full history for tag resolution)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the release tag to an existing git tag
+        id: tag
+        run: |
+          git fetch --tags --force origin
+          if ! commit="$(git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}")"; then
+            echo "::error::release tag ${RELEASE_TAG} does not exist in the repository; refusing to publish"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "release ${RELEASE_TAG} -> ${commit}"
+
+      - name: Check out the tagged commit
+        run: git checkout --detach "${{ steps.tag.outputs.commit }}"
+
+      - name: Verify tag/package/Cargo/Tauri version consistency
+        run: node scripts/remediation-01/check-versions.mjs "${RELEASE_TAG}"
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm run check
+
+      - name: Unit tests
+        run: pnpm run test
+
+      - name: Build
+        run: pnpm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
   release:
     name: Build ${{ matrix.target }}
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -32,12 +107,11 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
-    env:
-      RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || format('v0.1.{0}', github.run_number) }}
-
     steps:
-      - name: Checkout
+      - name: Checkout the tagged commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
@@ -45,30 +119,29 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
             libgtk-3-dev \
+            librsvg2-dev \
             patchelf \
             libssl-dev
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
+      - uses: pnpm/action-setup@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
         with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Build and create GitHub Release
         uses: tauri-apps/tauri-action@v0
@@ -80,7 +153,9 @@ jobs:
           tagName: ${{ env.RELEASE_TAG }}
           releaseName: PDF_Seeker ${{ env.RELEASE_TAG }}
           releaseBody: |
-            ## PDF_Seeker Release
+            ## PDF_Seeker Release ${{ env.RELEASE_TAG }}
+
+            Source commit: ${{ needs.validate.outputs.commit }}
 
             ### Platforms
             - macOS Apple Silicon (`aarch64`)
