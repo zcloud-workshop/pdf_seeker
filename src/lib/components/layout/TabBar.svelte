@@ -9,9 +9,20 @@
     activateTab,
   } from "@/stores";
   import { FileText, Plus, X } from "lucide-svelte";
-  import { open } from "@tauri-apps/plugin-dialog";
+  import { open, ask } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import { get } from "svelte/store";
+
+  async function requestClose(id: string) {
+    // 07-A: a refused close means the file has a write in flight; surface it
+    // instead of silently doing nothing.
+    if (!closeTab(id)) {
+      await ask(t("tabs.closeBlocked"), {
+        title: t("tabs.closeBlockedTitle"),
+        kind: "warning",
+      });
+    }
+  }
 
   async function handleOpen() {
     const selected = await open({
@@ -35,7 +46,7 @@
 
   function handleAuxClick(e: MouseEvent, id: string) {
     // Middle click closes the tab
-    if (e.button === 1) closeTab(id);
+    if (e.button === 1) requestClose(id);
   }
 
   $effect(() => {
@@ -44,7 +55,7 @@
         const id = get(activeTabId);
         if (id) {
           e.preventDefault();
-          closeTab(id);
+          requestClose(id);
         }
       }
     };
@@ -78,7 +89,7 @@
             ? 'opacity-70 hover:opacity-100'
             : 'opacity-0 group-hover:opacity-60 hover:!opacity-100'}"
           title={t("tabs.close")}
-          onclick={() => closeTab(tab.id)}
+          onclick={() => requestClose(tab.id)}
         >
           <X size={12} />
         </button>

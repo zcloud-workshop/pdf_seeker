@@ -392,6 +392,9 @@ pub async fn s3_download_file(
         .ok_or_else(|| AppError::Config("Download temp file is closed".into()))?;
     file.sync_all()?;
     drop(file);
+    // Serialize the final swap with PDF edits so a download that targets a
+    // file this app is writing cannot interleave with the replace.
+    let _write_lock = super::pdf_ops::lock_pdf_writes().map_err(AppError::Config)?;
     fs::rename(&temp.path, target)?;
     temp.committed = true;
 

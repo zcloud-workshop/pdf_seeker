@@ -3,6 +3,10 @@
  * (Tools → Viewer → Tools). Sessions are released explicitly when the file's
  * tab is closed (see stores.closeTab). */
 import { FileHistory } from "./history";
+import {
+  readPdfFingerprint,
+  type PdfFingerprint,
+} from "./restore";
 
 export interface DocumentViewState {
   page: number;
@@ -16,6 +20,10 @@ export interface DocumentSession {
   generation: number;
   /** Per-file write mutex for edit/undo/redo (R06). */
   writeBusy: boolean;
+  /** Last (size, mtime) observed on disk, refreshed after every successful
+   * write; used to detect external modifications before the next write
+   * (07-A). Null until the first refresh. */
+  fingerprint: PdfFingerprint | null;
   /** Mirrors of FileHistory counts kept on this reactive object so components
    * can $derive from them (FileHistory itself is a plain class instance). */
   undoCount: number;
@@ -39,6 +47,7 @@ export function getSession(path: string): DocumentSession {
       path,
       generation: 0,
       writeBusy: false,
+      fingerprint: null,
       undoCount: 0,
       redoCount: 0,
       history: new FileHistory(),
@@ -130,4 +139,57 @@ export function endFileWrite(path: string): void {
 
 export function isFileWriteBusy(path: string): boolean {
   return sessions.get(path)?.writeBusy ?? false;
+}
+
+/** True when any open file has an edit/undo/redo in flight — used by window
+ * close and update/restart coordination (07-A). */
+export function anyWriteBusy(): boolean {
+  for (const s of sessions.values()) {
+    if (s.writeBusy) return true;
+  }
+  return false;
+}
+
+// ─── File fingerprint (07-A: external modification detection) ───
+
+export function sessionFingerprint(
+  path: string | null | undefined,
+): PdfFingerprint | null {
+  return path ? sessions.get(path)?.fingerprint ?? null : null;
+}
+
+export function setSessionFingerprint(path: string, fp: PdfFingerprint): void {
+  const s = sessions.get(path);
+  if (s) s.fingerprint = fp;
+}
+
+/** Re-reads (size, mtime) from disk and records it as the session's known
+ * state. Call after every successful write. Best-effort: failures leave the
+ * previous value untouched and return null. */
+export async function refreshFileFingerprint(
+  path: string,
+): Promise<PdfFingerprint | null> {
+  try {
+    const fp = await readPdfFingerprint(path);
+    const s = getSession(path);
+    s.fingerprint = fp;
+    return fp;
+  } catch {
+    return null;
+  }
+}
+
+/** Best-effort pre-write check: if the session has a known fingerprint and
+ * the file on disk no longer matches it, throw so the caller can surface the
+ * conflict instead of overwriting the external change. The authoritative
+ * check lives in commit_pdf_snapshot (enforced inside the write lock). */
+export async function assertFileUnchanged(path: string): Promise<void> {
+  const known = sessions.get(path)?.fingerprint;
+  if (!known) return;
+  const current = await readPdfFingerprint(path);
+  if (current.size !== known.size || current.modifiedMs !== known.modifiedMs) {
+    throw new Error(
+      `'${path}' was modified outside this app; reload it before retrying`,
+    );
+  }
 }

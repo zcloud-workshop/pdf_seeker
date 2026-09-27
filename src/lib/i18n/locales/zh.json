@@ -1,7 +1,9 @@
 {
   "app": {
     "name": "PDF Seeker",
-    "loading": "加载中..."
+    "loading": "加载中...",
+    "exitWhileEditingTitle": "正在写入文件",
+    "exitWhileEditing": "仍有 PDF 写入任务正在进行。立即退出将放弃该任务，但文件本身不会损坏。确定退出吗？"
   },
   "nav": {
     "home": "首页",
@@ -167,7 +169,9 @@
     "pluginsStderr": "标准错误"
   },
   "tabs": {
-    "close": "关闭标签页"
+    "close": "关闭标签页",
+    "closeBlockedTitle": "正在写入文件",
+    "closeBlocked": "该文件正在执行编辑或撤销写入，写入完成后才能关闭标签页。"
   },
   "compare": {
     "title": "PDF 对比",
@@ -201,6 +205,7 @@
     "devSkip": "开发模式下不检查更新",
     "declined": "已跳过此次更新",
     "error": "更新失败",
-    "restartPrompt": "更新已安装，立即重启应用？"
+    "restartPrompt": "更新已安装，立即重启应用？",
+    "busyEditing": "正在写入 PDF 文件。请等待写入完成后再检查更新。"
   }
 }

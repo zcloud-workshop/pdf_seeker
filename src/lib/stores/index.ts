@@ -1,5 +1,5 @@
 import { derived, get, writable } from "svelte/store";
-import { releaseSession } from "@/document/session.svelte.ts";
+import { isFileWriteBusy, releaseSession } from "@/document/session.svelte.ts";
 
 export type ViewName = "home" | "viewer" | "tools" | "compare" | "storage" | "settings";
 
@@ -34,21 +34,26 @@ export function openTab(path: string): Tab {
   return tab;
 }
 
-export function closeTab(id: string) {
+/** Close a tab. Returns false when the file still has an edit/undo/redo in
+ * flight (07-A): closing mid-write would strand the in-flight task writing
+ * to a released session, so the close is refused and the caller can inform
+ * the user. */
+export function closeTab(id: string): boolean {
   const all = get(tabs);
   const idx = all.findIndex((t) => t.id === id);
-  if (idx === -1) return;
+  if (idx === -1) return true;
   const closed = all[idx];
+  if (isFileWriteBusy(closed.path)) return false;
   tabs.set(all.filter((t) => t.id !== id));
   // Closing the tab is the explicit release rule for per-file session state
-  // (edit history, view state) — R12. In-flight writes captured before the
-  // close still target this path; their generation check sees the bump.
+  // (edit history, view state) — R12.
   releaseSession(closed.path);
   if (get(activeTabId) === id) {
     const rest = get(tabs);
     const next = rest[Math.min(idx, rest.length - 1)];
     activeTabId.set(next ? next.id : null);
   }
+  return true;
 }
 
 export function activateTab(id: string) {
