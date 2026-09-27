@@ -6,17 +6,21 @@
     "core:default",
     "core:window:allow-set-fullscreen",
     "core:window:allow-is-fullscreen",
-    "core:window:allow-set-title",
-    "core:window:allow-center",
-    "core:window:allow-close",
     "dialog:default",
-    "dialog:allow-open",
-    "dialog:allow-save",
-    "dialog:allow-message",
     "dialog:allow-ask",
     "fs:default",
-    "fs:allow-read",
-    "fs:allow-write",
+    {
+      "identifier": "fs:allow-read-file",
+      "allow": [{ "path": "**" }]
+    },
+    {
+      "identifier": "fs:allow-write-file",
+      "allow": [{ "path": "**" }]
+    },
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [{ "path": "**" }]
+    },
     "shell:allow-open",
     "updater:default",
     "process:allow-restart"
