@@ -9,10 +9,19 @@
 use lopdf::{encryption, Document, Object, ObjectId};
 use md5::{Digest, Md5};
 use serde::Deserialize;
+use std::io::Read;
 
 type AppResult<T> = Result<T, String>;
 
 const KEY_LEN: usize = 16; // 128-bit
+
+struct SensitiveBytes(Vec<u8>);
+
+impl Drop for SensitiveBytes {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
 
 /// Standard 32-byte password padding (PDF 1.7 Table 3.2)
 const PAD: [u8; 32] = [
@@ -56,7 +65,8 @@ impl Rc4 {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.state[self.i as usize]);
             self.state.swap(self.i as usize, self.j as usize);
-            let k = self.state[(self.state[self.i as usize].wrapping_add(self.state[self.j as usize])) as usize];
+            let k = self.state
+                [(self.state[self.i as usize].wrapping_add(self.state[self.j as usize])) as usize];
             out.push(byte ^ k);
         }
         out
@@ -120,6 +130,39 @@ fn object_key(file_key: &[u8], id: ObjectId) -> Vec<u8> {
     d[..(file_key.len() + 5).min(16)].to_vec()
 }
 
+fn fill_random_bytes(bytes: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open("/dev/urandom")?.read_exact(bytes)
+    }
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        #[link(name = "bcrypt")]
+        extern "system" {
+            fn BCryptGenRandom(
+                algorithm: *mut c_void,
+                buffer: *mut u8,
+                length: u32,
+                flags: u32,
+            ) -> i32;
+        }
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                2,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(status))
+        }
+    }
+}
+
 /// Recursively encrypt every string and stream content of the object.
 /// Encrypted strings switch to hexadecimal serialization because the
 /// ciphertext is binary.
@@ -140,7 +183,9 @@ fn encrypt_object(obj: &mut Object, file_key: &[u8], id: ObjectId) {
             }
         }
         Object::Stream(stream) => {
-            // Encrypt the raw (still filter-encoded) bytes; keep /Filter as-is
+            for (_, value) in stream.dict.iter_mut() {
+                encrypt_object(value, file_key, id);
+            }
             let cipher = rc4(&object_key(file_key, id), &stream.content);
             stream.set_content(cipher);
         }
@@ -165,6 +210,9 @@ fn decrypt_object(obj: &mut Object, file_key: &[u8], id: ObjectId) {
             }
         }
         Object::Stream(stream) => {
+            for (_, value) in stream.dict.iter_mut() {
+                decrypt_object(value, file_key, id);
+            }
             let plain = rc4(&object_key(file_key, id), &stream.content);
             stream.set_content(plain);
         }
@@ -188,45 +236,42 @@ pub struct EncryptPdfRequest {
 
 #[tauri::command]
 pub fn encrypt_pdf(req: EncryptPdfRequest) -> AppResult<()> {
+    let _write_lock = super::pdf_ops::lock_pdf_writes()?;
     if req.owner_password.is_empty() {
         return Err("Owner password is required".into());
     }
 
-    let mut doc = Document::load(&req.input_path)
-        .map_err(|e| format!("Load '{}': {}", req.input_path, e))?;
+    let mut doc =
+        Document::load(&req.input_path).map_err(|e| format!("Load '{}': {}", req.input_path, e))?;
     if doc.is_encrypted() {
         return Err("This PDF is already encrypted".into());
     }
 
-    // Normalize through a temp save/load so object streams and incremental
-    // updates are flattened before encryption
-    let temp_path = std::env::temp_dir().join(format!(
-        "pdf_seeker_encrypt_{}.pdf",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    doc.save(&temp_path)
+    let mut normalized = SensitiveBytes(Vec::new());
+    doc.save_to(&mut normalized.0)
         .map_err(|e| format!("Normalize pass failed: {}", e))?;
-    let mut doc = Document::load(&temp_path)
-        .map_err(|e| format!("Reload normalized file failed: {}", e))?;
-    let _ = std::fs::remove_file(&temp_path);
+    let mut doc = Document::load_mem(&normalized.0)
+        .map_err(|e| format!("Reload normalized document failed: {}", e))?;
+    normalized.0.fill(0);
 
     // Permissions: bits 1-2 reserved zero, everything else allowed by default
     let mut p: i32 = -4; // 0xFFFFFFFC
-    if !req.allow_printing { p &= !0x4; }
-    if !req.allow_modifying { p &= !0x8; }
-    if !req.allow_copying { p &= !0x10; }
-    if !req.allow_annotating { p &= !0x20; }
+    if !req.allow_printing {
+        p &= !0x4;
+    }
+    if !req.allow_modifying {
+        p &= !0x8;
+    }
+    if !req.allow_copying {
+        p &= !0x10;
+    }
+    if !req.allow_annotating {
+        p &= !0x20;
+    }
 
     // Random file ID
     let mut id0 = [0u8; 16];
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    id0[..16].copy_from_slice(&nanos.to_le_bytes());
+    fill_random_bytes(&mut id0).map_err(|e| format!("Generate PDF file ID: {}", e))?;
     let file_id = Object::String(id0.to_vec(), lopdf::StringFormat::Hexadecimal);
 
     let user_pw = req.user_password.clone().unwrap_or_default();
@@ -249,17 +294,22 @@ pub fn encrypt_pdf(req: EncryptPdfRequest) -> AppResult<()> {
         (b"R".to_vec(), Object::Integer(3)),
         (b"Length".to_vec(), Object::Integer(128)),
         (b"P".to_vec(), Object::Integer(p as i64)),
-        (b"O".to_vec(), Object::String(o, lopdf::StringFormat::Hexadecimal)),
-        (b"U".to_vec(), Object::String(u, lopdf::StringFormat::Hexadecimal)),
+        (
+            b"O".to_vec(),
+            Object::String(o, lopdf::StringFormat::Hexadecimal),
+        ),
+        (
+            b"U".to_vec(),
+            Object::String(u, lopdf::StringFormat::Hexadecimal),
+        ),
     ]));
     let encrypt_id = doc.add_object(encrypt_dict);
 
     doc.trailer.set(b"Encrypt", Object::Reference(encrypt_id));
-    doc.trailer.set(b"ID", Object::Array(vec![file_id.clone(), file_id]));
+    doc.trailer
+        .set(b"ID", Object::Array(vec![file_id.clone(), file_id]));
 
-    doc.save(&req.output_path)
-        .map_err(|e| format!("Save '{}': {}", req.output_path, e))?;
-    Ok(())
+    super::pdf_ops::save_doc(&mut doc, &req.output_path)
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,17 +353,41 @@ fn try_derive_key(doc: &Document, pw: &[u8]) -> Option<Vec<u8>> {
 
 #[tauri::command]
 pub fn decrypt_pdf(req: DecryptPdfRequest) -> AppResult<()> {
-    let mut doc = Document::load(&req.input_path)
-        .map_err(|e| format!("Load '{}': {}", req.input_path, e))?;
+    let _write_lock = super::pdf_ops::lock_pdf_writes()?;
+    let mut doc =
+        Document::load(&req.input_path).map_err(|e| format!("Load '{}': {}", req.input_path, e))?;
     if !doc.is_encrypted() {
         return Err("This PDF is not encrypted".into());
     }
 
-    let password = req.password.clone().unwrap_or_default();
-    let file_key = try_derive_key(&doc, password.as_bytes())
-        .ok_or("Wrong password or unsupported encryption (only RC4 V2/R3 is supported)")?;
+    let encrypt_ref = doc
+        .trailer
+        .get(b"Encrypt")
+        .ok()
+        .and_then(|o| o.as_reference().ok())
+        .ok_or("Unsupported encryption dictionary")?;
+    let encrypt_dict = doc
+        .get_object(encrypt_ref)
+        .and_then(Object::as_dict)
+        .map_err(|_| "Unsupported encryption dictionary")?;
+    let version = encrypt_dict.get(b"V").and_then(Object::as_i64).ok();
+    let revision = encrypt_dict.get(b"R").and_then(Object::as_i64).ok();
+    let length = encrypt_dict
+        .get(b"Length")
+        .and_then(Object::as_i64)
+        .ok()
+        .unwrap_or(40);
+    if version != Some(2) || revision != Some(3) || length != 128 {
+        return Err("Unsupported encryption (only RC4-128 V2/R3 is supported)".into());
+    }
 
-    let encrypt_id = doc.trailer.get(b"Encrypt")
+    let password = req.password.clone().unwrap_or_default();
+    let file_key =
+        try_derive_key(&doc, password.as_bytes()).ok_or("Wrong password for RC4-128 V2/R3 PDF")?;
+
+    let encrypt_id = doc
+        .trailer
+        .get(b"Encrypt")
         .ok()
         .and_then(|o| o.as_reference().ok());
 
@@ -332,9 +406,7 @@ pub fn decrypt_pdf(req: DecryptPdfRequest) -> AppResult<()> {
         doc.objects.remove(&eid);
     }
 
-    doc.save(&req.output_path)
-        .map_err(|e| format!("Save '{}': {}", req.output_path, e))?;
-    Ok(())
+    super::pdf_ops::save_doc(&mut doc, &req.output_path)
 }
 
 #[cfg(test)]
@@ -370,16 +442,26 @@ mod tests {
         let page_id = doc.add_object(Object::Dictionary(lopdf::Dictionary::from_iter(vec![
             (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
             (b"Parent".to_vec(), Object::Reference(pages_id)),
-            (b"MediaBox".to_vec(), Object::Array(vec![
-                Object::Integer(0), Object::Integer(0),
-                Object::Integer(612), Object::Integer(792),
-            ])),
+            (
+                b"MediaBox".to_vec(),
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(612),
+                    Object::Integer(792),
+                ]),
+            ),
             (b"Contents".to_vec(), Object::Reference(content_id)),
-            (b"Resources".to_vec(), Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                (b"Font".to_vec(), Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                    (b"F1".to_vec(), Object::Reference(font_id)),
-                ]))),
-            ]))),
+            (
+                b"Resources".to_vec(),
+                Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                    b"Font".to_vec(),
+                    Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                        b"F1".to_vec(),
+                        Object::Reference(font_id),
+                    )])),
+                )])),
+            ),
         ])));
         if let Some(pages_obj) = doc.objects.get_mut(&pages_id) {
             if let Ok(d) = pages_obj.as_dict_mut() {
@@ -450,6 +532,34 @@ mod tests {
         })
         .unwrap();
 
+        if std::process::Command::new("pdftoppm")
+            .arg("-v")
+            .output()
+            .is_ok()
+        {
+            let prefix = dir.path().join("encrypted-render");
+            let status = std::process::Command::new("pdftoppm")
+                .args([
+                    "-upw",
+                    "user456",
+                    "-f",
+                    "1",
+                    "-singlefile",
+                    "-png",
+                    "-r",
+                    "72",
+                ])
+                .arg(&enc_str)
+                .arg(&prefix)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let image = image::open(prefix.with_extension("png")).unwrap().to_rgb8();
+            assert!(image
+                .pixels()
+                .any(|pixel| pixel.0.iter().any(|channel| *channel < 245)));
+        }
+
         // Wrong password is rejected
         assert!(decrypt_pdf(DecryptPdfRequest {
             input_path: enc_str.clone(),
@@ -471,12 +581,126 @@ mod tests {
 
         // Content stream survived the roundtrip
         let page_id = *doc.get_pages().get(&1).unwrap();
-        let contents_ref = doc.get_object(page_id).unwrap().as_dict().unwrap()
-            .get(b"Contents").unwrap().as_reference().unwrap();
+        let contents_ref = doc
+            .get_object(page_id)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Contents")
+            .unwrap()
+            .as_reference()
+            .unwrap();
         let stream = doc.get_object(contents_ref).unwrap().as_stream().unwrap();
-        let raw = stream.decompressed_content().unwrap_or_else(|_| stream.content.clone());
+        let raw = stream
+            .decompressed_content()
+            .unwrap_or_else(|_| stream.content.clone());
         let text = String::from_utf8_lossy(&raw);
-        assert!(text.contains("(Secret Hello) Tj"), "content corrupted: {}", text);
+        assert!(
+            text.contains("(Secret Hello) Tj"),
+            "content corrupted: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_recurses_through_arrays_and_stream_dictionaries() {
+        let dir = TempDir::new().unwrap();
+        let src = create_plain_pdf(dir.path(), "nested-plain.pdf");
+        let mut plain = Document::load(&src).unwrap();
+        let root = plain.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        plain
+            .get_object_mut(root)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                "NestedValues",
+                Object::Array(vec![
+                    Object::String(b"array text".to_vec(), lopdf::StringFormat::Literal),
+                    Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
+                        b"Nested".to_vec(),
+                        Object::String(b"dictionary text".to_vec(), lopdf::StringFormat::Literal),
+                    )])),
+                ]),
+            );
+        let stream_id = plain.add_object(Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::from_iter(vec![(
+                b"CustomText".to_vec(),
+                Object::String(
+                    b"stream dictionary text".to_vec(),
+                    lopdf::StringFormat::Literal,
+                ),
+            )]),
+            b"stream content text".to_vec(),
+        )));
+        plain
+            .objects
+            .get_mut(&root)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("NestedStream", Object::Reference(stream_id));
+        plain.save(&src).unwrap();
+
+        let encrypted = dir
+            .path()
+            .join("nested-encrypted.pdf")
+            .to_string_lossy()
+            .into_owned();
+        let decrypted = dir
+            .path()
+            .join("nested-decrypted.pdf")
+            .to_string_lossy()
+            .into_owned();
+        encrypt_pdf(EncryptPdfRequest {
+            input_path: src,
+            output_path: encrypted.clone(),
+            user_password: Some("user".into()),
+            owner_password: "owner".into(),
+            allow_printing: true,
+            allow_modifying: true,
+            allow_copying: true,
+            allow_annotating: true,
+        })
+        .unwrap();
+        decrypt_pdf(DecryptPdfRequest {
+            input_path: encrypted,
+            output_path: decrypted.clone(),
+            password: Some("user".into()),
+        })
+        .unwrap();
+
+        let restored = Document::load(decrypted).unwrap();
+        let root = restored
+            .trailer
+            .get(b"Root")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let catalog = restored.get_object(root).unwrap().as_dict().unwrap();
+        let values = catalog.get(b"NestedValues").unwrap().as_array().unwrap();
+        assert_eq!(values[0].as_str().unwrap(), b"array text");
+        assert_eq!(
+            values[1]
+                .as_dict()
+                .unwrap()
+                .get(b"Nested")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            b"dictionary text"
+        );
+        let stream_id = catalog
+            .get(b"NestedStream")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let stream = restored.get_object(stream_id).unwrap().as_stream().unwrap();
+        assert_eq!(
+            stream.dict.get(b"CustomText").unwrap().as_str().unwrap(),
+            b"stream dictionary text"
+        );
+        assert_eq!(stream.content, b"stream content text");
     }
 
     #[test]
@@ -525,4 +749,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-
