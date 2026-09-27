@@ -1,4 +1,5 @@
 import { derived, get, writable } from "svelte/store";
+import { releaseSession } from "@/document/session.svelte.ts";
 
 export type ViewName = "home" | "viewer" | "tools" | "compare" | "storage" | "settings";
 
@@ -37,7 +38,12 @@ export function closeTab(id: string) {
   const all = get(tabs);
   const idx = all.findIndex((t) => t.id === id);
   if (idx === -1) return;
+  const closed = all[idx];
   tabs.set(all.filter((t) => t.id !== id));
+  // Closing the tab is the explicit release rule for per-file session state
+  // (edit history, view state) — R12. In-flight writes captured before the
+  // close still target this path; their generation check sees the bump.
+  releaseSession(closed.path);
   if (get(activeTabId) === id) {
     const rest = get(tabs);
     const next = rest[Math.min(idx, rest.length - 1)];

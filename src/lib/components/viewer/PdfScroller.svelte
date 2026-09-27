@@ -40,6 +40,14 @@
   } from "@/pdf-engine";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onDestroy } from "svelte";
+  import { getSession, peekSession } from "@/document/session.svelte.ts";
+  import {
+    claimViewerFocus,
+    isViewerFocusOwner,
+    releaseViewerFocus,
+    subscribeViewerFocus,
+    viewerFocusOwner,
+  } from "@/document/viewerFocus";
 
   // ─── Props ──────────────────────────────────────────────────────────
 
@@ -63,7 +71,8 @@
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
   let scrollContainer: HTMLDivElement | undefined = $state(undefined);
 
-  // Per-tab view state (survives tab switches)
+  // Per-tab view state (survives tab switches; restored from the per-file
+  // session on mount so it also survives view switches — R12)
   let zoom = $state(1.0);
   let pageNo = $state(1);
   let pageCount = $state(0);
@@ -71,18 +80,37 @@
   const PAGE_GAP = 8;
   const DPR = window.devicePixelRatio || 1;
   const MAX_CONCURRENT_RENDERS = 4;
-  const MAX_CACHE_ENTRIES = 40;
+  /** Rendered-pixel budget for the page cache (R15). ~128 MB of RGBA. */
+  const MAX_CACHE_BYTES = 128 * 1024 * 1024;
 
   let pageHeights: number[] = $state([]);
   let pageWidths: number[] = $state([]);
   let canvasMap = new Map<number, HTMLCanvasElement>();
   let pageSlots = new Map<number, HTMLDivElement>();
   let pageCache = new Map<string, HTMLCanvasElement>();
+  let cacheBytes = 0;
   let observer: IntersectionObserver | null = null;
   let renderVersion = 0;
   let pendingRenders = 0;
   let renderQueue: number[] = [];
   let zoomRaf = 0;
+  let scrollRaf = 0;
+
+  // Async lifecycle guard (R14): bumped on every load; stale results destroy
+  // their document and never touch component state.
+  let docGeneration = 0;
+  // Path whose state is currently loaded; a reload of the same path is a
+  // refresh (keeps view state + outline undo snapshot), not a reset (R11).
+  let loadedPath: string | null = null;
+
+  // R29: identity for claiming viewer-level global shortcuts / shared state
+  const instanceId = $derived.by(() => `scroller-${tab.id}`);
+  let focusTick = $state(0);
+  $effect(() => subscribeViewerFocus(() => (focusTick++)));
+  const ownsGlobalViewerFocus = $derived.by(() => {
+    focusTick;
+    return isViewerFocusOwner(instanceId);
+  });
 
   // Cached base dimensions at pdf scale=1
   let basePageHeights: number[] = [];
@@ -96,12 +124,27 @@
   }
 
   function cachePut(key: string, canvas: HTMLCanvasElement) {
+    const existing = pageCache.get(key);
+    if (existing) {
+      cacheBytes -= existing.width * existing.height * 4;
+      pageCache.delete(key);
+    }
     pageCache.set(key, canvas);
-    while (pageCache.size > MAX_CACHE_ENTRIES) {
+    cacheBytes += canvas.width * canvas.height * 4;
+    // Byte-budget eviction (R15): drop oldest entries until within budget,
+    // never evicting the entry we just added.
+    while (cacheBytes > MAX_CACHE_BYTES && pageCache.size > 1) {
       const oldest = pageCache.keys().next().value;
-      if (oldest === undefined) break;
+      if (oldest === undefined || oldest === key) break;
+      const evicted = pageCache.get(oldest)!;
+      cacheBytes -= evicted.width * evicted.height * 4;
       pageCache.delete(oldest);
     }
+  }
+
+  function clearPageCache() {
+    pageCache.clear();
+    cacheBytes = 0;
   }
 
   function pageContainerWidth(): number {
@@ -112,49 +155,83 @@
   // ─── Document loading ───────────────────────────────────────────────
 
   async function loadDocument(path: string) {
+    const gen = ++docGeneration;
+    const sameFile = loadedPath === path;
+    loadedPath = path;
     loading = true;
     errorMsg = "";
-    pdfDoc = null;
     renderVersion++;
-    pageCache.clear();
+    clearPageCache();
     pageHeights = [];
     pageWidths = [];
     basePageHeights = [];
     basePageWidths = [];
     outlineNodes = [];
     editingOutline = false;
+    if (!sameFile) {
+      // Fresh document: adopt the per-file session view state (R12). A
+      // same-file refresh keeps the current position instead.
+      const s = getSession(path);
+      zoom = s.view.zoom > 0 ? s.view.zoom : 1;
+      pageNo = Math.max(1, s.view.page);
+      // R11: the outline undo snapshot only dies on a real file change,
+      // never on the same-file reload that follows a bookmark save.
+      outlineUndoSnapshot = null;
+    }
     try {
       const data = await readFile(path);
+      if (gen !== docGeneration) return;
       const doc = await loadPdf(new Uint8Array(data));
+      if (gen !== docGeneration) {
+        doc.destroy();
+        return;
+      }
+      // New document is ready — swap and only now destroy the old one (R14).
+      const previous = pdfDoc;
       pdfDoc = doc;
+      previous?.destroy();
       pageCount = doc.numPages;
-      pageNo = 1;
-      zoom = 1.0;
-      await loadBaseDimensions(doc);
-      applyZoomToDimensions(1.0);
+      pageNo = Math.min(Math.max(1, pageNo), pageCount);
+      await loadBaseDimensions(doc, gen);
+      if (gen !== docGeneration) return;
       const outline = await readOutline(doc);
+      if (gen !== docGeneration) return;
       outlineNodes = outline;
       savedOutlineJson = JSON.stringify(outline);
-      outlineUndoSnapshot = null;
+      if (!sameFile) outlineUndoSnapshot = null;
     } catch (e) {
+      if (gen !== docGeneration) return;
       errorMsg = String(e);
+      pdfDoc?.destroy();
       pdfDoc = null;
     } finally {
-      loading = false;
+      if (gen === docGeneration) loading = false;
     }
   }
 
-  async function loadBaseDimensions(doc: PdfDocumentProxy) {
+  async function loadBaseDimensions(doc: PdfDocumentProxy, gen: number) {
     const containerW = pageContainerWidth();
     const firstVp = await getPageViewport(doc, 1, 1);
+    if (gen !== docGeneration) return;
     baseFitScale = Math.max(0.1, Math.min(containerW / firstVp.width, 2));
 
-    basePageHeights = [];
-    basePageWidths = [];
-    for (let i = 1; i <= doc.numPages; i++) {
+    // R15: the first screen paints immediately using page-1 dimensions as the
+    // estimate for all pages; real per-page dimensions replace the estimates
+    // progressively so a 1000-page scan does not block on numPages lookups.
+    basePageHeights = Array.from({ length: doc.numPages }, () => firstVp.height);
+    basePageWidths = Array.from({ length: doc.numPages }, () => firstVp.width);
+    applyZoomToDimensions(zoom);
+    renderVisiblePages();
+
+    for (let i = 2; i <= doc.numPages; i++) {
       const vp = await getPageViewport(doc, i, 1);
-      basePageHeights.push(vp.height);
-      basePageWidths.push(vp.width);
+      if (gen !== docGeneration) return;
+      if (basePageHeights[i - 1] !== vp.height || basePageWidths[i - 1] !== vp.width) {
+        basePageHeights[i - 1] = vp.height;
+        basePageWidths[i - 1] = vp.width;
+        pageHeights[i - 1] = vp.height * zoom * baseFitScale;
+        pageWidths[i - 1] = vp.width * zoom * baseFitScale;
+      }
     }
   }
 
@@ -269,6 +346,14 @@
           );
           if (entry.isIntersecting) {
             renderPage(pageNum);
+          } else {
+            // R15: release the pixel buffer of pages that left the extended
+            // viewport; re-entering repaints from the page cache.
+            const canvas = canvasMap.get(pageNum);
+            if (canvas && canvas.width !== 0) {
+              canvas.width = 0;
+              canvas.height = 0;
+            }
           }
         }
       },
@@ -307,8 +392,6 @@
   }
 
   // ─── Scroll → page tracking ─────────────────────────────────────────
-
-  let scrollRaf = 0;
 
   function onScroll() {
     if (scrollRaf) cancelAnimationFrame(scrollRaf);
@@ -362,7 +445,7 @@
       cancelAnimationFrame(zoomRaf);
       zoomRaf = requestAnimationFrame(() => {
         renderVersion++;
-        pageCache.clear();
+        clearPageCache();
         renderVisiblePages();
       });
     }
@@ -372,7 +455,7 @@
     zoom = newZ;
     applyZoomToDimensions(newZ);
     renderVersion++;
-    pageCache.clear();
+    clearPageCache();
     renderVisiblePages();
   }
 
@@ -394,6 +477,10 @@
     id: number;
     title: string;
     pageNum: number | null;
+    /** R11: "page" targets are expressible through set_outline; "external"
+     * (URL actions) and "unresolvable" destinations are not — a save that
+     * would drop them is blocked instead of silently filtering them out. */
+    targetKind: "page" | "external" | "unresolvable";
     expanded: boolean;
     children: OutlineNode[];
   }
@@ -415,16 +502,27 @@
       const raw = await doc.getOutline();
       if (!raw) return [];
       const map = async (
-        items: { title: string; dest: unknown; items: unknown[] | null }[],
+        items: { title: string; dest: unknown; url?: unknown; items: unknown[] | null }[],
       ): Promise<OutlineNode[]> =>
         Promise.all(
-          items.map(async (it) => ({
-            id: outlineIdSeq++,
-            title: it.title,
-            pageNum: await resolveOutlinePage(doc, it.dest),
-            expanded: true,
-            children: await map((it.items || []) as never),
-          })),
+          items.map(async (it) => {
+            let targetKind: OutlineNode["targetKind"];
+            let pageNum: number | null = null;
+            if (typeof it.url === "string" && it.url) {
+              targetKind = "external";
+            } else {
+              pageNum = await resolveOutlinePage(doc, it.dest);
+              targetKind = pageNum != null ? "page" : "unresolvable";
+            }
+            return {
+              id: outlineIdSeq++,
+              title: it.title,
+              pageNum,
+              targetKind,
+              expanded: true,
+              children: await map((it.items || []) as never),
+            };
+          }),
         );
       return await map(raw as never);
     } catch {
@@ -526,6 +624,7 @@
       id: outlineIdSeq++,
       title,
       pageNum: pageNo,
+      targetKind: "page",
       expanded: true,
       children: [],
     };
@@ -564,7 +663,8 @@
   }
 
   function toInputItems(nodes: OutlineNode[]): unknown[] {
-    // Nodes whose destination page cannot be resolved are dropped on write
+    // Callers block lossy saves up front (see applyOutlineEdit), so every
+    // reachable node has a page target; the filter stays as a safety net.
     return nodes
       .filter((n) => n.pageNum != null)
       .map((n) => ({
@@ -574,7 +674,30 @@
       }));
   }
 
+  function unrepresentableTitles(nodes: OutlineNode[]): string[] {
+    const titles: string[] = [];
+    for (const n of nodes) {
+      if (n.targetKind !== "page") titles.push(n.title);
+      titles.push(...unrepresentableTitles(n.children));
+    }
+    return titles;
+  }
+
   async function applyOutlineEdit() {
+    // R11: the set_outline IPC can only express page destinations. Saving an
+    // outline that contains external links or unresolvable targets would
+    // silently drop those nodes (and their whole subtrees) — refuse instead.
+    const unrepresentable = unrepresentableTitles(outlineNodes);
+    if (unrepresentable.length > 0) {
+      outlineError =
+        `Cannot save: ${unrepresentable.length} bookmark(s) use external or unresolvable ` +
+        `destinations that this version cannot write back (${unrepresentable
+          .slice(0, 3)
+          .map((t) => `"${t}"`)
+          .join(", ")}${unrepresentable.length > 3 ? ", …" : ""}). ` +
+        `Saving would delete them; full outline editing lands with the 07-C protocol.`;
+      return;
+    }
     outlineSaving = true;
     outlineError = "";
     try {
@@ -596,7 +719,7 @@
   }
 
   async function undoOutlineEdit() {
-    if (!outlineUndoSnapshot) return;
+    if (!outlineUndoSnapshot || outlineSaving) return;
     const snap = outlineUndoSnapshot;
     outlineUndoSnapshot = null;
     try {
@@ -619,9 +742,12 @@
 
   async function handleKeydown(e: KeyboardEvent) {
     if (!active) return;
+    // R12: never swallow native text editing shortcuts
+    const target = e.target as HTMLElement | null;
     if (
-      e.target instanceof HTMLInputElement ||
-      e.target instanceof HTMLTextAreaElement
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      target?.isContentEditable
     )
       return;
     switch (e.key) {
@@ -659,6 +785,7 @@
         if (
           (e.ctrlKey || e.metaKey) &&
           !e.shiftKey &&
+          !outlineSaving &&
           outlineUndoSnapshot
         ) {
           e.preventDefault();
@@ -722,6 +849,34 @@
     loadDocument(tab.path);
   });
 
+  // R12: persist per-file reading state into the session store so it survives
+  // view switches (component destruction). Init from the session happens in
+  // loadDocument for a fresh document.
+  $effect(() => {
+    const s = peekSession(tab.path);
+    if (s) {
+      s.view.zoom = zoom;
+      s.view.page = pageNo;
+    }
+  });
+
+  // R12: after a remount, jump back to the session page once layout exists.
+  $effect(() => {
+    if (pageHeights.length === 0 || pageNo <= 1) return;
+    let applied = false;
+    const tryScroll = (tries: number) => {
+      if (applied) return;
+      const slot = pageSlots.get(pageNo);
+      if (slot) {
+        applied = true;
+        slot.scrollIntoView({ block: "start" });
+      } else if (tries < 120) {
+        requestAnimationFrame(() => tryScroll(tries + 1));
+      }
+    };
+    requestAnimationFrame(() => tryScroll(0));
+  });
+
   $effect(() => {
     if (scrollContainer) setupObserver();
     return () => {
@@ -739,9 +894,11 @@
     return () => el.removeEventListener("scroll", onScroll);
   });
 
-  // Push per-tab view state to the global stores for the active tab only
+  // Push per-tab view state to the global stores for the active tab only.
+  // R29: when several scrollers are active at once (PDF compare), only the
+  // focus owner may write the shared reading state.
   $effect(() => {
-    if (!active) return;
+    if (!active || !ownsGlobalViewerFocus) return;
     zoomLevel.set(zoom);
     currentPage.set(pageNo);
     totalPages.set(pageCount);
@@ -753,6 +910,16 @@
     const raf = requestAnimationFrame(() => renderVisiblePages());
     return () => cancelAnimationFrame(raf);
   });
+
+  // R29: an activated scroller claims viewer focus when unclaimed; user
+  // interaction (pointer down) always re-claims it for that panel.
+  $effect(() => {
+    if (active && viewerFocusOwner() === null) claimViewerFocus(instanceId);
+  });
+
+  function claimFocusFromPointer() {
+    if (active) claimViewerFocus(instanceId);
+  }
 
   $effect(() => {
     if (!active) return;
@@ -771,21 +938,27 @@
   });
 
   $effect(() => {
-    if (!active) return;
+    // R29: window-level actions are handled by at most one scroller — the
+    // focus owner among the active ones.
+    if (!active || !ownsGlobalViewerFocus) return;
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
   });
 
   onDestroy(() => {
     if (hideTimer) clearTimeout(hideTimer);
+    if (zoomRaf) cancelAnimationFrame(zoomRaf);
+    if (scrollRaf) cancelAnimationFrame(scrollRaf);
     observer?.disconnect();
     canvasMap.clear();
     pageSlots.clear();
-    pageCache.clear();
     renderQueue.length = 0;
     renderVersion++;
+    docGeneration++; // R14: invalidate any in-flight load for this instance
+    clearPageCache();
     pdfDoc?.destroy();
     pdfDoc = null;
+    releaseViewerFocus(instanceId);
   });
 
   // ─── Derived ────────────────────────────────────────────────────────
@@ -798,6 +971,7 @@
 <div
   class="flex h-full"
   onmousemove={handleMouseMove}
+  onpointerdown={claimFocusFromPointer}
   role="application"
 >
   {#if $outlineVisible}
