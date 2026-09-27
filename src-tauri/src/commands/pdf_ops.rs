@@ -194,6 +194,81 @@ pub(super) fn save_doc(doc: &mut Document, path: &str) -> AppResult<()> {
     save_doc_with(doc, path, |doc, temp| doc.save(temp).map(|_| ()))
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfFileFingerprint {
+    pub size: u64,
+    pub modified_ms: i64,
+}
+
+fn fingerprint_of(metadata: &std::fs::Metadata) -> PdfFileFingerprint {
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default();
+    PdfFileFingerprint {
+        size: metadata.len(),
+        modified_ms,
+    }
+}
+
+#[tauri::command]
+pub fn pdf_file_fingerprint(path: String) -> AppResult<PdfFileFingerprint> {
+    let metadata =
+        std::fs::metadata(&path).map_err(|e| format!("Read metadata of '{}': {}", path, e))?;
+    Ok(fingerprint_of(&metadata))
+}
+
+/// Restores `path` to the bytes of `snapshot_path` through the shared atomic
+/// save path. `expected_size`/`expected_modified_ms` come from the last state
+/// the frontend observed; a mismatch means another process changed the file
+/// and the restore is refused so the caller can reload.
+#[tauri::command]
+pub fn commit_pdf_snapshot(
+    path: String,
+    snapshot_path: String,
+    expected_size: Option<u64>,
+    expected_modified_ms: Option<i64>,
+) -> AppResult<PdfFileFingerprint> {
+    let _guard = lock_pdf_writes()?;
+    if expected_size.is_some() || expected_modified_ms.is_some() {
+        let metadata =
+            std::fs::metadata(&path).map_err(|e| format!("Read metadata of '{}': {}", path, e))?;
+        let current = fingerprint_of(&metadata);
+        if let Some(size) = expected_size {
+            if current.size != size {
+                return Err(format!(
+                    "'{}' was modified outside this app (size changed); reload it before retrying",
+                    path
+                ));
+            }
+        }
+        if let Some(modified_ms) = expected_modified_ms {
+            if current.modified_ms != modified_ms {
+                return Err(format!(
+                    "'{}' was modified outside this app (timestamp changed); reload it before retrying",
+                    path
+                ));
+            }
+        }
+    }
+    let mut doc = Document::load(&snapshot_path)
+        .map_err(|e| format!("Load snapshot '{}': {}", snapshot_path, e))?;
+    let result = save_doc(&mut doc, &path).and_then(|_| {
+        let metadata =
+            std::fs::metadata(&path).map_err(|e| format!("Read metadata of '{}': {}", path, e))?;
+        Ok(fingerprint_of(&metadata))
+    });
+    // The caller's scratch file is only ever ours to delete inside the system
+    // temp dir; arbitrary paths are left untouched.
+    if std::path::Path::new(&snapshot_path).starts_with(std::env::temp_dir()) {
+        let _ = std::fs::remove_file(&snapshot_path);
+    }
+    result
+}
+
 #[cfg(not(target_os = "windows"))]
 fn replace_pdf_file(temp: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
     std::fs::rename(temp, target)
@@ -3414,6 +3489,47 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"original pdf bytes");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn test_commit_pdf_snapshot_restores_bytes_and_returns_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let path = create_test_pdf(dir.path(), "restore.pdf", 2);
+        let snapshot = create_test_pdf(dir.path(), "snapshot.pdf", 5);
+        let expected = pdf_file_fingerprint(path.clone()).unwrap();
+        let result = commit_pdf_snapshot(
+            path.clone(),
+            snapshot,
+            Some(expected.size),
+            Some(expected.modified_ms),
+        )
+        .unwrap();
+        assert_eq!(Document::load(&path).unwrap().get_pages().len(), 5);
+        assert!(result.size > 0);
+    }
+
+    #[test]
+    fn test_commit_pdf_snapshot_rejects_stale_fingerprint_without_touching_target() {
+        let dir = TempDir::new().unwrap();
+        let path = create_test_pdf(dir.path(), "stale.pdf", 2);
+        let before = std::fs::read(&path).unwrap();
+        let snapshot = create_test_pdf(dir.path(), "stale-snapshot.pdf", 1);
+        let result = commit_pdf_snapshot(path.clone(), snapshot, Some(12345), None);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn test_commit_pdf_snapshot_rejects_invalid_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let path = create_test_pdf(dir.path(), "invalid-target.pdf", 1);
+        let before = std::fs::read(&path).unwrap();
+        let bad = dir.path().join("bad-snapshot.pdf");
+        std::fs::write(&bad, b"not a pdf").unwrap();
+        let result =
+            commit_pdf_snapshot(path.clone(), bad.to_string_lossy().into_owned(), None, None);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
