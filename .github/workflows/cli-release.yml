@@ -1,0 +1,72 @@
+name: CLI Release (pdfseek)
+
+# pdfseek CLI —— 离线扫描件/PDF → 排版文本提取 + 元数据脱敏（wedge MVP）
+# 触发：push cli-v* 标签，或手动 workflow_dispatch
+
+on:
+  push:
+    tags:
+      - "cli-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cli-release:
+    name: Build CLI ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            name: macos-arm64
+            bin: pdfseek
+          - os: macos-13
+            name: macos-x86_64
+            bin: pdfseek
+          - os: ubuntu-22.04
+            name: linux-x86_64
+            bin: pdfseek
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build pdfseek (release)
+        working-directory: src-tauri
+        run: cargo build --release --bin pdfseek
+
+      - name: Bundle (binary + OCR models + docs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          Stag="bundle/pdfseek-${{ matrix.name }}"
+          mkdir -p "$Stag/models"
+          cp "src-tauri/target/release/${{ matrix.bin }}" "$Stag/"
+          cp -R src-tauri/models/ocr/. "$Stag/models/"
+          cp CLI.md "$Stag/"
+          cd bundle && zip -rq "../pdfseek-${{ matrix.name }}.zip" "pdfseek-${{ matrix.name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfseek-${{ matrix.name }}
+          path: bundle/pdfseek-${{ matrix.name }}.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bundle/pdfseek-*.zip
+          generate_release_notes: true
+          prerelease: true

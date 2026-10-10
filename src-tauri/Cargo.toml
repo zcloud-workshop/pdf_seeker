@@ -5,6 +5,10 @@ description = "A cross-platform offline PDF toolbox"
 authors = [""]
 edition = "2021"
 
+[[bin]]
+name = "pdfseek"
+path = "src/bin/pdfseek.rs"
+
 [lib]
 name = "pdf_seeker_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
