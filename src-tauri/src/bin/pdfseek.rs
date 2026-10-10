@@ -61,6 +61,7 @@ fn find_models(explicit: &Option<PathBuf>) -> Result<PathBuf> {
                 v.push(PathBuf::from(dir));
             }
             v.push(PathBuf::from("models/ocr")); // 运行于 src-tauri
+            v.push(PathBuf::from("models")); // 发布包内平铺布局（binary 与 models/ 同级）
             v.push(PathBuf::from("src-tauri/models/ocr")); // 运行于项目根
             if let Some(exe) = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
                 v.push(exe.join("../models/ocr"));
