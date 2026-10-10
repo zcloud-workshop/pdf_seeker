@@ -66,7 +66,7 @@ jobs:
           cp "src-tauri/target/${{ matrix.target }}/release/pdfseek" "$Stag/"
           cp -R src-tauri/models/ocr/. "$Stag/models/"
           cp CLI.md "$Stag/"
-          cd bundle && zip -rq "../pdfseek-${{ matrix.name }}.zip" "pdfseek-${{ matrix.name }}"
+          cd bundle && zip -rq "pdfseek-${{ matrix.name }}.zip" "pdfseek-${{ matrix.name }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
