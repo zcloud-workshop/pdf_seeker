@@ -21,13 +21,13 @@ jobs:
         include:
           - os: macos-14
             name: macos-arm64
-            bin: pdfseek
-          - os: macos-13
+            target: aarch64-apple-darwin
+          - os: macos-14
             name: macos-x86_64
-            bin: pdfseek
+            target: x86_64-apple-darwin
           - os: ubuntu-22.04
             name: linux-x86_64
-            bin: pdfseek
+            target: x86_64-unknown-linux-gnu
 
     runs-on: ${{ matrix.os }}
 
@@ -37,15 +37,25 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux system deps (Tauri build tree)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.target }}
 
       - name: Build pdfseek (release)
         working-directory: src-tauri
-        run: cargo build --release --bin pdfseek
+        run: |
+          cargo build --release --bin pdfseek --target ${{ matrix.target }}
 
       - name: Bundle (binary + OCR models + docs)
         shell: bash
@@ -53,7 +63,7 @@ jobs:
           set -euo pipefail
           Stag="bundle/pdfseek-${{ matrix.name }}"
           mkdir -p "$Stag/models"
-          cp "src-tauri/target/release/${{ matrix.bin }}" "$Stag/"
+          cp "src-tauri/target/${{ matrix.target }}/release/pdfseek" "$Stag/"
           cp -R src-tauri/models/ocr/. "$Stag/models/"
           cp CLI.md "$Stag/"
           cd bundle && zip -rq "../pdfseek-${{ matrix.name }}.zip" "pdfseek-${{ matrix.name }}"
