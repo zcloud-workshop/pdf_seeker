@@ -40,3 +40,4 @@ pdfseek 文件.png --models ./models
 ```bash
 cd src-tauri && cargo build --release --bin pdfseek
 ```
+- 含大量图表/架构图的页面（图内散落标签会碎）

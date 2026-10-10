@@ -9,3 +9,4 @@ src-tauri/target/
 !.env.example
 scratch/
 *.mnn
+!src-tauri/models/ocr/*.mnn
